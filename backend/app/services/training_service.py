@@ -111,6 +111,54 @@ class TrainingService:
         if hasattr(data, 'enable_webhook'):
             job.extra_params['enable_webhook'] = data.enable_webhook
 
+        # 保存所有YOLO训练超参数到extra_params
+        yolo_params = {}
+
+        # 图片尺寸：支持非方形
+        if data.img_size_2 and data.img_size_2 != data.img_size:
+            yolo_params['imgsz'] = [data.img_size, data.img_size_2]
+
+        # 训练控制
+        yolo_params['save'] = data.save
+        yolo_params['val'] = data.val
+
+        # 数据增强
+        yolo_params['augment'] = data.augment
+        yolo_params['hsv_h'] = data.hsv_h
+        yolo_params['hsv_s'] = data.hsv_s
+        yolo_params['hsv_v'] = data.hsv_v
+        yolo_params['degrees'] = data.degrees
+        yolo_params['translate'] = data.translate
+        yolo_params['scale'] = data.scale
+        yolo_params['shear'] = data.shear
+        yolo_params['perspective'] = data.perspective
+        yolo_params['flipud'] = data.flipud
+        yolo_params['fliplr'] = data.fliplr
+        yolo_params['mosaic'] = data.mosaic
+        yolo_params['mixup'] = data.mixup
+
+        # 正则化
+        yolo_params['dropout'] = data.dropout
+        yolo_params['weight_decay'] = data.weight_decay
+
+        # 学习率策略
+        yolo_params['lrf'] = data.lrf
+        yolo_params['warmup_epochs'] = data.warmup_epochs
+
+        # 损失函数权重
+        yolo_params['box'] = data.box
+        yolo_params['cls'] = data.cls
+        yolo_params['dfl'] = data.dfl
+
+        # 高级优化
+        yolo_params['close_mosaic'] = data.close_mosaic
+        yolo_params['overlap_mask'] = data.overlap_mask
+        yolo_params['single_cls'] = data.single_cls
+        yolo_params['nbs'] = data.nbs
+
+        for k, v in yolo_params.items():
+            job.extra_params[k] = v
+
         db.add(job)
         await db.flush()
         await db.refresh(job)
@@ -314,6 +362,33 @@ class TrainingService:
 
         # Build dataset.yaml
         classes = dataset.classes or []
+
+        # 如果数据集没有注册类别，从标注数据中自动提取
+        if not classes:
+            logger.warning("Dataset has no classes defined, extracting from annotations...")
+            class_query = await db.execute(
+                select(Annotation.class_id, Annotation.class_name)
+                .join(Image, Image.id == Annotation.image_id)
+                .where(Image.dataset_id == job.dataset_id)
+                .distinct()
+                .order_by(Annotation.class_id)
+            )
+            class_rows = class_query.all()
+
+            if class_rows:
+                max_class_id = max(row.class_id for row in class_rows)
+                classes = [""] * (max_class_id + 1)
+                for row in class_rows:
+                    classes[row.class_id] = row.class_name or str(row.class_id)
+
+                # 回写到数据集记录，避免下次再提取
+                dataset.classes = classes
+                flag_modified(dataset, "classes")
+                await db.commit()
+                logger.info(f"Extracted {len(class_rows)} classes from annotations: {classes}")
+            else:
+                raise ValueError("Dataset has no classes and no annotations found. Cannot start training.")
+
         yaml_path = build_yolo_dataset_yaml(
             dataset_dir=str(output_dir),
             classes=classes,
@@ -653,13 +728,10 @@ async def _execute_training(db: AsyncSession, job_id: str, main_loop):
     model.add_callback("on_train_epoch_end", on_train_epoch_end)
     model.add_callback("on_val_end", on_val_end)
 
-    # 动态计算最优 worker 数量
-    # 考虑因素：CPU 核心数、batch size、共享内存
+    # 自动计算最优 data loading workers 数量
     import os
     cpu_count = os.cpu_count() or 4
 
-    # 根据 batch size 估算每个 worker 需要的内存（经验值）
-    # 较小的 batch size 可以支持更多 workers
     if job.batch_size <= 8:
         max_workers_by_batch = 8
     elif job.batch_size <= 16:
@@ -667,28 +739,28 @@ async def _execute_training(db: AsyncSession, job_id: str, main_loop):
     else:
         max_workers_by_batch = 4
 
-    # 综合考虑 CPU 和 batch size
-    optimal_workers = min(
-        cpu_count - 1,  # 留一个核心给主进程
+    final_workers = min(
+        cpu_count - 1,
         max_workers_by_batch,
-        8  # 最大不超过 8
+        8
     )
 
-    # 如果设置了共享内存小于 2GB，减少 workers 以避免内存不足
-    # 可以通过环境变量 SHM_SIZE_GB 传入
     shm_size_gb = float(os.environ.get('SHM_SIZE_GB', '4'))
     if shm_size_gb < 2:
-        optimal_workers = min(optimal_workers, 2)
-        logger.warning(f"Shared memory is small ({shm_size_gb}GB), limiting workers to {optimal_workers}")
+        final_workers = min(final_workers, 2)
+        logger.warning(f"Shared memory is small ({shm_size_gb}GB), limiting workers to {final_workers}")
 
-    logger.info(f"Using {optimal_workers} data loading workers (CPU cores: {cpu_count}, batch size: {job.batch_size})")
+    logger.info(f"Using {final_workers} data loading workers (CPU cores: {cpu_count}, batch size: {job.batch_size})")
+
+    # 构建图片尺寸参数：优先使用 extra_params 中的列表格式
+    imgsz_param = job.extra_params.get('imgsz', job.img_size)
 
     # Train
     train_args = {
         "data": yaml_path,
         "epochs": job.epochs,
         "batch": job.batch_size,
-        "imgsz": job.img_size,
+        "imgsz": imgsz_param,
         "lr0": job.learning_rate,
         "device": device,
         "project": str(output_dir),
@@ -696,11 +768,42 @@ async def _execute_training(db: AsyncSession, job_id: str, main_loop):
         "exist_ok": True,
         "verbose": True,
         "plots": True,
-        "save": True,
-        "cache": False,  # 禁用内存缓存以节省共享内存
-        "workers": optimal_workers,  # 动态调整的 worker 数量
-        "patience": job.extra_params.get('patience', 50),  # 早停耐心值
-        "save_period": job.extra_params.get('save_period', -1),  # 保存周期
+        "cache": False,
+        "workers": final_workers,
+        "patience": job.extra_params.get('patience', 100),
+        "save_period": job.extra_params.get('save_period', -1),
+        # 训练控制
+        "save": job.extra_params.get('save', True),
+        "val": job.extra_params.get('val', True),
+        # 数据增强
+        "augment": job.extra_params.get('augment', True),
+        "hsv_h": job.extra_params.get('hsv_h', 0.015),
+        "hsv_s": job.extra_params.get('hsv_s', 0.7),
+        "hsv_v": job.extra_params.get('hsv_v', 0.4),
+        "degrees": job.extra_params.get('degrees', 0.0),
+        "translate": job.extra_params.get('translate', 0.1),
+        "scale": job.extra_params.get('scale', 0.5),
+        "shear": job.extra_params.get('shear', 0.0),
+        "perspective": job.extra_params.get('perspective', 0.0),
+        "flipud": job.extra_params.get('flipud', 0.0),
+        "fliplr": job.extra_params.get('fliplr', 0.5),
+        "mosaic": job.extra_params.get('mosaic', 1.0),
+        "mixup": job.extra_params.get('mixup', 0.0),
+        # 正则化
+        "dropout": job.extra_params.get('dropout', 0.0),
+        "weight_decay": job.extra_params.get('weight_decay', 0.0005),
+        # 学习率策略
+        "lrf": job.extra_params.get('lrf', 0.01),
+        "warmup_epochs": job.extra_params.get('warmup_epochs', 3.0),
+        # 损失函数权重
+        "box": job.extra_params.get('box', 7.5),
+        "cls": job.extra_params.get('cls', 0.5),
+        "dfl": job.extra_params.get('dfl', 1.5),
+        # 高级参数
+        "close_mosaic": job.extra_params.get('close_mosaic', 10),
+        "overlap_mask": job.extra_params.get('overlap_mask', True),
+        "single_cls": job.extra_params.get('single_cls', False),
+        "nbs": job.extra_params.get('nbs', 64),
     }
 
     # 继续训练：从已有模型恢复
@@ -726,20 +829,35 @@ async def _execute_training(db: AsyncSession, job_id: str, main_loop):
         train_args['copy_paste'] = 0.5  # 启用 copy-paste 增强
 
     if job.extra_params:
-        # 合并用户自定义参数
+        # 已在 train_args 中显式处理的参数，不再从 extra_params 覆盖
+        skip_keys = {
+            'resume_training', 'base_model_id', 'class_weights', 'focus_classes',
+            'patience', 'save_period', 'enable_webhook', 'workers',
+            # 新增的 YOLO 参数已在 train_args 中直接设置
+            'imgsz', 'augment', 'hsv_h', 'hsv_s', 'hsv_v',
+            'degrees', 'translate', 'scale', 'shear', 'perspective',
+            'flipud', 'fliplr', 'mosaic', 'mixup',
+            'dropout', 'weight_decay', 'lrf', 'warmup_epochs',
+            'box', 'cls', 'dfl',
+            'close_mosaic', 'overlap_mask', 'single_cls', 'nbs',
+            'save', 'val',
+        }
         for key, value in job.extra_params.items():
-            if key not in ['resume_training', 'base_model_id', 'class_weights', 'focus_classes', 'patience', 'save_period', 'enable_webhook']:
+            if key not in skip_keys:
                 train_args[key] = value
 
-    logger.info(f"Starting training with args: patience={train_args.get('patience')}, save_period={train_args.get('save_period')}")
+    # 打印最终训练参数，便于排查
+    log_args = {k: v for k, v in train_args.items() if k not in ['data', 'project']}
+    logger.info(f"Final train_args: {log_args}")
 
     # 训练前清理显存
     await _cleanup_gpu_memory()
 
     try:
+        logger.info("Calling model.train() ...")
         results = model.train(**train_args)
+        logger.info("model.train() completed successfully")
     except Exception as train_error:
-        # 训练失败时清理显存
         logger.error(f"Training failed: {train_error}")
         await _cleanup_gpu_memory()
 

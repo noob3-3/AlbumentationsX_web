@@ -12,10 +12,10 @@ export const useTrainingStore = defineStore('training', () => {
   // Active WebSocket connections: { jobId: WebSocket }
   const wsConnections = ref({})
 
-  async function fetchJobs() {
+  async function fetchJobs(params = {}) {
     loading.value = true
     try {
-      const res = await trainingApi.listJobs()
+      const res = await trainingApi.listJobs(params)
       jobs.value = res.items
     } finally {
       loading.value = false

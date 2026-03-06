@@ -319,30 +319,67 @@ class LabelCreate(BaseModel):
 class TrainingJobCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=255)
     dataset_id: str
-    model_name: str = "yolo11n.pt"
-    epochs: int = Field(100, ge=1, le=1000)
-    batch_size: int = Field(16, ge=1, le=512)
-    img_size: int = Field(640, ge=32, le=1920)
-    learning_rate: float = Field(0.01, gt=0, le=1.0)
-    val_split: float = Field(0.2, gt=0, lt=1.0)
-    device: str = "auto"
-    use_augmented_data: bool = True  # 是否使用增强数据
+    model_name: str = "yolov8n.pt"
+    epochs: int = Field(400, ge=1, le=10000, description="训练轮数")
+    batch_size: int = Field(4, ge=1, le=512, description="每批次图片数量")
+    img_size: int = Field(640, ge=32, le=8192, description="图片尺寸（第一维度）")
+    img_size_2: Optional[int] = Field(640, ge=32, le=8192, description="图片尺寸（第二维度），为空则使用正方形")
+    learning_rate: float = Field(0.00001, gt=0, le=1.0, description="初始学习率 (lr0)")
+    val_split: float = Field(0.2, gt=0, lt=1.0, description="验证集划分比例")
+    device: str = Field("0", description="训练设备：auto/cpu/0/1/0,1")
+    use_augmented_data: bool = True
     extra_params: Optional[Dict[str, Any]] = {}
 
     # 继续训练相关参数
-    resume_training: bool = False  # 是否继续训练
-    base_model_id: Optional[str] = None  # 基础模型ID（继续训练时使用）
+    resume_training: bool = False
+    base_model_id: Optional[str] = None
 
     # 类别增强训练参数
-    class_weights: Optional[Dict[str, float]] = None  # 类别权重，例如 {"cat": 2.0, "dog": 1.5}
-    focus_classes: Optional[List[str]] = None  # 重点训练的类别列表
+    class_weights: Optional[Dict[str, float]] = None
+    focus_classes: Optional[List[str]] = None
 
-    # 早停参数
-    patience: int = Field(50, ge=0, le=200, description="早停耐心值，连续N轮验证指标不改善则停止，0表示不启用")
-    save_period: int = Field(-1, ge=-1, le=100, description="每N轮保存一次模型，-1表示只保存最佳和最后")
+    # 训练控制
+    save: bool = Field(True, description="是否保存训练结果")
+    val: bool = Field(True, description="训练期间是否进行验证")
+    patience: int = Field(100, ge=0, le=1000, description="早停耐心值，连续N轮验证指标不改善则停止，0=不启用")
+    save_period: int = Field(-1, ge=-1, le=1000, description="每N轮保存一次模型，-1=仅保存最佳和最后")
+
+    # ===== 数据增强参数 =====
+    augment: bool = Field(True, description="是否启用YOLO内置数据增强")
+    hsv_h: float = Field(0.1, ge=0.0, le=1.0, description="HSV色调增强范围")
+    hsv_s: float = Field(0.9, ge=0.0, le=1.0, description="HSV饱和度增强范围")
+    hsv_v: float = Field(0.5, ge=0.0, le=1.0, description="HSV亮度增强范围")
+    degrees: float = Field(15.0, ge=0.0, le=180.0, description="随机旋转角度范围（±度）")
+    translate: float = Field(0.2, ge=0.0, le=1.0, description="随机平移范围（图片尺寸比例）")
+    scale: float = Field(0.3, ge=0.0, le=1.0, description="随机缩放范围")
+    shear: float = Field(0.2, ge=0.0, le=90.0, description="随机剪切角度范围（±度）")
+    perspective: float = Field(0.001, ge=0.0, le=0.01, description="透视变换强度")
+    flipud: float = Field(0.5, ge=0.0, le=1.0, description="上下翻转概率")
+    fliplr: float = Field(0.5, ge=0.0, le=1.0, description="左右翻转概率")
+    mosaic: float = Field(1.0, ge=0.0, le=1.0, description="Mosaic四图拼接增强概率")
+    mixup: float = Field(0.2, ge=0.0, le=1.0, description="MixUp图片混合增强概率")
+
+    # ===== 正则化参数 =====
+    dropout: float = Field(0.5, ge=0.0, le=1.0, description="Dropout比率（0=不使用）")
+    weight_decay: float = Field(0.01, ge=0.0, le=0.1, description="权重衰减正则化系数")
+
+    # ===== 学习率策略 =====
+    lrf: float = Field(0.0001, gt=0, le=1.0, description="最终学习率因子，最终LR = lr0 × lrf")
+    warmup_epochs: float = Field(40.0, ge=0.0, le=100.0, description="学习率预热轮数")
+
+    # ===== 损失函数权重 =====
+    box: float = Field(0.1, ge=0.0, le=20.0, description="边界框回归损失权重")
+    cls: float = Field(0.3, ge=0.0, le=20.0, description="分类损失权重")
+    dfl: float = Field(1.5, ge=0.0, le=20.0, description="DFL分布焦点损失权重")
+
+    # ===== 高级优化参数 =====
+    close_mosaic: int = Field(5, ge=0, le=100, description="最后N轮关闭Mosaic增强")
+    overlap_mask: bool = Field(True, description="分割训练时允许掩码重叠")
+    single_cls: bool = Field(False, description="将所有类别视为单一类别训练")
+    nbs: int = Field(16, ge=1, le=256, description="名义批大小，用于自动梯度累积计算")
 
     # Webhook 推送
-    enable_webhook: bool = False  # 是否为本次任务启用 Webhook 推送
+    enable_webhook: bool = False
 
 
 # ─────────────────────────────────────────────

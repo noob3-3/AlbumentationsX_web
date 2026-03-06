@@ -157,8 +157,10 @@ services:
       # PyTorch 显存优化
       - PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
 
-      # Ultralytics 多 GPU 训练设置
+      # Ultralytics 设置
       - YOLO_VERBOSE=True
+      # 禁止 Ultralytics 自动联网下载模型/检查更新（国内服务器访问 GitHub 极慢会导致训练卡住）
+      - YOLO_OFFLINE=1
     deploy:
       resources:
         reservations:

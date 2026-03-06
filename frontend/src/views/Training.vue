@@ -198,21 +198,22 @@
             <el-divider>训练参数</el-divider>
 
             <el-form-item label="训练轮数">
-              <el-input-number v-model="form.epochs" :min="1" :max="1000" />
+              <el-input-number v-model="form.epochs" :min="1" :max="10000" />
             </el-form-item>
             <el-form-item label="批大小">
               <el-input-number v-model="form.batch_size" :min="1" :max="512" />
             </el-form-item>
             <el-form-item label="图片尺寸">
-              <el-select v-model="form.img_size" style="width:200px">
-                <el-option :value="320" label="320" />
-                <el-option :value="416" label="416" />
-                <el-option :value="640" label="640 (推荐)" />
-                <el-option :value="1280" label="1280" />
-              </el-select>
+              <div style="display: flex; align-items: center; gap: 8px">
+                <el-input-number v-model="form.img_size" :min="32" :max="8192" :step="32" controls-position="right" style="width: 130px" />
+                <span>×</span>
+                <el-input-number v-model="form.img_size_2" :min="32" :max="8192" :step="32" controls-position="right" style="width: 130px" />
+              </div>
+              <div style="color: #909399; font-size: 12px; margin-top: 4px">对应imgsz参数，建议为32的倍数</div>
             </el-form-item>
-            <el-form-item label="学习率">
-              <el-input-number v-model="form.learning_rate" :min="0.0001" :max="0.1" :step="0.001" :precision="4" />
+            <el-form-item label="初始学习率">
+              <el-input-number v-model="form.learning_rate" :min="0.0000001" :max="0.1" :step="0.00001" :precision="7" controls-position="right" style="width: 200px" />
+              <span style="color: #909399; font-size: 12px; margin-left: 8px">lr0</span>
             </el-form-item>
             <el-form-item label="验证集比例">
               <el-slider v-model="form.val_split" :min="0.1" :max="0.4" :step="0.05" :format-tooltip="(v) => `${(v*100).toFixed(0)}%`" style="width:200px" />
@@ -225,33 +226,139 @@
                 <el-radio value="0">GPU 0</el-radio>
               </el-radio-group>
             </el-form-item>
-
             <el-divider />
 
             <!-- 早停和保存策略 -->
             <el-form-item label="早停耐心值">
-              <el-input-number
-                v-model="form.patience"
-                :min="0"
-                :max="200"
-                style="width: 150px"
-              />
-              <el-text size="small" type="info" style="margin-left: 12px">
-                连续N轮验证指标不改善则停止，0表示不启用
-              </el-text>
+              <el-input-number v-model="form.patience" :min="0" :max="1000" style="width: 150px" />
+              <el-text size="small" type="info" style="margin-left: 12px">连续N轮无改善则停止，0=不启用</el-text>
+            </el-form-item>
+            <el-form-item label="保存策略">
+              <el-input-number v-model="form.save_period" :min="-1" :max="1000" style="width: 150px" />
+              <el-text size="small" type="info" style="margin-left: 12px">每N轮保存，-1=仅保存最佳和最后</el-text>
             </el-form-item>
 
-            <el-form-item label="保存策略">
-              <el-input-number
-                v-model="form.save_period"
-                :min="-1"
-                :max="100"
-                style="width: 150px"
-              />
-              <el-text size="small" type="info" style="margin-left: 12px">
-                每N轮保存一次，-1表示只保存最佳和最后
-              </el-text>
-            </el-form-item>
+            <!-- 高级训练参数折叠面板 -->
+            <el-collapse v-model="activeCollapse" style="margin-top: 12px; margin-bottom: 16px; border: none">
+
+              <!-- 学习率与正则化 -->
+              <el-collapse-item title="学习率与正则化" name="lr">
+                <el-form-item label="最终LR因子">
+                  <el-input-number v-model="form.lrf" :min="0.0000001" :max="1.0" :step="0.0001" :precision="7" controls-position="right" style="width: 200px" />
+                  <div style="color: #909399; font-size: 12px; margin-top: 2px">最终LR = lr0 × lrf = {{ (form.learning_rate * form.lrf).toExponential(2) }}</div>
+                </el-form-item>
+                <el-form-item label="预热轮数">
+                  <el-input-number v-model="form.warmup_epochs" :min="0" :max="100" :step="1" style="width: 150px" />
+                  <el-text size="small" type="info" style="margin-left: 8px">warmup_epochs</el-text>
+                </el-form-item>
+                <el-form-item label="权重衰减">
+                  <el-input-number v-model="form.weight_decay" :min="0" :max="0.1" :step="0.001" :precision="4" controls-position="right" style="width: 200px" />
+                  <el-text size="small" type="info" style="margin-left: 8px">L2正则化</el-text>
+                </el-form-item>
+                <el-form-item label="Dropout">
+                  <el-slider v-model="form.dropout" :min="0" :max="1" :step="0.05" style="width: 200px" />
+                  <span style="margin-left: 12px; min-width: 36px; display: inline-block">{{ form.dropout.toFixed(2) }}</span>
+                </el-form-item>
+              </el-collapse-item>
+
+              <!-- 数据增强参数 -->
+              <el-collapse-item title="数据增强参数" name="augmentation">
+                <el-form-item label="启用增强">
+                  <el-switch v-model="form.augment" />
+                </el-form-item>
+                <template v-if="form.augment">
+                  <el-form-item label="HSV色调(H)">
+                    <el-slider v-model="form.hsv_h" :min="0" :max="1" :step="0.01" style="width: 200px" />
+                    <span style="margin-left: 12px; min-width: 36px; display: inline-block">{{ form.hsv_h.toFixed(2) }}</span>
+                  </el-form-item>
+                  <el-form-item label="HSV饱和度(S)">
+                    <el-slider v-model="form.hsv_s" :min="0" :max="1" :step="0.01" style="width: 200px" />
+                    <span style="margin-left: 12px; min-width: 36px; display: inline-block">{{ form.hsv_s.toFixed(2) }}</span>
+                  </el-form-item>
+                  <el-form-item label="HSV亮度(V)">
+                    <el-slider v-model="form.hsv_v" :min="0" :max="1" :step="0.01" style="width: 200px" />
+                    <span style="margin-left: 12px; min-width: 36px; display: inline-block">{{ form.hsv_v.toFixed(2) }}</span>
+                  </el-form-item>
+                  <el-form-item label="旋转角度">
+                    <el-input-number v-model="form.degrees" :min="0" :max="180" :step="1" :precision="1" style="width: 150px" />
+                    <el-text size="small" type="info" style="margin-left: 8px">±度</el-text>
+                  </el-form-item>
+                  <el-form-item label="平移">
+                    <el-slider v-model="form.translate" :min="0" :max="1" :step="0.01" style="width: 200px" />
+                    <span style="margin-left: 12px; min-width: 36px; display: inline-block">{{ form.translate.toFixed(2) }}</span>
+                  </el-form-item>
+                  <el-form-item label="缩放">
+                    <el-slider v-model="form.scale" :min="0" :max="1" :step="0.01" style="width: 200px" />
+                    <span style="margin-left: 12px; min-width: 36px; display: inline-block">{{ form.scale.toFixed(2) }}</span>
+                  </el-form-item>
+                  <el-form-item label="剪切">
+                    <el-input-number v-model="form.shear" :min="0" :max="90" :step="0.1" :precision="1" style="width: 150px" />
+                    <el-text size="small" type="info" style="margin-left: 8px">±度</el-text>
+                  </el-form-item>
+                  <el-form-item label="透视变换">
+                    <el-input-number v-model="form.perspective" :min="0" :max="0.01" :step="0.0001" :precision="4" controls-position="right" style="width: 200px" />
+                  </el-form-item>
+                  <el-form-item label="上下翻转">
+                    <el-slider v-model="form.flipud" :min="0" :max="1" :step="0.05" style="width: 200px" />
+                    <span style="margin-left: 12px; min-width: 36px; display: inline-block">{{ form.flipud.toFixed(2) }}</span>
+                  </el-form-item>
+                  <el-form-item label="左右翻转">
+                    <el-slider v-model="form.fliplr" :min="0" :max="1" :step="0.05" style="width: 200px" />
+                    <span style="margin-left: 12px; min-width: 36px; display: inline-block">{{ form.fliplr.toFixed(2) }}</span>
+                  </el-form-item>
+                  <el-form-item label="Mosaic">
+                    <el-slider v-model="form.mosaic" :min="0" :max="1" :step="0.05" style="width: 200px" />
+                    <span style="margin-left: 12px; min-width: 36px; display: inline-block">{{ form.mosaic.toFixed(2) }}</span>
+                  </el-form-item>
+                  <el-form-item label="MixUp">
+                    <el-slider v-model="form.mixup" :min="0" :max="1" :step="0.05" style="width: 200px" />
+                    <span style="margin-left: 12px; min-width: 36px; display: inline-block">{{ form.mixup.toFixed(2) }}</span>
+                  </el-form-item>
+                </template>
+              </el-collapse-item>
+
+              <!-- 损失函数权重 -->
+              <el-collapse-item title="损失函数权重" name="loss">
+                <el-form-item label="边界框(box)">
+                  <el-input-number v-model="form.box" :min="0" :max="20" :step="0.1" :precision="2" style="width: 150px" />
+                  <el-text size="small" type="info" style="margin-left: 8px">边界框回归损失权重</el-text>
+                </el-form-item>
+                <el-form-item label="分类(cls)">
+                  <el-input-number v-model="form.cls" :min="0" :max="20" :step="0.1" :precision="2" style="width: 150px" />
+                  <el-text size="small" type="info" style="margin-left: 8px">分类损失权重</el-text>
+                </el-form-item>
+                <el-form-item label="DFL(dfl)">
+                  <el-input-number v-model="form.dfl" :min="0" :max="20" :step="0.1" :precision="2" style="width: 150px" />
+                  <el-text size="small" type="info" style="margin-left: 8px">分布焦点损失权重</el-text>
+                </el-form-item>
+              </el-collapse-item>
+
+              <!-- 高级参数 -->
+              <el-collapse-item title="高级参数" name="advanced">
+                <el-form-item label="关闭Mosaic">
+                  <el-input-number v-model="form.close_mosaic" :min="0" :max="100" style="width: 150px" />
+                  <el-text size="small" type="info" style="margin-left: 8px">最后N轮关闭Mosaic</el-text>
+                </el-form-item>
+                <el-form-item label="名义批大小">
+                  <el-input-number v-model="form.nbs" :min="1" :max="256" style="width: 150px" />
+                  <el-text size="small" type="info" style="margin-left: 8px">nbs，用于梯度累积</el-text>
+                </el-form-item>
+                <el-form-item label="重叠掩码">
+                  <el-switch v-model="form.overlap_mask" />
+                  <el-text size="small" type="info" style="margin-left: 8px">分割任务时允许掩码重叠</el-text>
+                </el-form-item>
+                <el-form-item label="单类别模式">
+                  <el-switch v-model="form.single_cls" />
+                  <el-text size="small" type="info" style="margin-left: 8px">将所有类别视为一类</el-text>
+                </el-form-item>
+                <el-form-item label="保存结果">
+                  <el-switch v-model="form.save" />
+                </el-form-item>
+                <el-form-item label="训练时验证">
+                  <el-switch v-model="form.val" />
+                </el-form-item>
+              </el-collapse-item>
+            </el-collapse>
 
             <el-form-item>
               <el-button type="primary" :loading="creating" @click="createJob">开始训练</el-button>
@@ -352,16 +459,19 @@ const availableModels = ref([])
 const datasetClasses = ref([])
 const selectedDatasetInfo = ref(null)
 
+const activeCollapse = ref([])
+
 const form = ref({
   name: '选择数据集和模型后自动生成',
   dataset_id: '',
-  model_name: 'yolo11n.pt',
-  epochs: 100,
-  batch_size: 16,
+  model_name: 'yolov8n.pt',
+  epochs: 400,
+  batch_size: 4,
   img_size: 640,
-  learning_rate: 0.01,
+  img_size_2: 640,
+  learning_rate: 0.00001,
   val_split: 0.2,
-  device: 'auto',
+  device: '0',
 
   // 使用增强数据
   use_augmented_data: true,
@@ -374,9 +484,45 @@ const form = ref({
   use_class_enhancement: false,
   focus_classes: [],
 
-  // 早停和保存策略
-  patience: 50,
+  // 训练控制
+  save: true,
+  val: true,
+  patience: 100,
   save_period: -1,
+
+  // 数据增强
+  augment: true,
+  hsv_h: 0.1,
+  hsv_s: 0.9,
+  hsv_v: 0.5,
+  degrees: 15.0,
+  translate: 0.2,
+  scale: 0.3,
+  shear: 0.2,
+  perspective: 0.001,
+  flipud: 0.5,
+  fliplr: 0.5,
+  mosaic: 1.0,
+  mixup: 0.2,
+
+  // 正则化
+  dropout: 0.5,
+  weight_decay: 0.01,
+
+  // 学习率策略
+  lrf: 0.0001,
+  warmup_epochs: 40,
+
+  // 损失函数权重
+  box: 0.1,
+  cls: 0.3,
+  dfl: 1.5,
+
+  // 高级参数
+  close_mosaic: 5,
+  overlap_mask: true,
+  single_cls: false,
+  nbs: 16,
 })
 
 const rules = {
@@ -470,7 +616,11 @@ function updateJobName() {
 }
 
 async function fetchJobs() {
-  await trainingStore.fetchJobs()
+  const params = {}
+  if (projectId.value) {
+    params.project_id = projectId.value
+  }
+  await trainingStore.fetchJobs(params)
 }
 
 async function fetchAvailableModels() {
