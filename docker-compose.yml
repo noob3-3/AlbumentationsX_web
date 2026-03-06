@@ -1,0 +1,61 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: axweb-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    image: axweb:latest
+    container_name: axweb
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - DEBUG=false
+      - HOST=0.0.0.0
+      - PORT=8000
+      - DATABASE_URL=postgresql+asyncpg://albumentations:albumentations123@192.168.31.41/albumentations
+      - REDIS_URL=redis://redis:6379/0
+      - CLIENT_API_TOKEN=${CLIENT_API_TOKEN:-your-secret-token-change-this}
+      - STATIC_DIR=/app/static
+      # Ultralytics 缓存配置 - 使用持久化目录
+      - ULTRALYTICS_DATASETS_DIR=/app/data/ultralytics/datasets
+      - ULTRALYTICS_WEIGHTS_DIR=/app/data/ultralytics/weights
+      - ULTRALYTICS_RUNS_DIR=/app/data/ultralytics/runs
+
+    volumes:
+      - ./data/uploads:/app/data/uploads       # 用户上传的原始图片
+      - ./data/datasets:/app/data/datasets     # 数据集配置和标注文件
+      - ./data/augmented:/app/data/augmented   # 数据增强后的图片
+      - ./data/models:/app/data/models         # 训练产生的模型文件
+      - ./data/exports:/app/data/exports       # 导出的数据集和模型
+      - ./data/ultralytics:/app/data/ultralytics
+
+    depends_on:
+      redis:
+        condition: service_healthy
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  redis-data:
+

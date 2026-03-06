@@ -1,0 +1,88 @@
+# ╔══════════════════════════════════════════════════════════════╗
+# ║  AlbumentationsX Training Platform — GPU All-in-one         ║
+# ║  Multi-stage: frontend build → GPU Python runtime           ║
+# ║  Run from project root: docker build -f backend/Dockerfile.gpu -t axweb-gpu . ║
+# ╚══════════════════════════════════════════════════════════════╝
+
+# ─────────────────────────────────────────────
+# Stage 1: Build Vue3 + Vite frontend
+# ─────────────────────────────────────────────
+FROM node:20-alpine AS frontend-builder
+
+WORKDIR /frontend
+
+# Cache npm install layer separately
+COPY frontend/package.json frontend/package-lock.json* ./
+RUN npm install --prefer-offline
+
+# Build production bundle
+COPY frontend/ .
+RUN npm run build
+# Artifacts at /frontend/dist/
+
+
+# ─────────────────────────────────────────────
+# Stage 2: GPU Runtime with CUDA support
+# Based on NVIDIA CUDA + Ultralytics official image
+# Reference: https://docs.ultralytics.com/guides/docker-quickstart/
+# ─────────────────────────────────────────────
+FROM ultralytics/ultralytics:latest
+
+# Set working directory
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+
+
+
+# 卸载当前版本
+RUN pip uninstall torch torchvision torchaudio -y --no-cache-dir
+
+# 安装支持CUDA 11.8的版本（兼容你的11.4驱动）
+RUN  pip install torch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 -f https://mirrors.aliyun.com/pytorch-wheels/cu118 --no-cache-dir
+
+# Copy requirements first (for better caching)
+# Use requirements-gpu.txt which excludes ultralytics (already in base image)
+COPY backend/requirements-gpu.txt ./requirements.txt
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY backend/ .
+
+# ── Copy built frontend static files ─────────
+# FastAPI will serve these under "/" via StaticFiles
+COPY --from=frontend-builder /frontend/dist /app/static
+
+# Create necessary directories
+# Set permissions to 777 to allow both host and container to read/write
+RUN mkdir -p \
+    data/uploads \
+    data/datasets \
+    data/augmented \
+    data/models \
+    data/exports \
+    logs && \
+    chmod -R 777 data logs && \
+    chmod +x start.sh
+
+# ── Python environment ────────────────────────
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    STATIC_DIR=/app/static
+
+# Expose port
+EXPOSE 8000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# Run database migrations and start server
+CMD ["./start.sh"]

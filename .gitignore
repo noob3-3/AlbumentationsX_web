@@ -1,0 +1,69 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# Backend data (exclude model weights and large files)
+backend/data/uploads/
+backend/data/datasets/
+backend/data/augmented/
+backend/data/models/
+backend/data/exports/
+backend/logs/
+backend/data/*.db
+
+# Keep .gitkeep placeholder files
+!backend/data/**/.gitkeep
+
+# Project root local data (mapped from Docker containers)
+# 📤 Uploaded files
+data/uploads/
+# 📁 Datasets
+data/datasets/
+# ✨ Augmented data
+data/augmented/
+# 🤖 Trained models
+data/models/
+# 📊 Training exports
+data/exports/
+# 🗄️ Database
+data/*.db
+# 📝 Logs
+logs/
+
+# Keep directory structure with .gitkeep files
+!data/**/.gitkeep
+!logs/.gitkeep
+
+# Alembic versions (optional: track these)
+# backend/alembic/versions/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Environment
+.env.local
+*.env.local
+
+# IDE
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# YOLO runs
+runs/

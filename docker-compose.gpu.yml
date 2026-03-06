@@ -1,0 +1,191 @@
+version: '3.8'
+
+# ─────────────────────────────────────────────
+# AlbumentationsX Training Platform - GPU Version
+# ─────────────────────────────────────────────
+# 使用 NVIDIA GPU 加速训练
+#
+# 前置要求:
+# 1. 安装 NVIDIA Docker: https://github.com/NVIDIA/nvidia-docker
+# 2. 验证 GPU 可用: docker run --rm --gpus all nvidia/cuda:11.8.0-base-ubuntu22.04 nvidia-smi
+#
+# 启动命令:
+# docker-compose -f docker-compose.gpu.yml up -d
+# ─────────────────────────────────────────────
+
+services:
+  # Redis for WebSocket message broadcasting
+  redis:
+    image: redis:7-alpine
+    container_name: axweb-redis
+    restart: unless-stopped
+    ports:
+      - "6378:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    networks:
+      - axweb-network
+
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: axweb-postgres
+    restart: unless-stopped
+    ports:
+      - "5431:5432"
+    environment:
+      - POSTGRES_DB=albumentations
+      - POSTGRES_USER=albumentations
+      - POSTGRES_PASSWORD=albumentations123
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./backend/fix_postgres_permissions.sql:/docker-entrypoint-initdb.d/fix_postgres_permissions.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U albumentations -d albumentations"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - axweb-network
+
+  # Backend with GPU support (includes built frontend)
+  backend-gpu:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile.gpu
+      args:
+        - BUILDKIT_INLINE_CACHE=1
+    container_name: axweb-backend-gpu
+
+    # IPC 配置 - 使用宿主机的 IPC 命名空间（推荐用于深度学习训练）
+    # 优点：容器可以使用宿主机的所有共享内存，无需手动设置 shm_size
+    # 适用场景：大规模训练、多进程数据加载
+    ipc: host
+
+    # 共享内存配置（备选方案）
+    # 如果不使用 ipc: host，可以手动设置共享内存大小
+    # 推荐值：小数据集 2gb，中等数据集 4gb，大数据集 8gb
+    # shm_size: '8gb'
+
+    # 端口映射 - 允许其他设备访问
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    volumes:
+      # ─────────────────────────────────────────────
+      # 持久化数据目录映射
+      # ─────────────────────────────────────────────
+      # 数据目录 - 存储所有训练相关数据
+      - ./data/uploads:/app/data/uploads       # 用户上传的原始图片
+      - ./data/datasets:/app/data/datasets     # 数据集配置和标注文件
+      - ./data/augmented:/app/data/augmented   # 数据增强后的图片
+      - ./data/models:/app/data/models         # 训练产生的模型文件
+      - ./data/exports:/app/data/exports       # 导出的数据集和模型
+      - ./data/ultralytics:/app/data/ultralytics
+
+      # 日志目录 - 存储应用和训练日志
+      - ./logs:/app/logs
+
+      # 共享数据目录 (可选) - 用于多容器共享数据
+      # - ./data:/app/data/shared
+
+      # ─────────────────────────────────────────────
+      # 开发模式挂载 (生产环境请注释)
+      # ─────────────────────────────────────────────
+      # - ./backend/app:/app/app                       # 热重载代码
+      # - ./backend/alembic:/app/alembic               # 数据库迁移脚本
+    environment:
+      # Database - 使用 Docker 内的 PostgreSQL 服务
+      - DATABASE_URL=postgresql+asyncpg://albumentations:albumentations123@postgres/albumentations
+
+      # Redis - WebSocket message broadcasting
+      - REDIS_URL=redis://redis:6379/0
+
+      # Paths
+      - UPLOAD_DIR=/app/data/uploads
+      - DATASET_DIR=/app/data/datasets
+      - AUGMENTED_DIR=/app/data/augmented
+      - MODEL_DIR=/app/data/models
+      - EXPORT_DIR=/app/data/exports
+      - LOG_DIR=/app/logs
+
+      # Ultralytics 缓存配置 - 使用持久化目录
+      # 这样预训练模型会下载到 /app/data/models，容器重启后不会丢失
+      # 示例：在启动Python脚本前设置所有路径
+      - ULTRALYTICS_DATASETS_DIR=/app/data/ultralytics/datasets
+      - ULTRALYTICS_WEIGHTS_DIR=/app/data/ultralytics/weights
+      - ULTRALYTICS_RUNS_DIR=/app/data/ultralytics/runs
+
+
+      # Server
+      - HOST=0.0.0.0
+      - PORT=8000
+      - SERVER_TYPE=uvicorn           # 服务器类型: uvicorn (默认) 或 gunicorn (生产推荐)
+      - WORKERS=4                     # 多线程 workers 数量（建议：CPU 核心数 * 2 + 1）
+      - RELOAD=false
+
+      # CORS - 内网使用，允许所有源
+      - ALLOWED_ORIGINS=["*"]
+
+      # API Token (for remote data collection)
+      - API_TOKEN=change-this-secret-token-in-production
+
+      # GPU Settings
+      # CUDA_VISIBLE_DEVICES 控制使用哪些 GPU:
+      #   - "0": 只使用第一个 GPU
+      #   - "0,1": 使用前两个 GPU
+      #   - "0,1,2,3": 使用4个 GPU
+      #   - 不设置: 使用所有可用 GPU
+      # - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+
+      # 共享内存大小（与 shm_size 配置保持一致）
+      # 用于优化 PyTorch DataLoader 的 worker 数量
+      - SHM_SIZE_GB=4
+
+      # PyTorch 显存优化
+      - PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
+
+      # Ultralytics 多 GPU 训练设置
+      - YOLO_VERBOSE=True
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              # count: 使用 GPU 数量
+              #   - all: 使用所有 GPU (默认)
+              #   - 1: 只使用 1 个 GPU
+              #   - 2: 使用 2 个 GPU
+              count: ${GPU_COUNT:-all}
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - axweb-network
+
+networks:
+  axweb-network:
+    driver: bridge
+
+volumes:
+  postgres-data:
+    driver: local
+  redis-data:
+    driver: local
