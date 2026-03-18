@@ -7,6 +7,7 @@ import asyncio
 from typing import Dict, Set, Optional
 from fastapi import WebSocket
 from loguru import logger
+import redis
 import redis.asyncio as aioredis
 
 
@@ -23,10 +24,13 @@ class ConnectionManager:
     def __init__(self):
         # job_id -> set of websocket connections (local to this worker process)
         self.active_connections: Dict[str, Set[WebSocket]] = {}
-        # Redis client for pub/sub
+        # Redis client for pub/sub (async)
         self.redis: Optional[aioredis.Redis] = None
         self.pubsub: Optional[aioredis.client.PubSub] = None
         self.listener_task: Optional[asyncio.Task] = None
+        # Sync Redis for publishing from worker threads (avoids "Future attached to different loop")
+        self._redis_url: Optional[str] = None
+        self._sync_redis: Optional[redis.Redis] = None
         self._initialized = False
 
     async def initialize(self, redis_url: str, channel: str = "websocket:messages"):
@@ -35,6 +39,7 @@ class ConnectionManager:
             return
 
         try:
+            self._redis_url = redis_url
             self.redis = await aioredis.from_url(redis_url, decode_responses=True)
             self.pubsub = self.redis.pubsub()
             await self.pubsub.subscribe(channel)
@@ -66,7 +71,34 @@ class ConnectionManager:
         if self.redis:
             await self.redis.close()
 
+        if self._sync_redis:
+            self._sync_redis.close()
+            self._sync_redis = None
+
         logger.info("🔌 WebSocket manager shutdown complete")
+
+    def publish_sync(self, job_id: str, message: dict) -> bool:
+        """Publish message via Redis synchronously. Safe to call from any thread.
+
+        Use this from worker threads (e.g. training callbacks) to avoid
+        'Future attached to different loop' errors when publishing via async redis.
+        """
+        if not self._redis_url or not hasattr(self, "channel"):
+            return False
+        try:
+            if self._sync_redis is None:
+                self._sync_redis = redis.from_url(
+                    self._redis_url, decode_responses=True
+                )
+            payload = json.dumps({"job_id": job_id, "message": message})
+            self._sync_redis.publish(self.channel, payload)
+            logger.debug(
+                f"📡 Published '{message.get('type', 'unknown')}' to Redis for job {job_id}"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"❌ Failed to publish to Redis (sync): {e}")
+            return False
 
     async def _redis_listener(self):
         """Listen for messages from Redis and forward to local connections"""

@@ -28,6 +28,24 @@ AVAILABLE_MODELS = [
 ]
 
 
+def _patch_nms_max_time_img(seconds_per_img: float = 2.0):
+    """Patch Ultralytics NMS：当未显式传入 max_time_img 时使用更大值，避免 time limit exceeded"""
+    try:
+        from ultralytics.utils import nms as nms_mod
+
+        _original_nms = nms_mod.non_max_suppression
+
+        def _patched_nms(*args, **kwargs):
+            if 'max_time_img' not in kwargs:
+                kwargs['max_time_img'] = seconds_per_img
+            return _original_nms(*args, **kwargs)
+
+        nms_mod.non_max_suppression = _patched_nms
+        logger.info(f"Patched NMS max_time_img default to {seconds_per_img}s")
+    except Exception as e:
+        logger.debug(f"Could not patch NMS max_time_img: {e}")
+
+
 async def _cleanup_gpu_memory(gpu_id: Optional[int] = None):
     """清理GPU显存，释放缓存
 
@@ -63,8 +81,10 @@ class TrainingService:
 
     @staticmethod
     async def create_job(db: AsyncSession, data: TrainingJobCreate) -> TrainingJob:
-        # 如果是继续训练，验证基础模型存在
-        if data.resume_training and data.base_model_id:
+        # 如果是继续训练，必须提供且验证基础模型存在
+        if data.resume_training:
+            if not data.base_model_id or not str(data.base_model_id).strip():
+                raise ValueError("继续训练时必须选择基础模型")
             base_model_result = await db.execute(
                 select(Model).where(Model.id == data.base_model_id)
             )
@@ -89,16 +109,21 @@ class TrainingService:
             status=JobStatus.PENDING,
         )
 
-        # 保存继续训练和类别增强参数
-        if data.resume_training:
+        # 保存继续训练和类别增强参数（仅当 base_model_id 有效时保存）
+        if data.resume_training and data.base_model_id:
             job.extra_params['resume_training'] = True
-            job.extra_params['base_model_id'] = data.base_model_id
+            job.extra_params['base_model_id'] = str(data.base_model_id).strip()
 
         if data.class_weights:
             job.extra_params['class_weights'] = data.class_weights
 
         if data.focus_classes:
             job.extra_params['focus_classes'] = data.focus_classes
+
+        # 保存独立验证集参数
+        if getattr(data, 'use_validation_dataset', False) and getattr(data, 'validation_dataset_id', None):
+            job.extra_params['use_validation_dataset'] = True
+            job.extra_params['validation_dataset_id'] = data.validation_dataset_id
 
         # 保存早停参数
         if data.patience is not None:
@@ -209,16 +234,16 @@ class TrainingService:
         return True
 
     @staticmethod
-    async def run_training_job(job_id: str, allocated_gpu_id: Optional[int] = None):
+    async def run_training_job(job_id: str, allocated_device: Optional[str] = None):
         """Run training in a thread pool (YOLO training is synchronous)
 
         Args:
             job_id: Training job ID
-            allocated_gpu_id: GPU ID allocated by queue manager (for CUDA_VISIBLE_DEVICES)
+            allocated_device: GPU device string from queue (e.g. "0" or "0,1")
         """
         loop = asyncio.get_event_loop()
-        # Pass the main event loop and allocated GPU ID to the training function
-        await loop.run_in_executor(None, _run_training_sync, job_id, loop, allocated_gpu_id)
+        # Pass the main event loop and allocated device string (e.g. "0" or "0,1") to the training function
+        await loop.run_in_executor(None, _run_training_sync, job_id, loop, allocated_device)
 
     @staticmethod
     async def prepare_yolo_dataset(db: AsyncSession, job: TrainingJob) -> str:
@@ -312,18 +337,60 @@ class TrainingService:
         all_images = images_with_annotations
         random.shuffle(all_images)
 
-        # Calculate split - ensure at least 10% for training
-        val_split = min(job.val_split, 0.9)  # Cap at 90% validation max
-        train_count = max(1, int(len(all_images) * (1 - val_split)))
+        extra = job.extra_params or {}
+        use_validation_dataset = extra.get("use_validation_dataset") and extra.get("validation_dataset_id")
 
-        # Split: train first, then val
-        train_images = all_images[:train_count]
-        val_images = all_images[train_count:]
+        if use_validation_dataset:
+            # 使用独立验证集：训练集=全部训练数据，验证集=从指定数据集加载
+            train_images = all_images
+            val_dataset_id = extra["validation_dataset_id"]
 
-        logger.info(
-            f"Dataset split: {len(train_images)} training, {len(val_images)} validation "
-            f"(split ratio: {1-val_split:.1%} train, {val_split:.1%} val)"
-        )
+            # 加载验证集数据集
+            val_dataset_result = await db.execute(
+                select(Dataset).where(Dataset.id == val_dataset_id)
+            )
+            val_dataset = val_dataset_result.scalar_one_or_none()
+            if not val_dataset:
+                raise ValueError(f"Validation dataset {val_dataset_id} not found")
+
+            # 获取验证集中有标注的图片（仅原始图，增强图可选；这里先用全部）
+            val_images_result = await db.execute(
+                select(Image).where(Image.dataset_id == val_dataset_id)
+            )
+            val_all = val_images_result.scalars().all()
+            val_images = []
+            for img in val_all:
+                anns_result = await db.execute(
+                    select(Annotation).where(Annotation.image_id == img.id)
+                )
+                if anns_result.scalars().all():
+                    val_images.append(img)
+
+            if not val_images:
+                raise ValueError(
+                    f"Validation dataset '{val_dataset.name}' has no images with annotations. "
+                    f"Please add annotations to the validation dataset."
+                )
+
+            logger.info(
+                f"Dataset split: {len(train_images)} training (from train dataset), "
+                f"{len(val_images)} validation (from dataset '{val_dataset.name}')"
+            )
+            await ws_manager.send_message(job.id, {
+                "type": "info",
+                "message": f"使用独立验证集: 训练 {len(train_images)} 张，验证 {len(val_images)} 张（来自 {val_dataset.name}）",
+            })
+        else:
+            # 按比例从训练集划分
+            val_split = min(job.val_split, 0.9)  # Cap at 90% validation max
+            train_count = max(1, int(len(all_images) * (1 - val_split)))
+            train_images = all_images[:train_count]
+            val_images = all_images[train_count:]
+
+            logger.info(
+                f"Dataset split: {len(train_images)} training, {len(val_images)} validation "
+                f"(split ratio: {1-val_split:.1%} train, {val_split:.1%} val)"
+            )
 
         # Output structure
         output_dir = settings.EXPORT_DIR / f"train_{job.id}"
@@ -331,7 +398,21 @@ class TrainingService:
             (output_dir / "images" / split).mkdir(parents=True, exist_ok=True)
             (output_dir / "labels" / split).mkdir(parents=True, exist_ok=True)
 
+        # 当使用独立验证集时，验证集可能有不同的类别顺序，需要建立 class_name -> train_class_id 的映射
+        val_class_map = None  # {class_name: train_class_id}
+        if use_validation_dataset:
+            train_classes = dataset.classes or []
+            val_class_map = {}
+            # 验证集类别可能在不同顺序，按名称映射
+            if val_dataset.classes:
+                for name in val_dataset.classes:
+                    if name in train_classes:
+                        val_class_map[name] = train_classes.index(name)
+                    else:
+                        logger.warning(f"Validation dataset has class '{name}' not in training dataset, such annotations will be skipped")
+
         for split_name, split_images in [("train", train_images), ("val", val_images)]:
+            is_val_from_separate = split_name == "val" and use_validation_dataset
             for img in split_images:
                 # Copy image
                 src = Path(img.file_path)
@@ -346,18 +427,41 @@ class TrainingService:
                 )
                 anns = anns_result.scalars().all()
 
+                # 验证集来自独立数据集时，映射 class_id 到训练集类别
+                if is_val_from_separate:
+                    train_classes = dataset.classes or []
+                    mapped_anns = []
+                    for a in anns:
+                        name = a.class_name or (val_dataset.classes[a.class_id] if val_dataset.classes and a.class_id < len(val_dataset.classes) else None)
+                        if val_class_map and name is not None and name in val_class_map:
+                            train_cid = val_class_map[name]
+                        elif name is not None and name in train_classes:
+                            train_cid = train_classes.index(name)
+                        elif not val_class_map and train_classes and a.class_id < len(train_classes):
+                            # 验证集无 classes 时假定顺序一致
+                            train_cid = a.class_id
+                        else:
+                            continue
+                        mapped_anns.append({
+                            "class_id": train_cid,
+                            "x_center": a.x_center, "y_center": a.y_center,
+                            "bbox_width": a.bbox_width, "bbox_height": a.bbox_height,
+                        })
+                    ann_list = mapped_anns
+                else:
+                    ann_list = [
+                        {
+                            "class_id": a.class_id,
+                            "x_center": a.x_center,
+                            "y_center": a.y_center,
+                            "bbox_width": a.bbox_width,
+                            "bbox_height": a.bbox_height,
+                        }
+                        for a in anns
+                    ]
+
                 label_filename = Path(img.filename).stem + ".txt"
                 label_path = output_dir / "labels" / split_name / label_filename
-                ann_list = [
-                    {
-                        "class_id": a.class_id,
-                        "x_center": a.x_center,
-                        "y_center": a.y_center,
-                        "bbox_width": a.bbox_width,
-                        "bbox_height": a.bbox_height,
-                    }
-                    for a in anns
-                ]
                 write_yolo_annotation(str(label_path), ann_list)
 
         # Build dataset.yaml
@@ -407,24 +511,23 @@ class TrainingService:
         return yaml_path, data_stats
 
 
-def _run_training_sync(job_id: str, main_loop, allocated_gpu_id: Optional[int] = None):
+def _run_training_sync(job_id: str, main_loop, allocated_device: Optional[str] = None):
     """Synchronous training function (runs in thread pool)
 
     Args:
         job_id: Training job ID
         main_loop: Main event loop
-        allocated_gpu_id: GPU ID allocated by queue manager (for CUDA_VISIBLE_DEVICES)
+        allocated_device: GPU device string from queue (e.g. "0" or "0,1" for multi-GPU)
     """
     import asyncio
     import nest_asyncio
 
-    # **关键修复**: 设置 CUDA_VISIBLE_DEVICES 环境变量
-    # 这样PyTorch只能看到分配给它的那个GPU，不会在其他GPU上初始化CUDA上下文
+    # 设置 CUDA_VISIBLE_DEVICES，单卡如 "0"，多卡如 "0,1"
     original_cuda_visible_devices = None
-    if allocated_gpu_id is not None:
+    if allocated_device:
         original_cuda_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES')
-        os.environ['CUDA_VISIBLE_DEVICES'] = str(allocated_gpu_id)
-        logger.info(f"Job {job_id}: Set CUDA_VISIBLE_DEVICES={allocated_gpu_id} (original: {original_cuda_visible_devices})")
+        os.environ['CUDA_VISIBLE_DEVICES'] = allocated_device
+        logger.info(f"Job {job_id}: Set CUDA_VISIBLE_DEVICES={allocated_device} (original: {original_cuda_visible_devices})")
 
     # Allow nested event loops (needed for Ultralytics callbacks)
     try:
@@ -462,7 +565,10 @@ def _run_training_sync(job_id: str, main_loop, allocated_gpu_id: Optional[int] =
                             # 处理CUDA OOM错误信息
                             error_message = str(e)
                             if "CUDA out of memory" in error_message or "OutOfMemoryError" in error_message:
-                                error_message = "GPU显存不足，训练失败。建议：1) 减小batch size 2) 减小图片尺寸 3) 等待其他训练任务完成"
+                                error_message = (
+                                    "GPU 显存不足 (OOM)。建议：1) 图片尺寸改为 640×640 或 1280×1280；"
+                                    "2) batch_size 降至 2-4；3) 等待其他训练任务释放显存。"
+                                )
                             job.error_message = error_message
                             # Clear time estimation fields
                             job.avg_epoch_time = None
@@ -495,12 +601,11 @@ def _run_training_sync(job_id: str, main_loop, allocated_gpu_id: Optional[int] =
         loop.close()
 
         # 恢复原来的CUDA_VISIBLE_DEVICES环境变量
-        if allocated_gpu_id is not None:
+        if allocated_device:
             if original_cuda_visible_devices is not None:
                 os.environ['CUDA_VISIBLE_DEVICES'] = original_cuda_visible_devices
                 logger.debug(f"Job {job_id}: Restored CUDA_VISIBLE_DEVICES={original_cuda_visible_devices}")
             else:
-                # 如果原来没有设置，则删除
                 os.environ.pop('CUDA_VISIBLE_DEVICES', None)
                 logger.debug(f"Job {job_id}: Removed CUDA_VISIBLE_DEVICES")
 
@@ -667,31 +772,25 @@ async def _execute_training(db: AsyncSession, job_id: str, main_loop):
         except Exception as e:
             logger.debug(f"Failed to schedule progress update: {e}")
 
-        # Send websocket update
-        async def _send_ws():
-            try:
-                await ws_manager.send_message(job_id, {
-                    "type": "training_progress",
-                    "job_id": job_id,
-                    "epoch": epoch,
-                    "total_epochs": job.epochs,
-                    "metrics": metrics,
-                    "metrics_history": metrics_history.copy(),  # 完整历史数据
-                    "percent": round(epoch / job.epochs * 100, 1),
-
-                    # 时间信息
-                    "elapsed_time": elapsed_time,
-                    "avg_epoch_time": avg_epoch_time,
-                    "estimated_remaining_time": estimated_remaining_time,
-                    "estimated_completion_time": estimated_completion_time.isoformat() if estimated_remaining_time > 0 else None,
-                })
-            except Exception as e:
-                logger.warning(f"Failed to send websocket message: {e}")
-
+        # Send websocket update (use sync publish to avoid "Future attached to different loop")
         try:
-            asyncio.run_coroutine_threadsafe(_send_ws(), main_loop)
+            ws_manager.publish_sync(job_id, {
+                "type": "training_progress",
+                "job_id": job_id,
+                "epoch": epoch,
+                "total_epochs": job.epochs,
+                "metrics": metrics,
+                "metrics_history": metrics_history.copy(),  # 完整历史数据
+                "percent": round(epoch / job.epochs * 100, 1),
+
+                # 时间信息
+                "elapsed_time": elapsed_time,
+                "avg_epoch_time": avg_epoch_time,
+                "estimated_remaining_time": estimated_remaining_time,
+                "estimated_completion_time": estimated_completion_time.isoformat() if estimated_remaining_time > 0 else None,
+            })
         except Exception as e:
-            logger.debug(f"Failed to schedule websocket update: {e}")
+            logger.debug(f"Failed to send websocket update: {e}")
 
     def on_val_end(validator):
         if hasattr(validator, 'metrics'):
@@ -706,24 +805,18 @@ async def _execute_training(db: AsyncSession, job_id: str, main_loop):
                     "val/map50_95": map50_95
                 })
 
-                # 通过WebSocket发送验证指标更新
-                async def _send_val_ws():
-                    try:
-                        await ws_manager.send_message(job_id, {
-                            "type": "validation_metrics",
-                            "job_id": job_id,
-                            "epoch": metrics_history[-1].get("epoch"),
-                            "map50": map50,
-                            "map50_95": map50_95,
-                            "metrics_history": metrics_history.copy(),
-                        })
-                    except Exception as e:
-                        logger.warning(f"Failed to send validation metrics: {e}")
-
+                # 通过WebSocket发送验证指标更新 (use sync publish to avoid loop error)
                 try:
-                    asyncio.run_coroutine_threadsafe(_send_val_ws(), main_loop)
+                    ws_manager.publish_sync(job_id, {
+                        "type": "validation_metrics",
+                        "job_id": job_id,
+                        "epoch": metrics_history[-1].get("epoch"),
+                        "map50": map50,
+                        "map50_95": map50_95,
+                        "metrics_history": metrics_history.copy(),
+                    })
                 except Exception as e:
-                    logger.debug(f"Failed to schedule validation update: {e}")
+                    logger.debug(f"Failed to send validation metrics: {e}")
 
     model.add_callback("on_train_epoch_end", on_train_epoch_end)
     model.add_callback("on_val_end", on_val_end)
@@ -755,6 +848,41 @@ async def _execute_training(db: AsyncSession, job_id: str, main_loop):
     # 构建图片尺寸参数：优先使用 extra_params 中的列表格式
     imgsz_param = job.extra_params.get('imgsz', job.img_size)
 
+    # 显存风险校验：避免 imgsz 过大导致 CUDA OOM（10-11GB 显卡常见）
+    def _effective_imgsz(p):
+        if isinstance(p, (list, tuple)) and len(p) >= 2:
+            return int(p[0]), int(p[1])
+        x = int(p)
+        return x, x
+
+    imgsz_w, imgsz_h = _effective_imgsz(imgsz_param)
+    img_pixels = imgsz_w * imgsz_h
+    is_multi_gpu = "," in str(device)
+    gpu_count = len(str(device).split(",")) if is_multi_gpu else 1
+
+    # DDP 时 batch_size 平分到每卡，必须 >= GPU 数量
+    if is_multi_gpu and job.batch_size < gpu_count:
+        raise ValueError(
+            f"双卡训练时 batch_size 会平分到每张卡，当前 batch_size={job.batch_size} 会导致每卡为 0。"
+            f"请将 batch_size 设为 ≥ {gpu_count}。"
+        )
+    max_batch_for_large = 2 if is_multi_gpu else 1  # 双卡时允许 batch 2
+    # batch 超限时拒绝；双卡(0,1)可适当放宽
+    if img_pixels > 2048 * 2048 and job.batch_size > max_batch_for_large:
+        raise ValueError(
+            f"图片尺寸 {imgsz_w}x{imgsz_h} 配合 batch_size={job.batch_size} 显存压力大。"
+            f"大尺寸时请将 batch_size 设为 {max_batch_for_large}，或选用双卡(0,1)后尝试 batch 2。"
+        )
+    if img_pixels > 1280 * 1280 and job.batch_size > 4:
+        raise ValueError(
+            f"图片尺寸 {imgsz_w}x{imgsz_h} 配合 batch_size={job.batch_size} 显存压力大。"
+            f"建议将 batch_size 降至 2-4 或减小图片尺寸至 1280×1280。"
+        )
+    if img_pixels > 2048 * 2048 and job.batch_size == 1:
+        logger.warning(
+            f"⚠️ 大尺寸 {imgsz_w}x{imgsz_h} batch=1：建议 16GB+ 显存，10-11GB 显卡可能 OOM"
+        )
+
     # Train
     train_args = {
         "data": yaml_path,
@@ -770,7 +898,8 @@ async def _execute_training(db: AsyncSession, job_id: str, main_loop):
         "plots": True,
         "cache": False,
         "workers": final_workers,
-        "patience": job.extra_params.get('patience', 100),
+        # patience=0 在 Ultralytics 中并不能禁用早停，需传入极大值（如 99999）
+        "patience": 99999 if (job.extra_params.get('patience') or 100) == 0 else job.extra_params.get('patience', 100),
         "save_period": job.extra_params.get('save_period', -1),
         # 训练控制
         "save": job.extra_params.get('save', True),
@@ -806,10 +935,18 @@ async def _execute_training(db: AsyncSession, job_id: str, main_loop):
         "nbs": job.extra_params.get('nbs', 64),
     }
 
-    # 继续训练：从已有模型恢复
-    if job.extra_params.get('resume_training'):
-        train_args['resume'] = True
-        logger.info("Resuming training from existing model")
+    # 注意：我们的「继续训练」= 从已有模型权重开始新训练，不是 Ultralytics 的 resume
+    # resume=True 仅用于从中断的同一 run 恢复；若 base_model 是已训练完成的 checkpoint（如 best.pt），
+    # Ultralytics 会尝试 resume 并因 "nothing to resume" 断言失败。显式传 resume=False 强制从权重开始新训练。
+    train_args["resume"] = False
+
+    # 默认关闭 AMP：Ultralytics 8.4.x 的 check_amp 会忽略用户选择的模型，强制下载 yolo26n.pt 做校验
+    # 见 https://github.com/ultralytics/ultralytics/issues/10325
+    # 用户选了 yolov8n 却下载 yolo26n，国内 GitHub 又慢。amp=False 可避免该下载
+    use_amp = job.extra_params.get("amp") is True
+    train_args["amp"] = use_amp
+    if not use_amp:
+        logger.info("amp=False to avoid check_amp downloading yolo26n.pt")
 
     # 类别权重：对特定类别加强训练
     if job.extra_params.get('class_weights'):
@@ -832,6 +969,8 @@ async def _execute_training(db: AsyncSession, job_id: str, main_loop):
         # 已在 train_args 中显式处理的参数，不再从 extra_params 覆盖
         skip_keys = {
             'resume_training', 'base_model_id', 'class_weights', 'focus_classes',
+            'resume',  # 始终由我们显式设为 False，避免 extra_params 覆盖
+            'amp',    # 继续训练时设为 False 避免 check_amp 下载
             'patience', 'save_period', 'enable_webhook', 'workers',
             # 新增的 YOLO 参数已在 train_args 中直接设置
             'imgsz', 'augment', 'hsv_h', 'hsv_s', 'hsv_v',
@@ -852,6 +991,9 @@ async def _execute_training(db: AsyncSession, job_id: str, main_loop):
 
     # 训练前清理显存
     await _cleanup_gpu_memory()
+
+    # 增大 NMS max_time_img 默认值，避免 "NMS time limit exceeded" 导致验证 mAP 异常低下
+    _patch_nms_max_time_img(2.0)
 
     try:
         logger.info("Calling model.train() ...")

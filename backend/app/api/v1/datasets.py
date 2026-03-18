@@ -1,6 +1,10 @@
 """
 Dataset API endpoints
 """
+import shutil
+import tempfile
+import zipfile
+import re
 from typing import Optional
 from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query, BackgroundTasks, Request
@@ -19,7 +23,7 @@ from app.schemas.schemas import (
     APICollectionRequest, PaginatedResponse, SuccessResponse,
 )
 from app.services import DatasetService, collect_from_urls
-from app.utils import allowed_image
+from app.utils import allowed_image, write_yolo_annotation, build_yolo_dataset_yaml
 import json
 
 router = APIRouter(prefix="/datasets", tags=["datasets"])
@@ -136,6 +140,114 @@ async def delete_dataset(dataset_id: str, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Dataset not found")
     await db.commit()
     return {"success": True, "message": "Dataset deleted"}
+
+
+@router.get("/{dataset_id}/export", summary="Export dataset as YOLO format ZIP")
+async def export_dataset(
+    dataset_id: str,
+    annotated_only: bool = Query(False, description="仅导出已标注的图片"),
+    db: AsyncSession = Depends(get_db),
+):
+    """导出数据集为 YOLO 格式 ZIP 包（含 images/、labels/、dataset.yaml、classes.txt）"""
+    dataset = await DatasetService.get_dataset(db, dataset_id)
+    if not dataset:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+
+    # 获取图片列表
+    query = select(Image).where(Image.dataset_id == dataset_id)
+    result = await db.execute(query)
+    images = result.scalars().all()
+
+    if not images:
+        raise HTTPException(status_code=400, detail="Dataset has no images")
+
+    # 筛选已标注图片（若需要）
+    if annotated_only:
+        images_with_anns = []
+        for img in images:
+            ann_result = await db.execute(
+                select(Annotation).where(Annotation.image_id == img.id)
+            )
+            if ann_result.scalars().all():
+                images_with_anns.append(img)
+        images = images_with_anns
+        if not images:
+            raise HTTPException(status_code=400, detail="Dataset has no images with annotations")
+
+    classes = dataset.classes or []
+    if not classes:
+        # 从标注提取类别
+        class_query = await db.execute(
+            select(Annotation.class_id, Annotation.class_name)
+            .join(Image, Image.id == Annotation.image_id)
+            .where(Image.dataset_id == dataset_id)
+            .distinct()
+            .order_by(Annotation.class_id)
+        )
+        class_rows = class_query.all()
+        if class_rows:
+            max_cid = max(row.class_id for row in class_rows)
+            classes = [""] * (max_cid + 1)
+            for row in class_rows:
+                classes[row.class_id] = row.class_name or str(row.class_id)
+
+    temp_dir = Path(tempfile.mkdtemp())
+    try:
+        images_dir = temp_dir / "images"
+        labels_dir = temp_dir / "labels"
+        images_dir.mkdir()
+        labels_dir.mkdir()
+
+        for img in images:
+            src = Path(img.file_path)
+            if not src.exists():
+                continue
+            dst_img = images_dir / img.filename
+            shutil.copy2(str(src), str(dst_img))
+
+            ann_result = await db.execute(
+                select(Annotation).where(Annotation.image_id == img.id)
+            )
+            anns = ann_result.scalars().all()
+            ann_list = [
+                {
+                    "class_id": a.class_id,
+                    "x_center": a.x_center,
+                    "y_center": a.y_center,
+                    "bbox_width": a.bbox_width,
+                    "bbox_height": a.bbox_height,
+                }
+                for a in anns
+            ]
+            label_path = labels_dir / (Path(img.filename).stem + ".txt")
+            write_yolo_annotation(str(label_path), ann_list)
+
+        build_yolo_dataset_yaml(
+            dataset_dir=str(temp_dir),
+            classes=classes,
+            train_path="images",
+            val_path="images",
+        )
+
+        # classes.txt
+        if classes:
+            (temp_dir / "classes.txt").write_text("\n".join(classes), encoding="utf-8")
+
+        safe_name = re.sub(r'[<>:"/\\|?*]', '_', dataset.name)
+        zip_path = Path(tempfile.gettempdir()) / f"dataset_{safe_name}_{dataset_id[:8]}.zip"
+
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for f in temp_dir.rglob("*"):
+                if f.is_file():
+                    zf.write(f, f.relative_to(temp_dir))
+
+        return FileResponse(
+            str(zip_path),
+            filename=f"{safe_name}_yolo.zip",
+            media_type="application/zip",
+        )
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 # ─────────────────────────────────────────────
@@ -389,6 +501,29 @@ async def delete_image(dataset_id: str, image_id: str, db: AsyncSession = Depend
     await DatasetService.delete_image(db, image_id)
     await db.commit()
     return {"success": True, "message": "Image deleted"}
+
+
+@router.post("/{dataset_id}/images/{image_id}/move", summary="Move image to another dataset")
+async def move_image(
+    dataset_id: str,
+    image_id: str,
+    target_dataset_id: str = Query(..., description="目标数据集ID"),
+    db: AsyncSession = Depends(get_db),
+):
+    """将图片及其标注移动到另一个数据集"""
+    try:
+        new_image = await DatasetService.move_image_to_dataset(
+            db, dataset_id, image_id, target_dataset_id
+        )
+        await db.commit()
+        return {
+            "success": True,
+            "message": "图片已移动",
+            "new_image_id": new_image.id,
+            "target_dataset_id": target_dataset_id,
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.delete("/{dataset_id}/classes/{class_name}", summary="Delete class and its annotations")

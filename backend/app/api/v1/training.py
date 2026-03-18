@@ -35,6 +35,17 @@ async def create_training_job(
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
 
+    # Validate validation dataset if using separate validation set
+    if getattr(data, 'use_validation_dataset', False) and getattr(data, 'validation_dataset_id', None):
+        val_ds_result = await db.execute(
+            select(Dataset).where(Dataset.id == data.validation_dataset_id)
+        )
+        val_ds = val_ds_result.scalar_one_or_none()
+        if not val_ds:
+            raise HTTPException(status_code=404, detail="Validation dataset not found")
+        if data.validation_dataset_id == data.dataset_id:
+            raise HTTPException(status_code=400, detail="Validation dataset cannot be the same as training dataset")
+
     # Check if dataset has images
     images_result = await db.execute(
         select(Image).where(Image.dataset_id == data.dataset_id)
@@ -69,7 +80,38 @@ async def create_training_job(
             f"Training with partially labeled data may result in poor model performance."
         )
 
-    job = await TrainingService.create_job(db, data)
+    # 多卡 DDP：batch_size 会被平分到每张卡，必须 >= GPU 数量
+    is_multi_gpu = data.device and "," in str(data.device)
+    if is_multi_gpu:
+        gpu_count = len(str(data.device).split(","))
+        if data.batch_size < gpu_count:
+            raise HTTPException(
+                status_code=400,
+                detail=f"双卡(0,1)训练时 batch_size 会平分到每张卡，当前 batch_size={data.batch_size} 会导致每卡为 0。请将 batch_size 设为 ≥ {gpu_count}。",
+            )
+
+    # 显存风险校验：大尺寸 + 大 batch 易 OOM
+    # 双卡(0,1)时允许 batch 2；单卡时大尺寸仅允许 batch 1
+    img_w = data.img_size
+    img_h = getattr(data, "img_size_2", None) or data.img_size
+    img_pixels = img_w * img_h
+    max_batch = 2 if is_multi_gpu else 1
+    if img_pixels > 2048 * 2048 and data.batch_size > max_batch:
+        raise HTTPException(
+            status_code=400,
+            detail=f"图片尺寸 {img_w}×{img_h} 配合 batch_size={data.batch_size} 显存压力大。"
+            f"大尺寸时请将 batch_size 设为 {max_batch}，或选用双卡(0,1)后尝试 batch 2。",
+        )
+    if img_pixels > 1280 * 1280 and data.batch_size > 4:
+        raise HTTPException(
+            status_code=400,
+            detail=f"图片尺寸 {img_w}×{img_h} 配合 batch_size={data.batch_size} 显存压力大。建议 batch_size 降至 2-4。",
+        )
+
+    try:
+        job = await TrainingService.create_job(db, data)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     await db.commit()
     # Start training in background thread
     background_tasks.add_task(TrainingService.run_training_job, job.id)

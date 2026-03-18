@@ -325,7 +325,9 @@ class TrainingJobCreate(BaseModel):
     img_size: int = Field(640, ge=32, le=8192, description="图片尺寸（第一维度）")
     img_size_2: Optional[int] = Field(640, ge=32, le=8192, description="图片尺寸（第二维度），为空则使用正方形")
     learning_rate: float = Field(0.00001, gt=0, le=1.0, description="初始学习率 (lr0)")
-    val_split: float = Field(0.2, gt=0, lt=1.0, description="验证集划分比例")
+    val_split: float = Field(0.2, gt=0, lt=1.0, description="验证集划分比例（当 use_validation_dataset=False 时使用）")
+    use_validation_dataset: bool = Field(False, description="是否使用独立数据集作为验证集")
+    validation_dataset_id: Optional[str] = Field(None, description="独立验证集的数据集ID，use_validation_dataset=True 时必填")
     device: str = Field("0", description="训练设备：auto/cpu/0/1/0,1")
     use_augmented_data: bool = True
     extra_params: Optional[Dict[str, Any]] = {}

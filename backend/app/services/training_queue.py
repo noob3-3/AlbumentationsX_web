@@ -111,29 +111,53 @@ class TrainingQueueManager:
                 await db.commit()
                 logger.info(f"Job {job_id} status updated to PENDING")
 
-    async def _allocate_gpu(self, job_id: str) -> Optional[int]:
-        """为训练任务分配一个空闲GPU"""
+    def _parse_device_gpus(self, device_str: str) -> Optional[list]:
+        """解析 device 字符串，返回 GPU ID 列表。如 '0,1' -> [0,1]，'0' -> [0]"""
+        if not device_str or device_str == "cpu" or device_str == "auto":
+            return None
+        try:
+            ids = [int(x.strip()) for x in device_str.split(",") if x.strip()]
+            if ids and all(0 <= i < self._gpu_count for i in ids):
+                return ids
+        except (ValueError, AttributeError):
+            pass
+        return None
+
+    async def _allocate_gpus(self, job_id: str, device_str: str) -> Optional[str]:
+        """为训练任务分配 GPU。若 device 为 '0,1' 则分配多卡；否则分配单卡。
+        返回 CUDA_VISIBLE_DEVICES 值，如 '0'、'0,1'；分配失败返回 None"""
+        gpu_ids = self._parse_device_gpus(device_str)
+        if not gpu_ids:
+            gpu_ids = [0]  # auto/cpu 时按单卡分配
+
         async with self._allocation_lock:
-            # 查找空闲的GPU
             used_gpus = set(self._gpu_allocations.keys())
             available_gpus = set(range(self._gpu_count)) - used_gpus
+            needed = set(gpu_ids)
 
-            if available_gpus:
-                gpu_id = min(available_gpus)  # 选择编号最小的空闲GPU
-                self._gpu_allocations[gpu_id] = job_id
-                logger.info(f"Allocated GPU {gpu_id} to job {job_id}")
-                return gpu_id
+            if needed.issubset(available_gpus):
+                cuda_devices = ",".join(str(i) for i in gpu_ids)
+                for gid in gpu_ids:
+                    self._gpu_allocations[gid] = job_id
+                logger.info(f"Allocated GPU(s) {cuda_devices} to job {job_id}")
+                return cuda_devices
 
-            logger.warning(f"No available GPU for job {job_id}, all {self._gpu_count} GPUs are in use")
+            logger.warning(
+                f"No available GPU(s) for job {job_id}: need {list(needed)}, "
+                f"available {list(available_gpus)}, used {list(used_gpus)}"
+            )
             return None
 
-    async def _release_gpu(self, gpu_id: int):
-        """释放GPU"""
+    async def _release_gpus(self, device_str: str, job_id: str):
+        """释放 job 占用的所有 GPU"""
+        gpu_ids = self._parse_device_gpus(device_str) if device_str else []
+        if not gpu_ids:
+            return
         async with self._allocation_lock:
-            if gpu_id in self._gpu_allocations:
-                job_id = self._gpu_allocations[gpu_id]
-                del self._gpu_allocations[gpu_id]
-                logger.info(f"Released GPU {gpu_id} from job {job_id}")
+            for gpu_id in gpu_ids:
+                if self._gpu_allocations.get(gpu_id) == job_id:
+                    del self._gpu_allocations[gpu_id]
+                    logger.info(f"Released GPU {gpu_id} from job {job_id}")
 
     def is_training(self) -> bool:
         """检查是否有训练任务正在执行"""
@@ -157,61 +181,67 @@ class TrainingQueueManager:
 
         while self._running:
             job_id = None
-            gpu_id = None
+            allocated_device = None
 
             try:
-                # 等待队列中的任务（带超时，以便可以响应停止信号）
                 try:
                     job_id = await asyncio.wait_for(self._queue.get(), timeout=1.0)
                 except asyncio.TimeoutError:
                     continue
 
-                # 获取信号量（控制并发数量）
-                async with self._training_semaphore:
-                    # 分配GPU
-                    gpu_id = await self._allocate_gpu(job_id)
+                # 先获取任务的 device 配置，以决定分配单卡还是多卡
+                job_device = "auto"
+                async with AsyncSessionLocal() as db:
+                    result = await db.execute(
+                        select(TrainingJob).where(TrainingJob.id == job_id)
+                    )
+                    job = result.scalar_one_or_none()
+                    if job:
+                        job_device = job.device or "auto"
 
-                    if gpu_id is None:
-                        # 理论上不应该发生，因为信号量已经控制了并发数
-                        logger.error(f"Failed to allocate GPU for job {job_id}")
+                async with self._training_semaphore:
+                    allocated_device = await self._allocate_gpus(job_id, job_device)
+
+                    if allocated_device is None:
+                        logger.warning(f"No GPU available for job {job_id}, re-queuing...")
+                        await self._queue.put(job_id)
                         self._queue.task_done()
+                        await asyncio.sleep(5)
                         continue
 
-                    logger.info(f"Worker #{worker_id}: Starting training job {job_id} on GPU {gpu_id}")
+                    logger.info(f"Worker #{worker_id}: Starting training job {job_id} on GPU(s) {allocated_device}")
 
                     try:
-                        # 更新任务，指定使用的GPU
                         async with AsyncSessionLocal() as db:
                             result = await db.execute(
                                 select(TrainingJob).where(TrainingJob.id == job_id)
                             )
                             job = result.scalar_one_or_none()
                             if job:
-                                # 如果任务设置为auto，则自动分配GPU
                                 if job.device == "auto":
-                                    job.device = str(gpu_id)
+                                    job.device = allocated_device
                                     await db.commit()
-                                    logger.info(f"Job {job_id} device set to GPU {gpu_id}")
+                                    logger.info(f"Job {job_id} device set to {allocated_device}")
 
-                        # 执行训练，传递GPU ID以便设置环境变量
                         from app.services.training_service import TrainingService
-                        await TrainingService.run_training_job(job_id, allocated_gpu_id=gpu_id)
-                        logger.info(f"Worker #{worker_id}: Training job {job_id} completed on GPU {gpu_id}")
+                        await TrainingService.run_training_job(
+                            job_id, allocated_device=allocated_device
+                        )
+                        logger.info(f"Worker #{worker_id}: Training job {job_id} completed")
 
                     except Exception as e:
-                        logger.error(f"Worker #{worker_id}: Training job {job_id} failed on GPU {gpu_id}: {e}")
+                        logger.error(f"Worker #{worker_id}: Training job {job_id} failed: {e}")
 
                     finally:
-                        # 释放GPU
-                        if gpu_id is not None:
-                            await self._release_gpu(gpu_id)
+                        if allocated_device:
+                            await self._release_gpus(allocated_device, job_id)
 
                         self._queue.task_done()
 
-                        # 清理该GPU的显存
-                        await self._cleanup_gpu_memory(gpu_id)
+                        # 清理显存（多卡时清理所有分配的卡）
+                        for gid in (self._parse_device_gpus(allocated_device) or []):
+                            await self._cleanup_gpu_memory(gid)
 
-                        # 等待一小段时间，确保资源完全释放
                         await asyncio.sleep(2)
 
             except asyncio.CancelledError:

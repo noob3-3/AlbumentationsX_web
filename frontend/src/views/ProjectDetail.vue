@@ -121,7 +121,7 @@
                   <el-tag :type="getStatusType(row.status)" size="small">{{ row.status }}</el-tag>
                 </template>
               </el-table-column>
-              <el-table-column label="操作" width="240" fixed="right">
+              <el-table-column label="操作" width="280" fixed="right">
                 <template #default="{ row }">
                   <el-button link type="primary" size="small" @click="$router.push(`/datasets/${row.id}`)">
                     查看
@@ -131,6 +131,9 @@
                   </el-button>
                   <el-button link type="primary" size="small" @click="$router.push(`/annotation?dataset=${row.id}`)">
                     标注
+                  </el-button>
+                  <el-button link type="primary" size="small" @click="exportDataset(row)">
+                    导出
                   </el-button>
                   <el-popconfirm title="确认删除?" @confirm="deleteDataset(row.id)">
                     <template #reference>
@@ -462,6 +465,21 @@ async function deleteDataset(datasetId) {
     loadProject()
   } catch (error) {
     ElMessage.error('删除失败')
+  }
+}
+
+async function exportDataset(dataset) {
+  try {
+    const blob = await datasetApi.export(dataset.id)
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `${dataset.name || 'dataset'}_yolo.zip`
+    a.click()
+    URL.revokeObjectURL(url)
+    ElMessage.success('数据集导出成功')
+  } catch (error) {
+    ElMessage.error(error.response?.data?.detail || error.message || '导出失败')
   }
 }
 

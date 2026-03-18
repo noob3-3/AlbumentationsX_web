@@ -55,7 +55,8 @@ ENV PYTHONUNBUFFERED=1 \
     HOST=0.0.0.0 \
     PORT=8000 \
     DEBUG=false \
-    STATIC_DIR=/app/static
+    STATIC_DIR=/app/static \
+    TZ=Asia/Shanghai
 
 EXPOSE 8000
 

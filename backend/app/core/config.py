@@ -60,6 +60,9 @@ class Settings(BaseSettings):
     # Client API token (for remote data collection client)
     CLIENT_API_TOKEN: str = "your-secret-token-change-this"
 
+    # 时区（用于日志、时间显示，如 Asia/Shanghai、UTC）
+    TIMEZONE: str = "Asia/Shanghai"
+
     class Config:
         env_file = ".env"
         extra = "allow"
@@ -79,6 +82,10 @@ class Settings(BaseSettings):
 
 settings = Settings()
 settings.create_dirs()
+
+# 设置时区（影响日志时间戳等，Docker 中可通过 TZ 环境变量覆盖）
+if "TZ" not in os.environ:
+    os.environ["TZ"] = settings.TIMEZONE
 
 # 配置 Ultralytics 使用持久化目录作为缓存
 # 这样可以避免每次容器重启都重新下载模型

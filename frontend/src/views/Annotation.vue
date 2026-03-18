@@ -86,9 +86,11 @@
           :projectId="currentDataset?.project_id || projectId"
           :images="images"
           :classes="currentDataset?.classes || []"
+          :datasets="datasets"
           :imageUrlFunc="imageUrl"
           @annotationsSaved="onAnnotationsSaved"
           @imageDeleted="onImageDeleted"
+          @imageMoved="onImageMoved"
         />
       </div>
 
@@ -329,6 +331,16 @@ function onAutoAnnotationSuccess(result) {
       currentDataset.value = ds
     })
   }
+}
+
+function onImageMoved() {
+  loadImages()
+  if (selectedDatasetId.value) {
+    datasetApi.get(selectedDatasetId.value).then((ds) => {
+      currentDataset.value = ds
+    })
+  }
+  loadDatasets()
 }
 
 function onImageDeleted() {

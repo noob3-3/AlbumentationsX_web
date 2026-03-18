@@ -24,9 +24,10 @@ pydantic-settings>=2.2.0
 httpx>=0.27.0
 
 # Computer Vision
+# PyTorch 2.2.2 与 NumPy 2.x 存在兼容问题（_ARRAY_API not found），暂固定到 1.x
 opencv-python-headless>=4.9.0
 Pillow>=10.3.0
-numpy>=1.26.0,<2.0.0
+numpy>=1.26.0,<2
 
 # Augmentation
 albumentations>=1.4.0

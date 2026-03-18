@@ -44,6 +44,26 @@
         <el-button icon="Picture" @click="showImageList = true" plain>
           图库
         </el-button>
+        <el-dropdown
+          v-if="currentImage && moveTargetDatasets.length > 0"
+          @command="(targetId) => moveCurrentImage(targetId)"
+          trigger="click"
+        >
+          <el-button type="info" :icon="FolderOpened" plain :disabled="!currentImage">
+            移动到 <el-icon class="el-icon--right"><ArrowDown /></el-icon>
+          </el-button>
+          <template #dropdown>
+            <el-dropdown-menu>
+              <el-dropdown-item
+                v-for="ds in moveTargetDatasets"
+                :key="ds.id"
+                :command="ds.id"
+              >
+                {{ ds.name }} ({{ ds.image_count }} 张)
+              </el-dropdown-item>
+            </el-dropdown-menu>
+          </template>
+        </el-dropdown>
         <el-popconfirm
           v-if="currentImage"
           title="确认删除此图片？"
@@ -108,7 +128,7 @@
 <script setup>
 import { ref, computed, onMounted, watch, reactive, nextTick } from 'vue'
 import { ElMessage } from 'element-plus'
-import { Delete } from '@element-plus/icons-vue'
+import { Delete, FolderOpened, ArrowDown } from '@element-plus/icons-vue'
 import AnnotationEditor from './AnnotationEditor.vue'
 import AutoAnnotationDialog from './AutoAnnotationDialog.vue'
 import { datasetApi } from '@/api'
@@ -124,10 +144,14 @@ const props = defineProps({
     type: Array,
     default: () => [],
   },
+  datasets: {
+    type: Array,
+    default: () => [],
+  },
   imageUrlFunc: Function,
 })
 
-const emit = defineEmits(['annotationsSaved', 'imageDeleted'])
+const emit = defineEmits(['annotationsSaved', 'imageDeleted', 'imageMoved'])
 
 const selectedImageId = ref('')
 const editorRef = ref(null)
@@ -154,6 +178,12 @@ const canGoPrevious = computed(() => {
 
 const canGoNext = computed(() => {
   return currentImageIndex.value >= 0 && currentImageIndex.value < props.images.length - 1
+})
+
+// 可移动到的数据集（排除当前数据集）
+const moveTargetDatasets = computed(() => {
+  if (!props.datasets || !props.datasetId) return []
+  return props.datasets.filter((d) => d.id !== props.datasetId)
 })
 
 onMounted(() => {
@@ -336,6 +366,26 @@ function handleKeyDown(event) {
     event.preventDefault()
     // Alt + Left arrow: 快速上一张（不保存，用于快速浏览）
     quickPreviousImage()
+  }
+}
+
+async function moveCurrentImage(targetDatasetId) {
+  if (!props.datasetId || !selectedImageId.value || !targetDatasetId) return
+  try {
+    await datasetApi.moveImage(props.datasetId, selectedImageId.value, targetDatasetId)
+    const movedId = selectedImageId.value
+    const idx = currentImageIndex.value
+    if (idx > 0) {
+      selectedImageId.value = props.images[idx - 1].id
+    } else if (idx < props.images.length - 1) {
+      selectedImageId.value = props.images[idx + 1].id
+    } else {
+      selectedImageId.value = ''
+    }
+    emit('imageMoved', { movedId, targetDatasetId })
+    ElMessage.success('图片已移动到目标数据集')
+  } catch (error) {
+    ElMessage.error('移动失败: ' + (error.response?.data?.detail || error.message))
   }
 }
 

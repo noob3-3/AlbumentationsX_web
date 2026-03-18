@@ -133,7 +133,7 @@
             >
               <el-select
                 v-model="form.base_model_id"
-                placeholder="选择要继续训练的模型"
+                placeholder="选择要继续训练的模型（已自动选中最优）"
                 style="width:100%"
               >
                 <el-option
@@ -144,6 +144,15 @@
                 />
               </el-select>
               <el-alert
+                v-if="availableModels.length === 0"
+                style="margin-top: 8px"
+                type="warning"
+                :closable="false"
+              >
+                <template #title>当前项目尚无已训练模型，请先完成一次训练</template>
+              </el-alert>
+              <el-alert
+                v-else
                 style="margin-top: 8px"
                 type="info"
                 :closable="false"
@@ -201,7 +210,10 @@
               <el-input-number v-model="form.epochs" :min="1" :max="10000" />
             </el-form-item>
             <el-form-item label="批大小">
-              <el-input-number v-model="form.batch_size" :min="1" :max="512" />
+              <el-input-number v-model="form.batch_size" :min="batchSizeMin" :max="512" />
+              <div v-if="form.device === '0,1'" style="color: #909399; font-size: 12px; margin-top: 4px">
+                双卡时 batch 平分到每卡，需 ≥ 2
+              </div>
             </el-form-item>
             <el-form-item label="图片尺寸">
               <div style="display: flex; align-items: center; gap: 8px">
@@ -215,23 +227,69 @@
               <el-input-number v-model="form.learning_rate" :min="0.0000001" :max="0.1" :step="0.00001" :precision="7" controls-position="right" style="width: 200px" />
               <span style="color: #909399; font-size: 12px; margin-left: 8px">lr0</span>
             </el-form-item>
-            <el-form-item label="验证集比例">
-              <el-slider v-model="form.val_split" :min="0.1" :max="0.4" :step="0.05" :format-tooltip="(v) => `${(v*100).toFixed(0)}%`" style="width:200px" />
-              <span style="margin-left:12px">{{ (form.val_split * 100).toFixed(0) }}%</span>
+            <el-form-item label="验证集">
+              <div style="display: flex; flex-direction: column; gap: 8px;">
+                <div style="display: flex; align-items: center; gap: 8px;">
+                  <el-checkbox v-model="form.use_validation_dataset">
+                    使用独立验证集（从下方选择数据集）
+                  </el-checkbox>
+                </div>
+                <template v-if="form.use_validation_dataset">
+                  <el-form-item prop="validation_dataset_id" style="margin-bottom: 0">
+                  <el-select
+                    v-model="form.validation_dataset_id"
+                    placeholder="选择验证集数据集"
+                    style="width: 100%"
+                    filterable
+                  >
+                    <el-option
+                      v-for="d in validationDatasetOptions"
+                      :key="d.id"
+                      :label="formatValidationDatasetOption(d)"
+                      :value="d.id"
+                    />
+                  </el-select>
+                  </el-form-item>
+                  <!-- 选中验证集的标注情况 -->
+                  <el-alert
+                    v-if="selectedValidationDatasetInfo"
+                    :type="selectedValidationDatasetInfo.annotated_image_count > 0 ? 'success' : 'warning'"
+                    :closable="false"
+                    show-icon
+                  >
+                    <template #title>
+                      <div style="font-size: 12px">
+                        验证集: {{ selectedValidationDatasetInfo.annotated_image_count }} 张已标注 / {{ selectedValidationDatasetInfo.total_images }} 张总计
+                        <span v-if="selectedValidationDatasetInfo.augmented_count > 0">
+                          （原始 {{ selectedValidationDatasetInfo.original_annotated_count }}/{{ selectedValidationDatasetInfo.original_count }}，增强 {{ selectedValidationDatasetInfo.augmented_annotated_count }}/{{ selectedValidationDatasetInfo.augmented_count }}）
+                        </span>
+                      </div>
+                    </template>
+                  </el-alert>
+                </template>
+                <div v-else>
+                  <el-slider v-model="form.val_split" :min="0.1" :max="0.4" :step="0.05" :format-tooltip="(v) => `${(v*100).toFixed(0)}%`" style="width:200px" />
+                  <span style="margin-left:12px">{{ (form.val_split * 100).toFixed(0) }}% 从训练集划分</span>
+                </div>
+              </div>
             </el-form-item>
             <el-form-item label="设备">
               <el-radio-group v-model="form.device">
                 <el-radio value="auto">自动</el-radio>
                 <el-radio value="cpu">CPU</el-radio>
                 <el-radio value="0">GPU 0</el-radio>
+                <el-radio value="0,1">GPU 0+1 (双卡)</el-radio>
               </el-radio-group>
+              <div v-if="form.device === '0,1'" style="color: #909399; font-size: 12px; margin-top: 4px">
+                双卡并行，适合 4096 等大尺寸训练；batch_size 需 ≥ 2
+              </div>
             </el-form-item>
             <el-divider />
 
             <!-- 早停和保存策略 -->
             <el-form-item label="早停耐心值">
               <el-input-number v-model="form.patience" :min="0" :max="1000" style="width: 150px" />
-              <el-text size="small" type="info" style="margin-left: 12px">连续N轮无改善则停止，0=不启用</el-text>
+              <el-text size="small" type="info" style="margin-left: 12px">连续N轮验证指标无改善则停止，0=禁用早停（训练满全部轮数）</el-text>
             </el-form-item>
             <el-form-item label="保存策略">
               <el-input-number v-model="form.save_period" :min="-1" :max="1000" style="width: 150px" />
@@ -435,7 +493,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { Refresh } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import { trainingApi } from '@/api'
@@ -458,6 +516,8 @@ const creating = ref(false)
 const availableModels = ref([])
 const datasetClasses = ref([])
 const selectedDatasetInfo = ref(null)
+const selectedValidationDatasetInfo = ref(null)
+const validationDatasetStatsCache = ref({})  // { datasetId: stats }
 
 const activeCollapse = ref([])
 
@@ -472,6 +532,10 @@ const form = ref({
   learning_rate: 0.00001,
   val_split: 0.2,
   device: '0',
+
+  // 验证集：使用独立数据集或按比例划分
+  use_validation_dataset: false,
+  validation_dataset_id: '',
 
   // 使用增强数据
   use_augmented_data: true,
@@ -538,6 +602,16 @@ const rules = {
       }
     }
   }],
+  validation_dataset_id: [{
+    required: false,
+    validator: (rule, value, callback) => {
+      if (form.value.use_validation_dataset && !value) {
+        callback(new Error('请选择验证集数据集'))
+      } else {
+        callback()
+      }
+    }
+  }],
 }
 
 const yolo11Models = ['yolo11n.pt', 'yolo11s.pt', 'yolo11m.pt', 'yolo11l.pt', 'yolo11x.pt']
@@ -575,11 +649,47 @@ watch(projectId, () => {
   form.value.base_model_id = ''
 })
 
+// 双卡时 batch 平分到每卡，最小需为 2
+const batchSizeMin = computed(() => (form.value.device === '0,1' ? 2 : 1))
+
+// 验证集可选数据集（排除当前训练集）
+const validationDatasetOptions = computed(() => {
+  const trainId = form.value.dataset_id
+  return datasets.value.filter(d => d.id !== trainId)
+})
+
+function formatValidationDatasetOption(d) {
+  const stats = validationDatasetStatsCache.value[d.id]
+  if (stats) {
+    return `${d.name} (${d.image_count}张，已标注 ${stats.annotated_image_count}/${stats.total_images} 张)`
+  }
+  return `${d.name} (${d.image_count}张)`
+}
+
 // 监听数据集变化，加载类别列表
 watch(() => form.value.dataset_id, () => {
   loadDatasetClasses()
   updateJobName()
   loadDatasetInfo()
+  if (form.value.validation_dataset_id === form.value.dataset_id) {
+    form.value.validation_dataset_id = ''
+  }
+  selectedValidationDatasetInfo.value = null
+  validationDatasetStatsCache.value = {}
+})
+
+// 监听使用独立验证集或验证集ID变化，加载选中验证集的标注统计
+watch(() => [form.value.use_validation_dataset, form.value.validation_dataset_id], ([useVal, valId]) => {
+  if (!useVal || !valId) {
+    selectedValidationDatasetInfo.value = null
+    return
+  }
+  loadValidationDatasetInfo()
+})
+
+// 监听设备：切到双卡时若 batch_size<2 自动修正
+watch(() => form.value.device, (device) => {
+  if (device === '0,1' && form.value.batch_size < 2) form.value.batch_size = 2
 })
 
 // 监听模型名称变化，更新任务名称
@@ -680,11 +790,36 @@ async function loadDatasetInfo() {
   }
 }
 
+async function loadValidationDatasetInfo() {
+  const valId = form.value.validation_dataset_id
+  if (!valId || !form.value.use_validation_dataset) {
+    selectedValidationDatasetInfo.value = null
+    return
+  }
+
+  try {
+    const { datasetApi } = await import('@/api')
+    const stats = await datasetApi.getStats(valId)
+    validationDatasetStatsCache.value[valId] = stats
+    selectedValidationDatasetInfo.value = {
+      total_images: stats.total_images,
+      original_count: stats.original_count,
+      augmented_count: stats.augmented_count,
+      annotated_image_count: stats.annotated_image_count,
+      original_annotated_count: stats.original_annotated_count,
+      augmented_annotated_count: stats.augmented_annotated_count,
+    }
+  } catch (error) {
+    console.error('Failed to load validation dataset info:', error)
+    selectedValidationDatasetInfo.value = null
+  }
+}
+
 function goToAnnotation() {
   router.push('/annotation')
 }
 
-function onResumeTrainingChange(value) {
+async function onResumeTrainingChange(value) {
   if (value) {
     // 启用继续训练时，建议减少训练轮数
     if (form.value.epochs > 50) {
@@ -692,7 +827,15 @@ function onResumeTrainingChange(value) {
       form.value.epochs = 50
     }
     // 加载可用模型列表
-    fetchAvailableModels()
+    await fetchAvailableModels()
+    // 自动选择模型：仅1个时直接选中；多个时选 mAP50 最高的
+    const models = availableModels.value
+    if (models.length === 1) {
+      form.value.base_model_id = models[0].id
+    } else if (models.length > 1) {
+      const best = models.reduce((a, b) => ((a?.map50 ?? 0) >= (b?.map50 ?? 0) ? a : b))
+      form.value.base_model_id = best.id
+    }
   } else {
     form.value.base_model_id = ''
   }
@@ -704,7 +847,21 @@ async function createJob() {
   await formRef.value.validate()
   creating.value = true
   try {
-    const job = await trainingStore.createJob(form.value)
+    const payload = { ...form.value }
+    if (!payload.use_validation_dataset) {
+      delete payload.validation_dataset_id
+    }
+    // 继续训练时必须包含 base_model_id，避免后端误用默认模型
+    if (payload.resume_training) {
+      if (!payload.base_model_id) {
+        ElMessage.warning('请选择要继续训练的基础模型')
+        creating.value = false
+        return
+      }
+    } else {
+      delete payload.base_model_id
+    }
+    const job = await trainingStore.createJob(payload)
     router.push(`/training/${job.id}`)
   } catch (error) {
     // Error message is already shown by the API handler

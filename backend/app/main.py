@@ -2,6 +2,7 @@
 FastAPI Application Entry Point
 AlbumentationsX + Ultralytics Training Platform
 """
+import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import FastAPI, Request
@@ -33,7 +34,18 @@ async def lifespan(app: FastAPI):
     await training_queue.start()
     logger.info("Training queue manager started")
 
+    # DDP 模式下 callback 不执行，轮询 results.csv 同步进度
+    from app.services.training_progress_poller import run_progress_poller
+    poller_task = asyncio.create_task(run_progress_poller(interval_sec=8.0))
+
     yield
+
+    # 停止进度轮询
+    poller_task.cancel()
+    try:
+        await poller_task
+    except asyncio.CancelledError:
+        pass
 
     # Shutdown training queue manager
     await training_queue.stop()

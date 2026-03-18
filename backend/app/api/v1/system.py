@@ -2,6 +2,9 @@
 System Information API
 Provides hardware and system resource information
 """
+import csv
+import io
+import subprocess
 from fastapi import APIRouter
 from loguru import logger
 import shutil
@@ -30,14 +33,83 @@ async def get_system_info() -> Dict[str, Any]:
     return info
 
 
+def _get_gpu_info_from_nvidia_smi() -> Optional[Dict[str, Any]]:
+    """通过 nvidia-smi 获取系统级 GPU 使用情况（含 DDP 子进程等所有进程）"""
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,name,memory.used,memory.total,memory.free,utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+
+        # index,name,memory.used,memory.total,memory.free,utilization.gpu
+        devices = []
+        reader = csv.reader(io.StringIO(result.stdout.strip()))
+        for row in reader:
+            if len(row) < 6:
+                continue
+            try:
+                gpu_id = int(row[0].strip())
+                name = row[1].strip()
+                mem_used_mb = float("".join(c for c in row[2] if c.isdigit() or c == ".") or "0")
+                mem_total_mb = float("".join(c for c in row[3] if c.isdigit() or c == ".") or "1")
+                mem_free_mb = float("".join(c for c in row[4] if c.isdigit() or c == ".") or "0")
+                util_pct = float("".join(c for c in row[5] if c.isdigit() or c == ".") or "0")
+            except (ValueError, IndexError):
+                continue
+            mem_total_gb = mem_total_mb / 1024
+            mem_used_gb = mem_used_mb / 1024
+            mem_free_gb = mem_free_mb / 1024
+            usage_pct = round((mem_used_gb / mem_total_gb) * 100, 1) if mem_total_gb > 0 else 0
+
+            devices.append({
+                "id": gpu_id,
+                "name": name,
+                "total_memory_gb": round(mem_total_gb, 2),
+                "allocated_memory_gb": round(mem_used_gb, 2),
+                "reserved_memory_gb": round(mem_used_gb, 2),
+                "free_memory_gb": round(mem_free_gb, 2),
+                "memory_usage_percent": usage_pct,
+                "utilization_percent": round(util_pct, 1),
+            })
+        return {"devices": devices, "count": len(devices)} if devices else None
+    except Exception as e:
+        logger.debug(f"nvidia-smi failed: {e}")
+        return None
+
+
 async def _get_gpu_info() -> Dict[str, Any]:
-    """获取GPU信息"""
+    """获取GPU信息。优先用 nvidia-smi 显示系统级真实使用（含 DDP 训练子进程）"""
     gpu_info = {
         "available": False,
         "count": 0,
         "devices": [],
     }
 
+    # 优先 nvidia-smi：可看到 DDP 子进程等所有进程的实际 GPU 使用
+    nvidia_result = _get_gpu_info_from_nvidia_smi()
+    if nvidia_result and nvidia_result["devices"]:
+        gpu_info["available"] = True
+        gpu_info["count"] = nvidia_result["count"]
+        gpu_info["devices"] = nvidia_result["devices"]
+        try:
+            import torch
+            gpu_info["cuda_version"] = torch.version.cuda
+            gpu_info["cudnn_version"] = torch.backends.cudnn.version()
+        except Exception:
+            gpu_info["cuda_version"] = "unknown"
+            gpu_info["cudnn_version"] = "unknown"
+        logger.debug(f"GPU info from nvidia-smi: {gpu_info['count']} GPU(s)")
+        return gpu_info
+
+    # 回退到 PyTorch（仅当前进程的显存，DDP 时多为 0）
     try:
         import torch
 
@@ -51,11 +123,9 @@ async def _get_gpu_info() -> Dict[str, Any]:
             for i in range(torch.cuda.device_count()):
                 try:
                     props = torch.cuda.get_device_properties(i)
-
-                    # 获取显存使用情况
-                    memory_allocated = torch.cuda.memory_allocated(i) / (1024**3)  # GB
-                    memory_reserved = torch.cuda.memory_reserved(i) / (1024**3)  # GB
-                    memory_total = props.total_memory / (1024**3)  # GB
+                    memory_allocated = torch.cuda.memory_allocated(i) / (1024**3)
+                    memory_reserved = torch.cuda.memory_reserved(i) / (1024**3)
+                    memory_total = props.total_memory / (1024**3)
 
                     device_info = {
                         "id": i,
@@ -73,7 +143,7 @@ async def _get_gpu_info() -> Dict[str, Any]:
                     logger.warning(f"Failed to get GPU {i} info: {e}")
 
             gpu_info["devices"] = devices
-            logger.debug(f"GPU info: {gpu_info['count']} GPU(s) available")
+            logger.debug(f"GPU info from PyTorch: {gpu_info['count']} GPU(s)")
         else:
             logger.debug("CUDA is not available")
 

@@ -44,6 +44,7 @@ services:
       - POSTGRES_USER=albumentations
       - POSTGRES_PASSWORD=albumentations123
       - PGDATA=/var/lib/postgresql/data/pgdata
+      - PGTZ=Asia/Shanghai
     volumes:
       - postgres-data:/var/lib/postgresql/data
       - ./backend/fix_postgres_permissions.sql:/docker-entrypoint-initdb.d/fix_postgres_permissions.sql
@@ -69,6 +70,10 @@ services:
     # 优点：容器可以使用宿主机的所有共享内存，无需手动设置 shm_size
     # 适用场景：大规模训练、多进程数据加载
     ipc: host
+
+    # PID 命名空间 - 多卡 DDP (torch.distributed) 必需
+    # NCCL 通过 PID 判断进程是否本地，Docker 默认的 PID 隔离会导致 "invalid device context" 错误
+    pid: host
 
     # 共享内存配置（备选方案）
     # 如果不使用 ipc: host，可以手动设置共享内存大小
@@ -107,6 +112,9 @@ services:
       # - ./backend/app:/app/app                       # 热重载代码
       # - ./backend/alembic:/app/alembic               # 数据库迁移脚本
     environment:
+      # 时区（日志、时间显示）
+      - TZ=Asia/Shanghai
+
       # Database - 使用 Docker 内的 PostgreSQL 服务
       - DATABASE_URL=postgresql+asyncpg://albumentations:albumentations123@postgres/albumentations
 
@@ -141,6 +149,12 @@ services:
 
       # API Token (for remote data collection)
       - API_TOKEN=change-this-secret-token-in-production
+
+      # NCCL 多卡通信（双卡及以上 DDP 训练）
+      # 排查问题时可将 NCCL_DEBUG 设为 INFO 或 WARN
+      - NCCL_DEBUG=${NCCL_DEBUG:-WARN}
+      # 宿主机无 InfiniBand 时禁用，避免相关报错
+      - NCCL_IB_DISABLE=1
 
       # GPU Settings
       # CUDA_VISIBLE_DEVICES 控制使用哪些 GPU:

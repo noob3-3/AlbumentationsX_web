@@ -42,9 +42,14 @@ export const datasetApi = {
     http.get(`/datasets/${datasetId}/images/${imageId}`),
   deleteImage: (datasetId, imageId) =>
     http.delete(`/datasets/${datasetId}/images/${imageId}`),
+  moveImage: (datasetId, imageId, targetDatasetId) =>
+    http.post(`/datasets/${datasetId}/images/${imageId}/move`, null, { params: { target_dataset_id: targetDatasetId } }),
 
   // 数据集统计
   getStats: (datasetId) => http.get(`/datasets/${datasetId}/stats`),
+
+  // 导出数据集（YOLO 格式 ZIP），返回 blob 用于触发下载
+  export: (datasetId, params = {}) => http.get(`/datasets/${datasetId}/export`, { params, responseType: 'blob' }),
 
   // 删除类别及其标注
   deleteClass: (datasetId, className) =>

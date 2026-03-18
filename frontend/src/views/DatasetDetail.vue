@@ -16,6 +16,17 @@
       <template #extra>
         <el-space>
           <el-button :icon="Download" @click="$router.push(`/collect?dataset=${id}`)">采集图片</el-button>
+          <el-dropdown @command="(cmd) => exportDataset(cmd === 'annotated')">
+            <el-button :icon="Upload" :loading="exportLoading">
+              导出数据集<el-icon class="el-icon--right"><ArrowDown /></el-icon>
+            </el-button>
+            <template #dropdown>
+              <el-dropdown-menu>
+                <el-dropdown-item command="all">导出全部</el-dropdown-item>
+                <el-dropdown-item command="annotated">仅导出已标注</el-dropdown-item>
+              </el-dropdown-menu>
+            </template>
+          </el-dropdown>
           <el-button type="primary" :icon="MagicStick" @click="showAugDialog = true">数据增强</el-button>
           <el-button type="success" :icon="Cpu" @click="showTrainDialog = true">开始训练</el-button>
         </el-space>
@@ -63,10 +74,14 @@
               <AnnotationView
                 v-if="dataset && images.length > 0"
                 :datasetId="id"
+                :projectId="dataset?.project_id"
                 :images="images"
                 :classes="dataset?.classes || []"
+                :datasets="otherDatasets"
                 :imageUrlFunc="imageUrl"
                 @annotationsSaved="onAnnotationsSaved"
+                @imageDeleted="onImageDeleted"
+                @imageMoved="onImageMoved"
               />
               <el-empty v-else description="请先添加图片">
                 <el-button type="primary" @click="$router.push(`/collect?dataset=${id}`)">立即采集</el-button>
@@ -177,7 +192,7 @@
 <script setup>
 import { ref, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Delete, Download, MagicStick, Cpu, Picture, Edit, Operation } from '@element-plus/icons-vue'
+import { Delete, Download, Upload, MagicStick, Cpu, Picture, Edit, Operation, ArrowDown } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import { datasetApi, augmentationApi, trainingApi } from '@/api'
 import { useDatasetStore } from '@/stores/dataset'
@@ -200,7 +215,9 @@ const augMultiplier = ref(3)
 const augLoading = ref(false)
 const showTrainDialog = ref(false)
 const trainLoading = ref(false)
+const exportLoading = ref(false)
 const availableModels = ref([])
+const otherDatasets = ref([])
 
 const trainForm = ref({
   name: `训练_${new Date().toLocaleDateString('zh-CN')}`,
@@ -217,9 +234,10 @@ const imageUrl = (imageId, thumb = false) => datasetApi.imageUrl(imageId, thumb)
 const statusType = (s) => ({ active: 'success', ready: 'success', error: 'danger' })[s] || 'info'
 
 onMounted(async () => {
+  await store.fetchDataset(id)
   await Promise.all([
-    store.fetchDataset(id),
     loadImages(),
+    loadOtherDatasets(),
   ])
   const modRes = await trainingApi.availableModels()
   availableModels.value = modRes.models
@@ -256,6 +274,19 @@ async function loadMore() {
   }
 }
 
+async function loadOtherDatasets() {
+  try {
+    const params = { page: 1, page_size: 100 }
+    if (dataset.value?.project_id) {
+      params.project_id = dataset.value.project_id
+    }
+    const res = await datasetApi.list(params)
+    otherDatasets.value = (res.items || []).filter((d) => d.id !== id)
+  } catch {
+    otherDatasets.value = []
+  }
+}
+
 async function deleteImage(imageId) {
   await datasetApi.deleteImage(id, imageId)
   images.value = images.value.filter((i) => i.id !== imageId)
@@ -265,8 +296,18 @@ async function deleteImage(imageId) {
 
 function onAnnotationsSaved(data) {
   ElMessage.success('标注已保存')
-  // 重新加载图片以更新标注数量
   loadImages()
+}
+
+function onImageDeleted() {
+  loadImages()
+  store.fetchDataset(id)
+}
+
+function onImageMoved() {
+  loadImages()
+  store.fetchDataset(id)
+  loadOtherDatasets()
 }
 
 async function startAugmentation() {
@@ -281,6 +322,24 @@ async function startAugmentation() {
     router.push('/augmentation')
   } finally {
     augLoading.value = false
+  }
+}
+
+async function exportDataset(annotatedOnly = false) {
+  exportLoading.value = true
+  try {
+    const blob = await datasetApi.export(id, { annotated_only: annotatedOnly })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `${dataset.value?.name || 'dataset'}_yolo.zip`
+    a.click()
+    URL.revokeObjectURL(url)
+    ElMessage.success('数据集导出成功')
+  } catch (error) {
+    ElMessage.error(error.response?.data?.detail || error.message || '导出失败')
+  } finally {
+    exportLoading.value = false
   }
 }
 

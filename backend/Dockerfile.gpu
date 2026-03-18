@@ -40,18 +40,26 @@ RUN apt-get update && apt-get install -y \
 
 
 
-# 卸载当前版本
-RUN pip uninstall torch torchvision torchaudio -y --no-cache-dir
-
-# 安装支持CUDA 11.8的版本（兼容你的11.4驱动）
-RUN  pip install torch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 -f https://mirrors.aliyun.com/pytorch-wheels/cu118 --no-cache-dir
+# 卸载基础镜像自带的 torch（避免版本冲突）
+RUN pip uninstall torch torchvision torchaudio -y --no-cache-dir || true
 
 # Copy requirements first (for better caching)
 # Use requirements-gpu.txt which excludes ultralytics (already in base image)
 COPY backend/requirements-gpu.txt ./requirements.txt
 
-# Install Python dependencies
+# 1) 先装应用依赖（numpy<2 已在 requirements 中）
 RUN pip install --no-cache-dir -r requirements.txt
+
+# 2) 升级 Ultralytics（其依赖 torch>=1.8、numpy>=1.23 无上限，可能拉高 numpy 或 torch）
+RUN pip install --no-cache-dir -U "ultralytics>=8.4.23"
+
+# 3) 最后强制安装指定版本，覆盖任何被依赖解析改动的包
+#    - PyTorch 2.2.2 + CUDA 11.8（国内镜像）
+#    - NumPy 1.x（2.2.2 与 NumPy 2.x 不兼容，ultralytics 会拉 numpy 2.x）
+RUN pip install --no-cache-dir --force-reinstall \
+    torch==2.2.2 torchvision==0.17.2 torchaudio==2.2.2 \
+    "numpy>=1.26.0,<2" \
+    -f https://mirrors.aliyun.com/pytorch-wheels/cu118
 
 # Copy application code
 COPY backend/ .
@@ -75,7 +83,8 @@ RUN mkdir -p \
 # ── Python environment ────────────────────────
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    STATIC_DIR=/app/static
+    STATIC_DIR=/app/static \
+    TZ=Asia/Shanghai
 
 # Expose port
 EXPOSE 8000

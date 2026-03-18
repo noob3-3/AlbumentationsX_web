@@ -10,9 +10,12 @@ from app.core.config import settings
 DATABASE_URL = settings.DATABASE_URL.replace("sqlite:///", "sqlite+aiosqlite:///")
 
 # SQLite-specific connection args (check_same_thread is not valid for PostgreSQL)
+# PostgreSQL: 设置连接时区，确保 datetime 按 Asia/Shanghai 解析（含远程 PG）
 connect_args = {}
 if DATABASE_URL.startswith("sqlite"):
     connect_args = {"check_same_thread": False}
+elif "postgresql" in DATABASE_URL:
+    connect_args = {"server_settings": {"TimeZone": settings.TIMEZONE}}
 
 # Configure engine with proper pooling for async operations
 # Key settings to prevent event loop conflicts:

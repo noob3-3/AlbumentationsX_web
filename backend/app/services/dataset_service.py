@@ -343,3 +343,113 @@ class DatasetService:
             dataset.annotation_count = max(0, dataset.annotation_count - len(image.annotations))
         await db.delete(image)
         return True
+
+    @staticmethod
+    async def move_image_to_dataset(
+        db: AsyncSession,
+        source_dataset_id: str,
+        image_id: str,
+        target_dataset_id: str,
+    ) -> Optional[Image]:
+        """将图片（含标注）移动到另一个数据集"""
+        if source_dataset_id == target_dataset_id:
+            raise ValueError("目标数据集不能与源数据集相同")
+
+        image = await DatasetService.get_image(db, image_id)
+        if not image:
+            return None
+        if image.dataset_id != source_dataset_id:
+            raise ValueError("图片不属于指定源数据集")
+
+        target_dataset = await DatasetService.get_dataset(db, target_dataset_id)
+        if not target_dataset:
+            raise ValueError("目标数据集不存在")
+        if not target_dataset.storage_path:
+            raise ValueError("目标数据集存储路径未配置")
+
+        src_path = Path(image.file_path)
+        if not src_path.exists():
+            raise ValueError("图片文件不存在")
+
+        # 目标存储目录
+        target_images_dir = Path(target_dataset.storage_path) / "images"
+        target_thumbs_dir = Path(target_dataset.storage_path) / "thumbnails"
+        target_images_dir.mkdir(parents=True, exist_ok=True)
+        target_thumbs_dir.mkdir(parents=True, exist_ok=True)
+
+        # 复制图片文件到目标数据集（新文件名避免冲突）
+        new_filename = generate_filename(image.original_filename)
+        dst_img_path = target_images_dir / new_filename
+        dst_thumb_path = target_thumbs_dir / new_filename
+        shutil.copy2(str(src_path), str(dst_img_path))
+        create_thumbnail(str(dst_img_path), str(dst_thumb_path))
+
+        # 合并类别：目标数据集已有 + 源图片标注中的新类别
+        source_dataset = await DatasetService.get_dataset(db, source_dataset_id)
+        target_classes = list(target_dataset.classes or [])
+        source_classes = source_dataset.classes or []
+        class_name_to_target_id = {c: i for i, c in enumerate(target_classes)}
+
+        for ann in image.annotations:
+            name = ann.class_name or (source_classes[ann.class_id] if ann.class_id < len(source_classes) else f"class_{ann.class_id}")
+            if name not in class_name_to_target_id:
+                class_name_to_target_id[name] = len(target_classes)
+                target_classes.append(name)
+
+        target_dataset.classes = target_classes
+
+        # 创建新 Image 记录
+        width, height, file_size = get_image_info(str(dst_img_path))
+        new_image = Image(
+            dataset_id=target_dataset_id,
+            filename=new_filename,
+            original_filename=image.original_filename,
+            file_path=str(dst_img_path),
+            thumbnail_path=str(dst_thumb_path),
+            width=width,
+            height=height,
+            file_size=file_size,
+            source=image.source,
+            source_url=image.source_url,
+            is_augmented=image.is_augmented,
+            parent_id=None,  # 移动后不再关联原增强链
+            annotation_status=image.annotation_status,
+        )
+        db.add(new_image)
+        await db.flush()
+
+        # 复制标注并映射 class_id
+        for ann in image.annotations:
+            name = ann.class_name or (source_classes[ann.class_id] if ann.class_id < len(source_classes) else f"class_{ann.class_id}")
+            target_cid = class_name_to_target_id.get(name, 0)
+            new_ann = Annotation(
+                image_id=new_image.id,
+                class_id=target_cid,
+                class_name=name,
+                x_center=ann.x_center,
+                y_center=ann.y_center,
+                bbox_width=ann.bbox_width,
+                bbox_height=ann.bbox_height,
+                confidence=ann.confidence,
+            )
+            db.add(new_ann)
+
+        ann_count = len(image.annotations)
+        target_dataset.image_count = (target_dataset.image_count or 0) + 1
+        target_dataset.annotation_count = (target_dataset.annotation_count or 0) + ann_count
+        if new_image.is_augmented:
+            target_dataset.augmented_count = (target_dataset.augmented_count or 0) + 1
+
+        # 删除源图片
+        for path in [image.file_path, image.thumbnail_path]:
+            if path and Path(path).exists():
+                Path(path).unlink(missing_ok=True)
+        source_dataset.image_count = max(0, source_dataset.image_count - 1)
+        source_dataset.annotation_count = max(0, source_dataset.annotation_count - ann_count)
+        if image.is_augmented:
+            source_dataset.augmented_count = max(0, (source_dataset.augmented_count or 0) - 1)
+        await db.delete(image)
+
+        await db.flush()
+        await db.refresh(new_image)
+        return new_image
