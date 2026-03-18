@@ -17,7 +17,7 @@ export default defineConfig({
     host: '0.0.0.0', // 允许外部访问
     proxy: {
       '/api': {
-        target: 'http://192.168.31.16:8000',
+        target: 'http://192.168.31.41:8000',
         changeOrigin: true,
         rewrite: (path) => path,
         configure: (proxy, options) => {

@@ -5,10 +5,10 @@
       <div class="toolbar-section">
         <span class="label">工具:</span>
         <el-radio-group v-model="selectedTool" @change="toolChanged">
-          <el-radio-button label="select">选择/编辑</el-radio-button>
-          <el-radio-button label="rect">绘制框</el-radio-button>
-          <el-radio-button label="polygon">多边形</el-radio-button>
-          <el-radio-button label="view">查看</el-radio-button>
+          <el-radio-button value="select">选择/编辑</el-radio-button>
+          <el-radio-button value="rect">绘制框</el-radio-button>
+          <el-radio-button value="polygon">多边形</el-radio-button>
+          <el-radio-button value="view">查看</el-radio-button>
         </el-radio-group>
       </div>
 
@@ -27,15 +27,27 @@
     </div>
 
     <!-- Canvas area -->
-    <div class="canvas-container" @mousemove="onCanvasMouseMove" @mouseleave="onCanvasMouseLeave" @click="onCanvasClick">
-      <canvas
-        ref="canvas"
-        :width="canvasWidth"
-        :height="canvasHeight"
-        class="annotation-canvas"
-        @mousedown="onCanvasMouseDown"
-        @mouseup="onCanvasMouseUp"
-      />
+    <div
+      ref="canvasContainerRef"
+      class="canvas-container"
+      @mousemove="onCanvasMouseMove"
+      @mouseleave="onCanvasMouseLeave"
+      @click="onCanvasClick"
+      @wheel.prevent="onCanvasWheel"
+    >
+      <div
+        class="canvas-zoom-wrapper"
+        :style="zoomWrapperStyle"
+      >
+        <canvas
+          ref="canvas"
+          :width="canvasWidth"
+          :height="canvasHeight"
+          class="annotation-canvas"
+          @mousedown="onCanvasMouseDown"
+          @mouseup="onCanvasMouseUp"
+        />
+      </div>
       <div v-if="!imageLoaded" class="canvas-placeholder">
         <el-icon class="is-loading"><Loading /></el-icon>
         <p>加载中...</p>
@@ -112,9 +124,10 @@
 </template>
 
 <script setup>
-import { ref, onMounted, nextTick, watch } from 'vue'
+import { ref, computed, onMounted, nextTick, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Loading } from '@element-plus/icons-vue'
+import Pica from 'pica'
 
 const props = defineProps({
   imageId: String,
@@ -139,6 +152,9 @@ const canvas = ref(null)
 const ctx = ref(null)
 const imageLoaded = ref(false)
 const img = ref(null)
+const resizedImageCache = ref(null) // 大图缩放后的缓存，加速重绘
+const picaResizer = new Pica({ tile: 1024 })
+const PICA_THRESHOLD = 1200 // 超过此尺寸用 pica 缩放
 
 const selectedTool = ref('select')
 const selectedClass = ref('')
@@ -167,6 +183,17 @@ function markSaved() {
 
 const canvasWidth = ref(800)
 const canvasHeight = ref(600)
+const canvasContainerRef = ref(null)
+const zoom = ref(1)
+const zoomOriginX = ref(0)
+const zoomOriginY = ref(0)
+const MIN_ZOOM = 0.25
+const MAX_ZOOM = 4
+
+const zoomWrapperStyle = computed(() => ({
+  transform: `scale(${zoom.value})`,
+  transformOrigin: `${zoomOriginX.value}px ${zoomOriginY.value}px`,
+}))
 
 // Drawing state
 const isDrawing = ref(false)
@@ -199,11 +226,17 @@ onMounted(async () => {
 // Watch for image changes
 watch(() => props.imageId, (newImageId, oldImageId) => {
   if (newImageId && newImageId !== oldImageId) {
+    logLoad('imageId changed', oldImageId, '->', newImageId)
     isDrawing.value = false
     currentAnnotation.value = null
     polygonPoints.value = []
     annotationHistory.value = []
     imageLoaded.value = false
+    zoom.value = 1
+    zoomOriginX.value = 0
+    zoomOriginY.value = 0
+    resizeRetryCount = 0
+    resizedImageCache.value = null
 
     annotations.value = props.initialAnnotations ? JSON.parse(JSON.stringify(props.initialAnnotations)) : []
     savedSnapshot.value = annotationsSnapshot(annotations.value)
@@ -223,48 +256,116 @@ watch(() => props.initialAnnotations, (newAnnotations) => {
   }
 }, { deep: true })
 
+const DEBUG_LOAD = false
+const loadStartTime = { current: 0 }
+function logLoad(...args) {
+  if (!DEBUG_LOAD) return
+  const now = performance.now()
+  const elapsed = loadStartTime.current ? (now - loadStartTime.current).toFixed(1) : 0
+  const ts = new Date().toLocaleTimeString('zh-CN', { hour12: false }) + '.' + String(now % 1000).padStart(3, '0').slice(0, 3)
+  console.log(`[AnnotationEditor] [${ts}] +${elapsed}ms`, ...args)
+}
+
 function loadImage() {
+  loadStartTime.current = performance.now()
+  logLoad('loadImage start', { imageId: props.imageId, imageUrl: props.imageUrl, hasPreloaded: !!props.preloadedImage, preloadComplete: props.preloadedImage?.complete, preloadNaturalWidth: props.preloadedImage?.naturalWidth })
+
+  const doResizeAndShow = () => {
+    logLoad('doResizeAndShow called')
+    nextTick(async () => {
+      resizeCanvas()
+      const t0 = performance.now()
+      const w = canvasWidth.value
+      const h = canvasHeight.value
+      const imgW = img.value.naturalWidth || img.value.width
+      const imgH = img.value.naturalHeight || img.value.height
+      if ((imgW > PICA_THRESHOLD || imgH > PICA_THRESHOLD) && w > 0 && h > 0) {
+        try {
+          const tmpCanvas = document.createElement('canvas')
+          tmpCanvas.width = w
+          tmpCanvas.height = h
+          await picaResizer.resize(img.value, tmpCanvas)
+          resizedImageCache.value = tmpCanvas
+          logLoad('pica resize done in', (performance.now() - t0).toFixed(0), 'ms')
+        } catch (e) {
+          logLoad('pica failed, fallback to drawImage', e)
+          resizedImageCache.value = null
+        }
+      }
+      redraw()
+      logLoad('redraw done in', (performance.now() - t0).toFixed(0), 'ms, canvas:', w, 'x', h)
+      imageLoaded.value = true
+      emit('imageReady')
+    })
+  }
+
   // Use preloaded image if available for instant rendering
   if (props.preloadedImage && props.preloadedImage.complete && props.preloadedImage.naturalWidth > 0) {
+    logLoad('using preloaded image')
     img.value = props.preloadedImage
-    resizeCanvas()
-    imageLoaded.value = true
-    redraw()
-    emit('imageReady')
+    doResizeAndShow()
     return
   }
 
+  logLoad('creating new Image, loading:', props.imageUrl)
   img.value = new Image()
   img.value.crossOrigin = 'anonymous'
   img.value.onload = () => {
-    resizeCanvas()
-    imageLoaded.value = true
-    redraw()
-    emit('imageReady')
+    logLoad('Image onload fired')
+    doResizeAndShow()
   }
-  img.value.onerror = () => {
+  img.value.onerror = (e) => {
+    logLoad('Image onerror', e)
     ElMessage.error('图片加载失败')
   }
   img.value.src = props.imageUrl
 }
 
 function resizeCanvas() {
-  if (!img.value || !canvas.value) return
-
-  const container = canvas.value.parentElement
-  const maxWidth = container.clientWidth
-  const maxHeight = container.clientHeight - 40
-
-  let width = img.value.width
-  let height = img.value.height
-
-  if (width > maxWidth) {
-    height = (height * maxWidth) / width
-    width = maxWidth
+  if (!img.value || !canvas.value) {
+    logLoad('resizeCanvas early return: no img/canvas', !!img.value, !!canvas.value)
+    return
   }
-  if (height > maxHeight) {
-    width = (width * maxHeight) / height
-    height = maxHeight
+
+  const container = canvasContainerRef.value
+  if (!container) {
+    logLoad('resizeCanvas: container ref is null!')
+    return
+  }
+  const cw = container.clientWidth
+  const ch = container.clientHeight
+  const maxWidth = Math.max(200, cw || 800)
+  const maxHeight = Math.max(200, (ch || 600) - 20)
+
+  logLoad('resizeCanvas container', { cw, ch, maxWidth, maxHeight })
+
+  // 容器尺寸异常时延迟重试，避免连续切换时越缩越小
+  if (cw > 0 && ch > 0) {
+    resizeRetryCount = 0
+    doResize(maxWidth, maxHeight)
+  } else {
+    resizeRetryCount++
+    if (resizeRetryCount > 30) {
+      logLoad('resizeCanvas: container still 0 after 30 retries, using fallback 800x600')
+      resizeRetryCount = 0
+      doResize(800, 580)
+    } else {
+      logLoad('resizeCanvas: container size 0, retry', resizeRetryCount)
+      requestAnimationFrame(() => resizeCanvas())
+    }
+  }
+}
+let resizeRetryCount = 0
+
+function doResize(maxWidth, maxHeight) {
+  if (!img.value || !canvas.value) return
+  let width = img.value.naturalWidth || img.value.width
+  let height = img.value.naturalHeight || img.value.height
+
+  if (width > maxWidth || height > maxHeight) {
+    const ratio = Math.min(maxWidth / width, maxHeight / height)
+    width = Math.round(width * ratio)
+    height = Math.round(height * ratio)
   }
 
   canvasWidth.value = width
@@ -274,10 +375,16 @@ function resizeCanvas() {
 }
 
 function redraw() {
-  if (!ctx.value || !img.value || !imageLoaded.value) return
+  if (!ctx.value || !img.value) return
 
   ctx.value.clearRect(0, 0, canvasWidth.value, canvasHeight.value)
-  ctx.value.drawImage(img.value, 0, 0, canvasWidth.value, canvasHeight.value)
+  const w = canvasWidth.value
+  const h = canvasHeight.value
+  if (resizedImageCache.value) {
+    ctx.value.drawImage(resizedImageCache.value, 0, 0, w, h)
+  } else {
+    ctx.value.drawImage(img.value, 0, 0, w, h)
+  }
 
   // Draw annotations
   annotations.value.forEach((ann, index) => {
@@ -389,8 +496,8 @@ function drawResizeHandles(x, y, width, height) {
 function getCanvasCoordinates(e) {
   const rect = canvas.value.getBoundingClientRect()
   return {
-    x: e.clientX - rect.left,
-    y: e.clientY - rect.top,
+    x: (e.clientX - rect.left) / zoom.value,
+    y: (e.clientY - rect.top) / zoom.value,
   }
 }
 
@@ -760,6 +867,16 @@ function onCanvasMouseLeave() {
   redraw()
 }
 
+function onCanvasWheel(e) {
+  if (!imageLoaded.value) return
+  e.preventDefault()
+  const rect = canvas.value.getBoundingClientRect()
+  zoomOriginX.value = (e.clientX - rect.left) / zoom.value
+  zoomOriginY.value = (e.clientY - rect.top) / zoom.value
+  const delta = e.deltaY > 0 ? -0.1 : 0.1
+  zoom.value = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoom.value + delta))
+}
+
 
 function deleteAnnotation(index) {
   annotationHistory.value.push(JSON.stringify(annotations.value))
@@ -824,11 +941,22 @@ function toolChanged() {
   redraw()
 }
 
+function toggleDrawSelect() {
+  if (selectedTool.value === 'select' || selectedTool.value === 'view') {
+    selectedTool.value = 'rect'
+  } else {
+    selectedTool.value = 'select'
+  }
+  toolChanged()
+}
+
 defineExpose({
   saveAnnotations,
   isDirty,
   markSaved,
   getAnnotations: () => annotations.value,
+  toggleDrawSelect,
+  selectedTool,
 })
 </script>
 
@@ -873,6 +1001,10 @@ defineExpose({
   position: relative;
   overflow: auto;
   min-height: 400px;
+}
+
+.canvas-zoom-wrapper {
+  display: inline-block;
 }
 
 .annotation-canvas {

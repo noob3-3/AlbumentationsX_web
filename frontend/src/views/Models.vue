@@ -20,13 +20,76 @@
       <template #header>
         <div style="display:flex;justify-content:space-between;align-items:center">
           <span>模型列表 ({{ models.length }})</span>
-          <el-button size="small" :icon="Refresh" @click="loadModels">刷新</el-button>
+          <div style="display:flex;gap:8px">
+            <el-button type="primary" size="small" :icon="Upload" @click="showImportDialog">导入模型</el-button>
+            <el-button size="small" :icon="Refresh" @click="loadModels">刷新</el-button>
+          </div>
         </div>
       </template>
 
-      <el-empty v-if="!models.length" description="暂无训练完成的模型，请先完成训练任务" />
+      <el-empty v-if="!models.length" description="暂无模型，可训练或导入模型" />
 
-      <el-table v-else :data="models" stripe>
+      <!-- 导入模型对话框 -->
+      <el-dialog
+        v-model="importDialogVisible"
+        title="导入模型"
+        width="520px"
+        :close-on-click-modal="false"
+        @closed="resetImportForm"
+      >
+        <el-form ref="importFormRef" :model="importForm" :rules="importRules" label-width="100px">
+          <el-form-item label="模型名称" prop="name">
+            <el-input v-model="importForm.name" placeholder="请输入模型名称" maxlength="255" show-word-limit />
+          </el-form-item>
+          <el-form-item label="权重文件" prop="file" required>
+            <el-upload
+              ref="uploadRef"
+              :auto-upload="false"
+              :limit="1"
+              accept=".pt"
+              :on-change="onImportFileChange"
+              :on-remove="() => importForm.file = null"
+              :on-exceed="() => ElMessage.warning('仅支持上传一个 .pt 文件')"
+            >
+              <template #trigger>
+                <el-button type="primary" plain>选择 .pt 文件</el-button>
+              </template>
+              <template #tip>
+                <div class="el-upload__tip">支持 YOLO 格式权重文件，最大 500MB</div>
+              </template>
+            </el-upload>
+          </el-form-item>
+          <el-form-item label="类别（可选）">
+            <el-input
+              v-model="importForm.classes"
+              type="textarea"
+              :rows="3"
+              placeholder="逗号分隔，如：人,车,狗。不填则尝试从模型中自动提取"
+            />
+          </el-form-item>
+          <el-form-item label="或上传类别文件">
+            <el-upload
+              :auto-upload="false"
+              :limit="1"
+              accept=".txt"
+              :on-change="onClassesFileChange"
+              :on-remove="() => importForm.classesFile = null"
+            >
+              <template #trigger>
+                <el-button size="small" plain>选择 classes.txt</el-button>
+              </template>
+            </el-upload>
+          </el-form-item>
+        </el-form>
+        <template #footer>
+          <el-button @click="importDialogVisible = false">取消</el-button>
+          <el-button type="primary" :loading="importing" @click="submitImport">
+            导入
+          </el-button>
+        </template>
+      </el-dialog>
+
+      <el-table v-if="models.length" :data="models" stripe>
         <el-table-column prop="name" label="模型名称" min-width="160" />
         <el-table-column prop="model_type" label="类型" width="80" align="center">
           <template #default="{ row }">
@@ -66,7 +129,7 @@
         <el-table-column prop="created_at" label="创建时间" width="160">
           <template #default="{ row }">{{ formatDate(row.created_at) }}</template>
         </el-table-column>
-        <el-table-column label="操作" width="140" fixed="right">
+        <el-table-column label="操作" width="200" fixed="right">
           <template #default="{ row }">
             <el-dropdown @command="(cmd) => handleDownload(cmd, row)" size="small">
               <el-button type="primary" size="small">
@@ -85,6 +148,17 @@
                 </el-dropdown-menu>
               </template>
             </el-dropdown>
+            <el-popconfirm
+              v-if="!row.is_deployed"
+              title="确认删除此模型？"
+              @confirm="deleteModel(row)"
+            >
+              <template #reference>
+                <el-button type="danger" size="small" :icon="Delete" plain style="margin-left: 8px">
+                  删除
+                </el-button>
+              </template>
+            </el-popconfirm>
           </template>
         </el-table-column>
       </el-table>
@@ -94,7 +168,7 @@
 
 <script setup>
 import { ref, onMounted, watch } from 'vue'
-import { Refresh, Download, FolderOpened, ArrowDown } from '@element-plus/icons-vue'
+import { Refresh, Download, FolderOpened, ArrowDown, Delete, Upload } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import { trainingApi } from '@/api'
 import { useProjectStore } from '@/stores/project'
@@ -104,6 +178,71 @@ const projectStore = useProjectStore()
 const { hasProject, projectId } = storeToRefs(projectStore)
 
 const models = ref([])
+const importDialogVisible = ref(false)
+const importing = ref(false)
+const importFormRef = ref(null)
+const uploadRef = ref(null)
+const importForm = ref({
+  name: '',
+  file: null,
+  classes: '',
+  classesFile: null,
+})
+const importRules = {
+  name: [{ required: true, message: '请输入模型名称', trigger: 'blur' }],
+}
+
+function showImportDialog() {
+  importDialogVisible.value = true
+}
+
+function onImportFileChange(file) {
+  importForm.value.file = file.raw || file
+}
+
+function onClassesFileChange(file) {
+  importForm.value.classesFile = file.raw || file
+}
+
+function resetImportForm() {
+  importForm.value = { name: '', file: null, classes: '', classesFile: null }
+  uploadRef.value?.clearFiles?.()
+  importFormRef.value?.resetFields?.()
+}
+
+async function submitImport() {
+  if (!importForm.value.file) {
+    ElMessage.warning('请选择要导入的 .pt 文件')
+    return
+  }
+  if (!importForm.value.name?.trim()) {
+    ElMessage.warning('请输入模型名称')
+    return
+  }
+  importing.value = true
+  try {
+    const formData = new FormData()
+    formData.append('file', importForm.value.file)
+    formData.append('name', importForm.value.name.trim())
+    if (projectId.value) {
+      formData.append('project_id', projectId.value)
+    }
+    if (importForm.value.classes?.trim()) {
+      formData.append('classes_str', importForm.value.classes.trim())
+    }
+    if (importForm.value.classesFile) {
+      formData.append('classes_file', importForm.value.classesFile)
+    }
+    await trainingApi.importModel(formData)
+    ElMessage.success('模型导入成功')
+    importDialogVisible.value = false
+    loadModels()
+  } catch (error) {
+    ElMessage.error('导入失败: ' + (error.response?.data?.detail || error.message))
+  } finally {
+    importing.value = false
+  }
+}
 
 const formatDate = (d) => d ? new Date(d).toLocaleString('zh-CN', { hour12: false }) : '-'
 const formatSize = (bytes) => {
@@ -153,6 +292,16 @@ function handleDownload(command, model) {
     // 下载完整包 (权重 + 标签 + 说明)
     ElMessage.success('正在下载完整模型包 (包含权重、标签文件和使用说明)...')
     window.open(trainingApi.downloadModelPackage(model.id), '_blank')
+  }
+}
+
+async function deleteModel(model) {
+  try {
+    await trainingApi.deleteModel(model.id)
+    ElMessage.success('模型已删除')
+    loadModels()
+  } catch (error) {
+    ElMessage.error('删除失败: ' + (error.response?.data?.detail || error.message))
   }
 }
 </script>

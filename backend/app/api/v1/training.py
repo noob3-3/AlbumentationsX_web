@@ -2,17 +2,20 @@
 Training API endpoints
 """
 import asyncio
+import shutil
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query, File, Form, UploadFile
 from fastapi.responses import FileResponse
 from pathlib import Path
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, delete
 
 from app.core.database import get_db
+from app.core.config import settings
 from app.schemas.schemas import TrainingJobCreate, TrainingJobResponse, SuccessResponse, ModelResponse
 from app.services import TrainingService, AVAILABLE_MODELS
-from app.models import JobStatus, Model, Dataset, Image, Annotation, TrainingJob
+from app.models import JobStatus, Model, ModelValidation, Dataset, Image, Annotation, TrainingJob
+from app.models.models import gen_uuid
 from loguru import logger
 
 router = APIRouter(prefix="/training", tags=["training"])
@@ -145,6 +148,85 @@ async def get_queue_status():
 # ─────────────────────────────────────────────
 # Model management
 # ─────────────────────────────────────────────
+@router.post("/models/import", response_model=ModelResponse, summary="Import model from file")
+async def import_model(
+    file: UploadFile = File(..., description="模型权重文件 (.pt)"),
+    name: str = Form(..., min_length=1, max_length=255, description="模型名称"),
+    project_id: Optional[str] = Form(None, description="所属项目ID"),
+    classes_str: Optional[str] = Form(None, description="类别列表，逗号分隔"),
+    classes_file: Optional[UploadFile] = File(None, description="类别文件 classes.txt，每行一个类别"),
+    db: AsyncSession = Depends(get_db),
+):
+    """导入 YOLO 模型权重文件 (.pt) 到模型库"""
+    if not file.filename or not file.filename.lower().endswith(".pt"):
+        raise HTTPException(status_code=422, detail="请上传 .pt 格式的模型权重文件")
+
+    # 解析类别
+    classes = []
+    if classes_str and classes_str.strip():
+        classes = [c.strip() for c in classes_str.split(",") if c.strip()]
+    elif classes_file and classes_file.filename:
+        try:
+            content = await classes_file.read()
+            classes = [line.strip() for line in content.decode("utf-8").strip().split("\n") if line.strip()]
+        except Exception as e:
+            logger.warning(f"Failed to parse classes file: {e}")
+
+    # 创建导入目录并保存文件
+    model_id = gen_uuid()
+    import_dir = settings.MODEL_DIR / "imported" / model_id
+    import_dir.mkdir(parents=True, exist_ok=True)
+    dest_path = import_dir / "best.pt"
+
+    try:
+        file_size = 0
+        max_size = 500 * 1024 * 1024  # 500MB
+        with open(dest_path, "wb") as f:
+            while chunk := await file.read(1024 * 1024):
+                file_size += len(chunk)
+                if file_size > max_size:
+                    dest_path.unlink(missing_ok=True)
+                    raise HTTPException(status_code=413, detail="模型文件超过 500MB 限制")
+                f.write(chunk)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to save imported model: {e}")
+        dest_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail=f"保存文件失败: {str(e)}")
+
+    # 尝试从模型中提取类别（如果未手动指定）
+    if not classes:
+        try:
+            from ultralytics import YOLO
+            yolo = YOLO(str(dest_path))
+            if hasattr(yolo, "model") and hasattr(yolo.model, "names") and yolo.model.names:
+                classes = list(yolo.model.names.values())
+                logger.info(f"Extracted {len(classes)} classes from model: {classes}")
+        except Exception as e:
+            logger.warning(f"Could not extract classes from model: {e}")
+
+    # 创建 Model 记录
+    model = Model(
+        id=model_id,
+        name=name.strip(),
+        project_id=project_id or None,
+        training_job_id=None,
+        model_path=str(dest_path),
+        model_type="yolo",
+        classes=classes if classes else None,
+        map50=None,
+        map50_95=None,
+        file_size=file_size,
+        is_deployed=False,
+    )
+    db.add(model)
+    await db.commit()
+    await db.refresh(model)
+    logger.info(f"Imported model: {name} (id={model_id}, classes={len(classes) if classes else 0})")
+    return model
+
+
 @router.get("/models", summary="List trained models")
 async def list_models(
     project_id: Optional[str] = Query(None, description="Filter by project ID"),
@@ -165,6 +247,37 @@ async def get_model(model_id: str, db: AsyncSession = Depends(get_db)):
     if not model:
         raise HTTPException(status_code=404, detail="Model not found")
     return model
+
+
+@router.delete("/models/{model_id}", response_model=SuccessResponse, summary="Delete model")
+async def delete_model(model_id: str, db: AsyncSession = Depends(get_db)):
+    """删除模型（已部署的模型不可删除）"""
+    result = await db.execute(select(Model).where(Model.id == model_id))
+    model = result.scalar_one_or_none()
+    if not model:
+        raise HTTPException(status_code=404, detail="Model not found")
+    if model.is_deployed:
+        raise HTTPException(status_code=400, detail="无法删除已部署的模型，请先停止部署")
+    # 删除关联的验证记录（避免 model_id NOT NULL 约束冲突）
+    await db.execute(delete(ModelValidation).where(ModelValidation.model_id == model_id))
+    # 删除模型文件
+    if model.model_path and Path(model.model_path).exists():
+        try:
+            model_path = Path(model.model_path)
+            model_path.unlink(missing_ok=True)
+            run_dir = model_path.parent
+            last_pt = run_dir / "last.pt"
+            if last_pt.exists():
+                last_pt.unlink(missing_ok=True)
+            # 导入的模型在 imported/{id}/ 目录下，删除整个目录
+            if "imported" in str(run_dir):
+                if run_dir.exists():
+                    shutil.rmtree(run_dir, ignore_errors=True)
+        except OSError as e:
+            logger.warning(f"Failed to delete model file: {e}")
+    await db.delete(model)
+    await db.commit()
+    return {"success": True, "message": "Model deleted"}
 
 
 @router.get("/models/{model_id}/download", summary="Download model weights (best.pt)")

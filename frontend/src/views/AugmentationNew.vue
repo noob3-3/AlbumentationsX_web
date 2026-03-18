@@ -79,7 +79,7 @@
                         <div class="preset-title">{{ config.name }}</div>
                         <div class="preset-desc">{{ config.description }}</div>
                         <div class="preset-transforms">
-                          包含 {{ config.transforms.length }} 种增强方式
+                          包含 {{ (config?.transforms || []).length }} 种增强方式
                         </div>
                       </div>
                     </el-radio>
@@ -88,16 +88,16 @@
               </el-form-item>
 
               <!-- Preview Preset Transforms -->
-              <el-collapse v-if="selectedPreset" style="margin-top: 16px">
+              <el-collapse v-if="selectedPreset && presetConfigs[selectedPreset]?.transforms" style="margin-top: 16px">
                 <el-collapse-item title="查看包含的增强方式" name="1">
                   <div class="transform-list">
                     <el-tag
-                      v-for="t in presetConfigs[selectedPreset].transforms"
-                      :key="t.name"
+                      v-for="t in (presetConfigs[selectedPreset]?.transforms || [])"
+                      :key="t?.name || t"
                       size="small"
                       style="margin: 4px"
                     >
-                      {{ getTransformLabel(t.name) }}
+                      {{ getTransformLabel(t?.name ?? t) }}
                     </el-tag>
                   </div>
                 </el-collapse-item>
@@ -116,7 +116,7 @@
                   <div class="transform-category">
                     <el-space wrap>
                       <div
-                        v-for="transformName in transformsByCategory[categoryKey]"
+                        v-for="transformName in (transformsByCategory[categoryKey] || [])"
                         :key="transformName"
                         class="transform-card"
                         :class="{ active: isTransformSelected(transformName) }"
@@ -459,9 +459,9 @@ async function fetchJobs() {
 async function fetchTransforms() {
   try {
     const res = await augmentationApi.listTransforms()
-    transformsInfo.value = res.transforms
-    categories.value = res.categories
-    transformsByCategory.value = res.by_category
+    transformsInfo.value = res?.transforms || {}
+    categories.value = res?.categories || {}
+    transformsByCategory.value = res?.by_category || {}
 
     // Set first category as active
     const categoryKeys = Object.keys(categories.value)
@@ -470,15 +470,24 @@ async function fetchTransforms() {
     }
   } catch (error) {
     ElMessage.error('加载增强方式失败')
+    transformsInfo.value = {}
+    categories.value = {}
+    transformsByCategory.value = {}
   }
 }
 
 async function fetchPresets() {
   try {
     const res = await augmentationApi.getRecommendedConfigs()
-    presetConfigs.value = res.configs
+    presetConfigs.value = res?.configs || {}
+    // 确保 selectedPreset 指向有效配置
+    const keys = Object.keys(presetConfigs.value)
+    if (keys.length > 0 && !presetConfigs.value[selectedPreset.value]) {
+      selectedPreset.value = keys[0]
+    }
   } catch (error) {
     ElMessage.error('加载预设配置失败')
+    presetConfigs.value = {}
   }
 }
 
@@ -494,8 +503,14 @@ async function createJob() {
 
     if (configMode.value === 'preset') {
       // Use preset config
+      const preset = presetConfigs.value[selectedPreset.value]
+      if (!preset?.transforms) {
+        ElMessage.warning('预设配置加载异常，请刷新页面重试')
+        creating.value = false
+        return
+      }
       config = {
-        transforms: presetConfigs.value[selectedPreset.value].transforms,
+        transforms: preset.transforms,
       }
     } else {
       // Use custom config

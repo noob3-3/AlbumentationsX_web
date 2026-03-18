@@ -24,7 +24,7 @@
             <el-select v-model="uploadForm.datasetId" placeholder="选择数据集" style="width:100%">
               <el-option v-for="d in datasets" :key="d.id" :label="d.name" :value="d.id" />
             </el-select>
-            <el-button link style="margin-left:8px" @click="showCreateDataset = true">+ 新建</el-button>
+            <el-button link style="margin-left:8px" @click="goToCreateDataset">+ 新建数据集</el-button>
           </el-form-item>
         </el-form>
 
@@ -80,7 +80,7 @@
             <el-select v-model="labelUploadForm.datasetId" placeholder="选择数据集" style="width:100%">
               <el-option v-for="d in datasets" :key="d.id" :label="d.name" :value="d.id" />
             </el-select>
-            <el-button link style="margin-left:8px" @click="showCreateDataset = true">+ 新建</el-button>
+            <el-button link style="margin-left:8px" @click="goToCreateDataset">+ 新建数据集</el-button>
           </el-form-item>
         </el-form>
 
@@ -201,6 +201,7 @@
             <el-select v-model="urlForm.datasetId" placeholder="选择数据集" style="width:100%">
               <el-option v-for="d in datasets" :key="d.id" :label="d.name" :value="d.id" />
             </el-select>
+            <el-button link style="margin-left:8px" @click="goToCreateDataset">+ 新建数据集</el-button>
           </el-form-item>
           <el-form-item label="图片URL列表">
             <el-input
@@ -268,26 +269,12 @@ https://example.com/image2.png"
         </div>
       </el-tab-pane>
     </el-tabs>
-
-    <!-- Create Dataset Dialog -->
-    <el-dialog v-model="showCreateDataset" title="新建数据集" width="440px">
-      <el-form :model="newDataset" label-width="80px">
-        <el-form-item label="名称"><el-input v-model="newDataset.name" /></el-form-item>
-        <el-form-item label="类别">
-          <el-select v-model="newDataset.classes" multiple filterable allow-create style="width:100%" placeholder="输入类别后回车" />
-        </el-form-item>
-      </el-form>
-      <template #footer>
-        <el-button @click="showCreateDataset = false">取消</el-button>
-        <el-button type="primary" @click="createDataset">创建</el-button>
-      </template>
-    </el-dialog>
   </div>
 </template>
 
 <script setup>
 import { ref, computed, onMounted, watch } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { UploadFilled, Document } from '@element-plus/icons-vue'
 import { datasetApi } from '@/api'
@@ -296,6 +283,7 @@ import { useProjectStore } from '@/stores/project'
 import { storeToRefs } from 'pinia'
 
 const route = useRoute()
+const router = useRouter()
 const store = useDatasetStore()
 const projectStore = useProjectStore()
 const { datasets } = storeToRefs(store)
@@ -308,7 +296,6 @@ const uploading = ref(false)
 const uploadProgress = ref(0)
 const collecting = ref(false)
 const collectResult = ref(null)
-const showCreateDataset = ref(false)
 
 // Label upload refs
 const imageUploadRef = ref()
@@ -325,7 +312,6 @@ const labelUploadResult = ref(null)
 const uploadForm = ref({ datasetId: route.query.dataset || '' })
 const urlForm = ref({ datasetId: route.query.dataset || '', urlText: '' })
 const labelUploadForm = ref({ datasetId: route.query.dataset || '' })
-const newDataset = ref({ name: '', classes: [] })
 
 const urlList = computed(() =>
   urlForm.value.urlText
@@ -483,11 +469,14 @@ function clearLabelUpload() {
   labelUploadProgress.value = 0
 }
 
-async function createDataset() {
-  if (!newDataset.value.name) return
-  await store.createDataset(newDataset.value)
-  showCreateDataset.value = false
-  newDataset.value = { name: '', classes: [] }
+function goToCreateDataset() {
+  if (!projectId.value) {
+    ElMessage.warning('请先在页面顶部选择项目')
+    router.push('/projects')
+    return
+  }
+  router.push(`/projects/${projectId.value}`)
+  ElMessage.info('请在项目页创建数据集')
 }
 </script>
 

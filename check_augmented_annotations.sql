@@ -36,7 +36,7 @@ LIMIT 20;
 
 -- 3. 查看原始图片和其增强版本的标注情况对比
 SELECT
-    orig.id as original_id,
+    orig.id as original_id,n
     orig.filename as original_filename,
     COUNT(DISTINCT orig_ann.id) as original_annotations,
     aug.id as augmented_id,

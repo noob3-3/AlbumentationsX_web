@@ -255,7 +255,9 @@ class Model(Base):
     # Relationships
     project_rel: Mapped[Optional["Project"]] = relationship("Project", back_populates="models")
     deployments: Mapped[list["Deployment"]] = relationship("Deployment", back_populates="model")
-    validations: Mapped[list["ModelValidation"]] = relationship("ModelValidation", back_populates="model")
+    validations: Mapped[list["ModelValidation"]] = relationship(
+        "ModelValidation", back_populates="model", cascade="all, delete-orphan"
+    )
 
 
 # ─────────────────────────────────────────────

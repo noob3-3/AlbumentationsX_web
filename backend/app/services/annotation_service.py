@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Optional, List
 from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, or_, and_, exists
 from sqlalchemy.orm import selectinload
 from PIL import Image as PILImage
 import numpy as np
@@ -169,8 +169,21 @@ class AnnotationService:
         else:
             # Filter by annotation status
             if not annotate_all:
-                # Only annotate unannotated images
-                query = query.where(Image.annotation_status == AnnotationStatus.UNANNOTATED)
+                # 未标注范围：包含 UNANNOTATED，以及「已标注但无标注框」的图片
+                # （上次自动标注未检测到目标时会被标为 AUTO_ANNOTATED，用户仍视为未标注）
+                has_annotations = exists().where(Annotation.image_id == Image.id)
+                query = query.where(
+                    or_(
+                        Image.annotation_status == AnnotationStatus.UNANNOTATED,
+                        and_(
+                            Image.annotation_status.in_([
+                                AnnotationStatus.AUTO_ANNOTATED,
+                                AnnotationStatus.MANUALLY_ANNOTATED,
+                            ]),
+                            ~has_annotations,  # 无标注框
+                        ),
+                    )
+                )
             # If annotate_all is True, don't filter by annotation status
 
             # Filter augmented images
@@ -180,8 +193,24 @@ class AnnotationService:
 
         result = await db.execute(query)
         images = result.scalars().all()
-
         total_images = len(images)
+
+        if total_images == 0:
+            # 调试：统计各类图片数量，便于排查为何为 0
+            from sqlalchemy import func
+            debug_query = (
+                select(Image.annotation_status, func.count(Image.id))
+                .where(Image.dataset_id == dataset_id)
+            )
+            if not include_augmented:
+                debug_query = debug_query.where(Image.is_augmented == False)
+            debug_query = debug_query.group_by(Image.annotation_status)
+            count_result = await db.execute(debug_query)
+            stats = dict(count_result.all())
+            logger.warning(
+                f"⚠️ Auto-annotation found 0 images for dataset {dataset_id}. "
+                f"Status counts (include_augmented={include_augmented}): {stats}"
+            )
         success_count = 0
         failed_count = 0
 

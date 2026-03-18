@@ -238,6 +238,7 @@ import { trainingApi, annotationApi } from '@/api'
 
 const props = defineProps({
   datasetId: String,
+  projectId: String,  // 用于过滤自定义模型，只显示当前项目的模型
   selectedImages: {
     type: Array,
     default: () => [],
@@ -354,7 +355,8 @@ async function checkAndResumeActiveJob() {
 const fetchModels = async () => {
   loadingModels.value = true
   try {
-    const res = await trainingApi.listModels()
+    const params = props.projectId ? { project_id: props.projectId } : {}
+    const res = await trainingApi.listModels(params)
     models.value = res.models || []
     if (models.value.length > 0) {
       form.value.model_id = models.value[0].id
@@ -589,8 +591,10 @@ function connectWebSocket(jobId) {
   ws.onclose = (event) => {
     console.log('🔌 WebSocket closed:', event.code, event.reason)
 
-    if (ws._pingInterval) {
-      clearInterval(ws._pingInterval)
+    // 使用 event.target 而非 ws，避免竞态：ws 可能已被置为 null
+    const closedWs = event.target
+    if (closedWs?._pingInterval) {
+      clearInterval(closedWs._pingInterval)
     }
 
     // 不重连，依靠轮询获取进度

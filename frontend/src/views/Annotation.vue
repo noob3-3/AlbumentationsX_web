@@ -83,10 +83,12 @@
       <div v-if="selectedDatasetId && images.length > 0">
         <AnnotationView
           :datasetId="selectedDatasetId"
+          :projectId="currentDataset?.project_id || projectId"
           :images="images"
           :classes="currentDataset?.classes || []"
           :imageUrlFunc="imageUrl"
           @annotationsSaved="onAnnotationsSaved"
+          @imageDeleted="onImageDeleted"
         />
       </div>
 
@@ -98,6 +100,7 @@
     <AutoAnnotationDialog
       ref="autoAnnotationDialogRef"
       :datasetId="selectedDatasetId"
+      :projectId="currentDataset?.project_id || projectId"
       :selectedImages="images"
       @success="onAutoAnnotationSuccess"
     />
@@ -321,6 +324,15 @@ function onAutoAnnotationSuccess(result) {
   // Reload images to show auto-generated annotations
   loadImages()
   // Reload dataset to update class list
+  if (selectedDatasetId.value) {
+    datasetApi.get(selectedDatasetId.value).then(ds => {
+      currentDataset.value = ds
+    })
+  }
+}
+
+function onImageDeleted() {
+  loadImages()
   if (selectedDatasetId.value) {
     datasetApi.get(selectedDatasetId.value).then(ds => {
       currentDataset.value = ds

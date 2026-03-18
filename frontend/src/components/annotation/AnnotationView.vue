@@ -6,7 +6,7 @@
         <div class="selector-label">
           选择要标注的图片
           <el-tag size="small" type="info" style="margin-left: 8px">
-            快捷键: Ctrl+S 快速下一张 | Ctrl+P 快速上一张 | Ctrl+Enter 仅保存 (注: 点击按钮也会自动保存)
+            快捷键: A 上一张 | D 下一张 | W 切换绘制/选择 | 滚轮缩放 | Ctrl+S/Ctrl+P 保存并跳转
           </el-tag>
         </div>
         <el-select
@@ -44,6 +44,17 @@
         <el-button icon="Picture" @click="showImageList = true" plain>
           图库
         </el-button>
+        <el-popconfirm
+          v-if="currentImage"
+          title="确认删除此图片？"
+          @confirm="deleteCurrentImage"
+        >
+          <template #reference>
+            <el-button type="danger" icon="Delete" plain :disabled="!currentImage">
+              删除图片
+            </el-button>
+          </template>
+        </el-popconfirm>
       </el-col>
     </el-row>
 
@@ -67,6 +78,7 @@
     <AutoAnnotationDialog
       ref="autoAnnotationDialog"
       :datasetId="datasetId"
+      :projectId="projectId"
       :selectedImages="[currentImage]"
       @success="onAutoAnnotationSuccess"
     />
@@ -96,11 +108,14 @@
 <script setup>
 import { ref, computed, onMounted, watch, reactive, nextTick } from 'vue'
 import { ElMessage } from 'element-plus'
+import { Delete } from '@element-plus/icons-vue'
 import AnnotationEditor from './AnnotationEditor.vue'
 import AutoAnnotationDialog from './AutoAnnotationDialog.vue'
+import { datasetApi } from '@/api'
 
 const props = defineProps({
   datasetId: String,
+  projectId: String,  // 用于自动标注时过滤自定义模型
   images: {
     type: Array,
     default: () => [],
@@ -112,7 +127,7 @@ const props = defineProps({
   imageUrlFunc: Function,
 })
 
-const emit = defineEmits(['annotationsSaved'])
+const emit = defineEmits(['annotationsSaved', 'imageDeleted'])
 
 const selectedImageId = ref('')
 const editorRef = ref(null)
@@ -144,7 +159,18 @@ const canGoNext = computed(() => {
 onMounted(() => {
   if (props.images.length > 0) {
     selectedImageId.value = props.images[0].id
+    nextTick(() => preloadAdjacentImages())
   }
+})
+
+watch(() => props.images, (newImages) => {
+  if (newImages?.length > 0) {
+    nextTick(() => preloadAdjacentImages())
+  }
+}, { immediate: false })
+
+watch([() => currentImage.value?.id, () => currentPreloadedImage.value], ([imgId, preloaded]) => {
+  logLoad('editor props', { imageId: imgId, hasPreloaded: !!preloaded })
 })
 
 function preloadImage(imgData) {
@@ -161,18 +187,32 @@ function preloadImage(imgData) {
   preImg.src = imageUrl(imgData.id)
 }
 
-function preloadNextImage() {
+function preloadAdjacentImages() {
   const idx = currentImageIndex.value
   if (idx < 0) return
+  if (idx > 0) {
+    preloadImage(props.images[idx - 1])
+  }
   if (idx + 1 < props.images.length) {
     preloadImage(props.images[idx + 1])
+  }
+  if (idx + 2 < props.images.length) {
+    preloadImage(props.images[idx + 2])
   }
 }
 
 function onImageReady() {
   nextTick(() => {
-    preloadNextImage()
+    preloadAdjacentImages()
   })
+}
+
+const DEBUG_LOAD = false
+function logLoad(...args) {
+  if (!DEBUG_LOAD) return
+  const now = performance.now()
+  const ts = new Date().toLocaleTimeString('zh-CN', { hour12: false }) + '.' + String(now % 1000).padStart(3, '0').slice(0, 3)
+  console.log(`[AnnotationView] [${ts}]`, ...args)
 }
 
 function imageUrl(imageId, thumbnail = false) {
@@ -246,8 +286,33 @@ async function saveAndPrevious() {
 }
 
 function handleKeyDown(event) {
+  // 输入框或下拉选择展开时不响应快捷键
+  const target = event.target
+  const isInput = target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable
+  const isInDropdown = target.closest?.('.el-select__popper') || target.closest?.('.el-popper')
+  if (isInput || isInDropdown) return
+
   // Check if Ctrl/Cmd is pressed
   const isCtrl = event.ctrlKey || event.metaKey
+
+  // A: 上一张
+  if (event.key === 'a' || event.key === 'A') {
+    event.preventDefault()
+    previousImage()
+    return
+  }
+  // D: 下一张
+  if (event.key === 'd' || event.key === 'D') {
+    event.preventDefault()
+    nextImage()
+    return
+  }
+  // W: 切换绘制/选择状态
+  if (event.key === 'w' || event.key === 'W') {
+    event.preventDefault()
+    editorRef.value?.toggleDrawSelect?.()
+    return
+  }
 
   if (isCtrl && event.key === 's') {
     event.preventDefault()
@@ -271,6 +336,27 @@ function handleKeyDown(event) {
     event.preventDefault()
     // Alt + Left arrow: 快速上一张（不保存，用于快速浏览）
     quickPreviousImage()
+  }
+}
+
+async function deleteCurrentImage() {
+  if (!props.datasetId || !selectedImageId.value) return
+  try {
+    await datasetApi.deleteImage(props.datasetId, selectedImageId.value)
+    const deletedId = selectedImageId.value
+    const idx = currentImageIndex.value
+    // 切换到上一张或下一张
+    if (idx > 0) {
+      selectedImageId.value = props.images[idx - 1].id
+    } else if (idx < props.images.length - 1) {
+      selectedImageId.value = props.images[idx + 1].id
+    } else {
+      selectedImageId.value = ''
+    }
+    emit('imageDeleted', deletedId)
+    ElMessage.success('图片已删除')
+  } catch (error) {
+    ElMessage.error('删除失败: ' + (error.response?.data?.detail || error.message))
   }
 }
 

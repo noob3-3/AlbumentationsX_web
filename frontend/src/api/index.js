@@ -77,6 +77,8 @@ export const trainingApi = {
   // Models
   listModels: (params) => http.get('/training/models', { params }),
   getModel: (id) => http.get(`/training/models/${id}`),
+  importModel: (formData) => http.post('/training/models/import', formData),
+  deleteModel: (id) => http.delete(`/training/models/${id}`),
   downloadModel: (id) => `/api/v1/training/models/${id}/download`,
   downloadModelPackage: (id) => `/api/v1/training/models/${id}/download-package`,
 }
