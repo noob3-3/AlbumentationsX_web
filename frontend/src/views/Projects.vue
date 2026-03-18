@@ -23,9 +23,9 @@
         </el-col>
         <el-col :span="12">
           <el-radio-group v-model="statusFilter" @change="loadProjects">
-            <el-radio-button label="">全部</el-radio-button>
-            <el-radio-button label="active">活跃</el-radio-button>
-            <el-radio-button label="archived">已归档</el-radio-button>
+            <el-radio-button value="">全部</el-radio-button>
+            <el-radio-button value="active">活跃</el-radio-button>
+            <el-radio-button value="archived">已归档</el-radio-button>
           </el-radio-group>
         </el-col>
       </el-row>

@@ -51,6 +51,28 @@ class DatasetService:
         return result.scalar_one_or_none()
 
     @staticmethod
+    async def get_or_create_api_inference_dataset(db: AsyncSession, project_id: Optional[str]) -> Optional[Dataset]:
+        """获取或创建项目的 API 推理数据集（用于自动保存部署推理的图片和结果）"""
+        if not project_id:
+            return None
+        # 查找名称固定的数据集
+        result = await db.execute(
+            select(Dataset)
+            .where(Dataset.project_id == project_id)
+            .where(Dataset.name == "API推理数据")
+        )
+        dataset = result.scalar_one_or_none()
+        if dataset:
+            return dataset
+        # 不存在则创建
+        dataset = await DatasetService.create_dataset(
+            db, DatasetCreate(name="API推理数据", project_id=project_id, description="部署 API 推理自动保存的图片与检测结果")
+        )
+        await db.flush()
+        await db.refresh(dataset)
+        return dataset
+
+    @staticmethod
     async def list_datasets(
         db: AsyncSession,
         skip: int = 0,
@@ -158,6 +180,13 @@ class DatasetService:
                 db.add(ann)
 
         # Update dataset counts
+        dataset.image_count += 1
+        if annotations:
+            dataset.annotation_count += len(annotations)
+
+        await db.flush()
+        await db.refresh(image)
+        return image
 
     @staticmethod
     async def save_uploaded_image_stream(

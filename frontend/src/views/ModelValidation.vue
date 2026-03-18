@@ -14,8 +14,19 @@
     <el-card>
       <template #header>
         <div class="card-header">
-          <span class="title">模型验证</span>
-          <el-tag type="info">多模型对比测试</el-tag>
+          <div>
+            <span class="title">模型验证</span>
+            <el-tag type="info">多模型对比测试</el-tag>
+          </div>
+          <el-popconfirm
+            v-if="hasProject && projectId"
+            title="确定清除当前项目的所有验证测试数据？此操作不可恢复"
+            @confirm="cleanValidationData"
+          >
+            <template #reference>
+              <el-button type="warning" size="small" plain>清除测试数据</el-button>
+            </template>
+          </el-popconfirm>
         </div>
       </template>
 
@@ -28,11 +39,12 @@
               ref="uploadRef"
               :auto-upload="false"
               :show-file-list="true"
-              :limit="1"
+              :limit="100"
               accept="image/*"
               :on-change="handleImageSelect"
               :on-exceed="handleExceed"
               :on-remove="handleRemove"
+              multiple
               drag
             >
               <el-icon class="el-icon--upload"><upload-filled /></el-icon>
@@ -40,12 +52,15 @@
                 拖拽图片到此处或 <em>点击上传</em>
               </div>
               <template #tip>
-                <div class="el-upload__tip">支持 jpg/png 格式图片，拖入新图片将替换旧图片</div>
+                <div class="el-upload__tip">支持 jpg/png 格式，最多 100 张</div>
               </template>
             </el-upload>
 
-            <div v-if="previewImage" class="image-preview">
-              <el-image :src="previewImage" fit="contain" style="width: 100%; max-height: 300px" />
+            <div v-if="uploadedFiles.length > 0" class="image-preview-list">
+              <div v-for="(f, idx) in uploadedFiles" :key="idx" class="preview-item">
+                <el-image :src="previewUrls[idx]" fit="contain" style="width: 80px; height: 60px; border-radius: 4px" />
+                <span class="preview-name">{{ f.name }}</span>
+              </div>
             </div>
           </div>
 
@@ -131,7 +146,7 @@
             type="primary"
             size="large"
             :loading="validating"
-            :disabled="!uploadedFile || selectedModels.length === 0"
+            :disabled="uploadedFiles.length === 0 || selectedModels.length === 0"
             @click="runValidation"
             style="width: 100%; margin-top: 20px"
           >
@@ -146,81 +161,101 @@
             <h3>验证结果</h3>
 
             <div v-if="validationResults" class="results">
-              <el-alert
-                :title="`总耗时: ${validationResults.total_time_ms.toFixed(2)} ms`"
-                type="success"
-                :closable="false"
-                style="margin-bottom: 16px"
-              />
+              <div class="results-header">
+                <el-alert
+                  :title="`共 ${validationResults.images?.length || 0} 张图片，总耗时: ${validationResults.total_time_ms.toFixed(2)} ms`"
+                  type="success"
+                  :closable="false"
+                  style="flex: 1; margin-bottom: 0"
+                />
+                <el-button type="primary" size="small" @click="openSaveDialog">
+                  <el-icon><FolderOpened /></el-icon>
+                  保存到数据集
+                </el-button>
+              </div>
 
-              <el-tabs v-model="activeTab" type="border-card" @tab-change="handleTabChange">
-                <el-tab-pane
-                  v-for="result in validationResults.results"
-                  :key="result.model_id"
-                  :label="`${result.model_name} (${result.detection_count})`"
-                  :name="result.model_id"
+              <el-collapse v-model="activeImageIndex">
+                <el-collapse-item
+                  v-for="(imgResult, imgIdx) in (validationResults.images || [])"
+                  :key="imgIdx"
+                  :name="String(imgIdx)"
                 >
-                  <div v-if="result.error" class="error-message">
-                    <el-alert :title="result.error" type="error" :closable="false" />
-                  </div>
+                  <template #title>
+                    <span>{{ imgResult.image_name }}</span>
+                    <el-tag size="small" type="info" style="margin-left: 8px">
+                      {{ imgResult.results?.reduce((s, r) => s + (r.detection_count || 0), 0) }} 检测 / {{ imgResult.total_time_ms?.toFixed(0) }}ms
+                    </el-tag>
+                  </template>
 
-                  <div v-else class="result-layout">
-                    <div class="result-image-wrap">
-                      <canvas :ref="(el) => setCanvasRef(result.model_id, el)" class="result-canvas" />
-                    </div>
-
-                    <div class="result-info-panel">
-                      <div class="stat-item">
-                        <span class="stat-label">模型</span>
-                        <span class="stat-value" style="font-size: 14px">{{ result.model_name }}</span>
-                      </div>
-                      <div class="stat-item">
-                        <span class="stat-label">检测数量</span>
-                        <span class="stat-value">{{ result.detection_count }}</span>
-                      </div>
-                      <div class="stat-item">
-                        <span class="stat-label">推理耗时</span>
-                        <span class="stat-value">{{ result.inference_time_ms.toFixed(1) }} ms</span>
+                  <el-tabs v-model="activeTabByImage[imgIdx]" type="border-card" @tab-change="(name) => handleTabChange(name, imgIdx)">
+                    <el-tab-pane
+                      v-for="result in (imgResult.results || [])"
+                      :key="result.model_id"
+                      :label="`${result.model_name} (${result.detection_count})`"
+                      :name="result.model_id"
+                    >
+                      <div v-if="result.error" class="error-message">
+                        <el-alert :title="result.error" type="error" :closable="false" />
                       </div>
 
-                      <div class="detection-list-title">检测结果</div>
-                      <div v-if="result.detections.length === 0" class="no-detection">
-                        未检测到任何物体
-                      </div>
-                      <div v-else class="detection-list">
-                        <div
-                          v-for="(det, idx) in result.detections"
-                          :key="idx"
-                          class="detection-row"
-                        >
-                          <span class="det-color" :style="{ background: getColor(idx) }" />
-                          <span class="det-class">{{ det.class_name }}</span>
-                          <span class="det-conf">{{ (det.confidence * 100).toFixed(1) }}%</span>
+                      <div v-else class="result-layout">
+                        <div class="result-image-wrap">
+                          <canvas :ref="(el) => setCanvasRef(imgIdx, result.model_id, el)" class="result-canvas" />
+                        </div>
+
+                        <div class="result-info-panel">
+                          <div class="stat-item">
+                            <span class="stat-label">模型</span>
+                            <span class="stat-value" style="font-size: 14px">{{ result.model_name }}</span>
+                          </div>
+                          <div class="stat-item">
+                            <span class="stat-label">检测数量</span>
+                            <span class="stat-value">{{ result.detection_count }}</span>
+                          </div>
+                          <div class="stat-item">
+                            <span class="stat-label">推理耗时</span>
+                            <span class="stat-value">{{ result.inference_time_ms.toFixed(1) }} ms</span>
+                          </div>
+
+                          <div class="detection-list-title">检测结果</div>
+                          <div v-if="result.detections.length === 0" class="no-detection">
+                            未检测到任何物体
+                          </div>
+                          <div v-else class="detection-list">
+                            <div
+                              v-for="(det, idx) in result.detections"
+                              :key="idx"
+                              class="detection-row"
+                            >
+                              <span class="det-color" :style="{ background: getColor(idx) }" />
+                              <span class="det-class">{{ det.class_name }}</span>
+                              <span class="det-conf">{{ (det.confidence * 100).toFixed(1) }}%</span>
+                            </div>
+                          </div>
                         </div>
                       </div>
-                    </div>
-                  </div>
-                </el-tab-pane>
+                    </el-tab-pane>
 
-                <!-- Comparison tab -->
-                <el-tab-pane label="对比分析" name="comparison">
-                  <el-table :data="comparisonData" stripe size="small">
-                    <el-table-column prop="model_name" label="模型" width="200" />
-                    <el-table-column prop="detection_count" label="检测数量" width="100" align="center" />
-                    <el-table-column prop="inference_time_ms" label="推理时间 (ms)" width="150" align="center">
-                      <template #default="{ row }">
-                        {{ row.inference_time_ms.toFixed(2) }}
-                      </template>
-                    </el-table-column>
-                    <el-table-column label="状态" width="100" align="center">
-                      <template #default="{ row }">
-                        <el-tag v-if="row.error" type="danger">失败</el-tag>
-                        <el-tag v-else type="success">成功</el-tag>
-                      </template>
-                    </el-table-column>
-                  </el-table>
-                </el-tab-pane>
-              </el-tabs>
+                    <el-tab-pane label="对比分析" :name="'comparison_' + imgIdx">
+                      <el-table :data="(imgResult.results || []).map(r => ({ model_name: r.model_name, detection_count: r.detection_count, inference_time_ms: r.inference_time_ms, error: r.error }))" stripe size="small">
+                        <el-table-column prop="model_name" label="模型" width="200" />
+                        <el-table-column prop="detection_count" label="检测数量" width="100" align="center" />
+                        <el-table-column prop="inference_time_ms" label="推理时间 (ms)" width="150" align="center">
+                          <template #default="{ row }">
+                            {{ row.inference_time_ms?.toFixed(2) }}
+                          </template>
+                        </el-table-column>
+                        <el-table-column label="状态" width="100" align="center">
+                          <template #default="{ row }">
+                            <el-tag v-if="row.error" type="danger">失败</el-tag>
+                            <el-tag v-else type="success">成功</el-tag>
+                          </template>
+                        </el-table-column>
+                      </el-table>
+                    </el-tab-pane>
+                  </el-tabs>
+                </el-collapse-item>
+              </el-collapse>
             </div>
 
             <el-empty v-else description="上传图片并选择模型后开始验证" :image-size="200" />
@@ -228,13 +263,60 @@
         </el-col>
       </el-row>
     </el-card>
+
+    <!-- 保存到数据集对话框 -->
+    <el-dialog
+      v-model="saveDialogVisible"
+      title="保存到数据集"
+      width="480px"
+      :close-on-click-modal="false"
+      @open="onSaveDialogOpen"
+    >
+      <el-form label-width="100px" label-position="left">
+        <el-form-item label="选择数据集">
+          <el-select
+            v-model="saveDatasetMode"
+            placeholder="选择已有或新建"
+            style="width: 100%"
+            @change="onSaveDatasetModeChange"
+          >
+            <el-option label="新建数据集" value="new" />
+            <el-option
+              v-for="ds in projectDatasets"
+              :key="ds.id"
+              :label="ds.name"
+              :value="ds.id"
+            />
+          </el-select>
+        </el-form-item>
+        <el-form-item v-if="saveDatasetMode === 'new'" label="数据集名称">
+          <el-input v-model="saveDatasetName" placeholder="输入新数据集名称" maxlength="255" show-word-limit />
+        </el-form-item>
+        <el-form-item label="检测结果来源">
+          <el-select v-model="saveModelId" placeholder="选择模型" style="width: 100%">
+            <el-option
+              v-for="mid in selectedModels"
+              :key="mid"
+              :label="getModelName(mid)"
+              :value="mid"
+            />
+          </el-select>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="saveDialogVisible = false">取消</el-button>
+        <el-button type="primary" :loading="savingToDataset" @click="submitSaveToDataset">
+          保存
+        </el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <script setup>
 import { ref, computed, onMounted, watch, nextTick } from 'vue'
 import { ElMessage } from 'element-plus'
-import { UploadFilled, View } from '@element-plus/icons-vue'
+import { UploadFilled, View, FolderOpened } from '@element-plus/icons-vue'
 import axios from 'axios'
 import { useProjectStore } from '@/stores/project'
 import { storeToRefs } from 'pinia'
@@ -289,26 +371,25 @@ const projectStore = useProjectStore()
 const { hasProject, projectId } = storeToRefs(projectStore)
 
 const uploadRef = ref(null)
-const uploadedFile = ref(null)
-const previewImage = ref('')
+const uploadedFiles = ref([])
+const previewUrls = ref([])
 const selectedModels = ref([])
 const models = ref([])
 const confidence = ref(0.5)
 const iou = ref(0.45)
 const validating = ref(false)
 const validationResults = ref(null)
-const activeTab = ref('')
+const activeImageIndex = ref(['0'])
+const activeTabByImage = ref({})
 const canvasRefs = ref({})
 
-const comparisonData = computed(() => {
-  if (!validationResults.value) return []
-  return validationResults.value.results.map(r => ({
-    model_name: r.model_name,
-    detection_count: r.detection_count,
-    inference_time_ms: r.inference_time_ms,
-    error: r.error,
-  }))
-})
+// 保存到数据集
+const saveDialogVisible = ref(false)
+const saveDatasetMode = ref('new') // 'new' | dataset_id
+const saveDatasetName = ref('')
+const saveModelId = ref('')
+const projectDatasets = ref([])
+const savingToDataset = ref(false)
 
 onMounted(() => {
   loadModels()
@@ -319,6 +400,20 @@ watch(projectId, () => {
   selectedModels.value = []
   validationResults.value = null
 })
+
+async function cleanValidationData() {
+  if (!projectId.value) {
+    ElMessage.warning('请先选择项目')
+    return
+  }
+  try {
+    const res = await axios.delete('/api/v1/validation/clean', { params: { project_id: projectId.value } })
+    ElMessage.success(res.data?.message || '清除成功')
+    validationResults.value = null
+  } catch (e) {
+    ElMessage.error('清除失败: ' + (e.response?.data?.detail || e.message))
+  }
+}
 
 async function loadModels() {
   try {
@@ -353,26 +448,24 @@ async function loadModels() {
   }
 }
 
-function handleImageSelect(file) {
-  uploadedFile.value = file.raw
-  previewImage.value = URL.createObjectURL(file.raw)
-  // 清除之前的验证结果
-  validationResults.value = []
+function handleImageSelect(file, fileList) {
+  const files = fileList.map(f => f.raw).filter(Boolean)
+  uploadedFiles.value = files
+  previewUrls.value.forEach(url => URL.revokeObjectURL(url))
+  previewUrls.value = files.map(f => URL.createObjectURL(f))
+  validationResults.value = null
 }
 
-function handleExceed(files) {
-  // 当超过限制时，清除旧文件，使用新文件
-  uploadRef.value.clearFiles()
-  const file = files[0]
-  uploadRef.value.handleStart(file)
-  handleImageSelect({ raw: file })
+function handleExceed() {
+  ElMessage.warning('最多上传 100 张图片')
 }
 
-function handleRemove() {
-  // 移除图片时清除选择和预览
-  uploadedFile.value = null
-  previewImage.value = null
-  validationResults.value = []
+function handleRemove(file, fileList) {
+  const files = fileList.map(f => f.raw).filter(Boolean)
+  uploadedFiles.value = files
+  previewUrls.value.forEach(url => URL.revokeObjectURL(url))
+  previewUrls.value = files.map(f => URL.createObjectURL(f))
+  validationResults.value = null
 }
 
 function handleModelChange(value) {
@@ -390,47 +483,32 @@ function removeModel(modelId) {
 }
 
 async function runValidation() {
-  if (!uploadedFile.value || selectedModels.value.length === 0) {
+  if (uploadedFiles.value.length === 0 || selectedModels.value.length === 0) {
     ElMessage.warning('请上传图片并选择至少一个模型')
     return
   }
-
-  console.log('Starting validation with models:', selectedModels.value)
 
   validating.value = true
   validationResults.value = null
 
   try {
     const formData = new FormData()
-    formData.append('file', uploadedFile.value)
-
-    // 将模型ID数组转换为JSON字符串
-    const modelIdsJson = JSON.stringify(selectedModels.value)
-    console.log('Model IDs JSON:', modelIdsJson)
-    formData.append('model_ids', modelIdsJson)
-
+    uploadedFiles.value.forEach(f => formData.append('files', f))
+    formData.append('model_ids', JSON.stringify(selectedModels.value))
     formData.append('confidence', confidence.value.toString())
     formData.append('iou', iou.value.toString())
 
-    console.log('FormData contents:')
-    for (let pair of formData.entries()) {
-      console.log(pair[0] + ':', pair[1])
-    }
-
-    const response = await axios.post('/api/v1/validation/validate', formData, {
-      headers: {
-        'Content-Type': 'multipart/form-data',
-      },
-    })
-
-    console.log('Validation response:', response.data)
+    const response = await axios.post('/api/v1/validation/validate', formData)
 
     validationResults.value = response.data
-    if (validationResults.value.results.length > 0) {
-      activeTab.value = validationResults.value.results[0].model_id
-      await nextTick()
-      drawResultForModel(activeTab.value)
-    }
+    activeImageIndex.value = ['0']
+    activeTabByImage.value = Object.fromEntries(
+      (validationResults.value.images || []).map((img, i) => [i, img.results?.[0]?.model_id || ''])
+    )
+    await nextTick()
+    Object.entries(activeTabByImage.value).forEach(([i, modelId]) => {
+      drawResultForModel(Number(i), modelId)
+    })
 
     ElMessage.success('验证完成')
   } catch (error) {
@@ -441,21 +519,104 @@ async function runValidation() {
   }
 }
 
-function setCanvasRef(modelId, el) {
-  if (el) canvasRefs.value[modelId] = el
+function setCanvasRef(imgIdx, modelId, el) {
+  if (el) {
+    if (!canvasRefs.value[imgIdx]) canvasRefs.value[imgIdx] = {}
+    canvasRefs.value[imgIdx][modelId] = el
+  }
 }
 
-function drawResultForModel(modelId) {
-  if (!previewImage.value || !validationResults.value) return
-  const result = validationResults.value.results.find((r) => r.model_id === modelId)
+function drawResultForModel(imgIdx, modelId) {
+  if (!validationResults.value?.images?.[imgIdx] || !previewUrls.value[imgIdx]) return
+  const imgResult = validationResults.value.images[imgIdx]
+  const result = imgResult.results?.find((r) => r.model_id === modelId)
   if (!result || result.error) return
-  const canvas = canvasRefs.value[modelId]
-  if (canvas) drawDetections(canvas, previewImage.value, result.detections)
+  const canvas = canvasRefs.value[imgIdx]?.[modelId]
+  if (canvas) drawDetections(canvas, previewUrls.value[imgIdx], result.detections)
 }
 
-function handleTabChange(tabName) {
-  if (tabName === 'comparison') return
-  nextTick(() => drawResultForModel(tabName))
+function handleTabChange(tabName, imgIdx) {
+  if (String(tabName).startsWith('comparison_')) return
+  nextTick(() => drawResultForModel(imgIdx, tabName))
+}
+
+// 保存到数据集
+async function openSaveDialog() {
+  saveDialogVisible.value = true
+}
+
+async function onSaveDialogOpen() {
+  saveDatasetMode.value = 'new'
+  saveDatasetName.value = ''
+  saveModelId.value = selectedModels.value[0] || ''
+  projectDatasets.value = []
+  if (projectId.value) {
+    try {
+      const res = await axios.get('/api/v1/datasets', { params: { project_id: projectId.value, page_size: 100 } })
+      const items = res.data?.items ?? res.data
+      projectDatasets.value = Array.isArray(items) ? items : []
+    } catch (e) {
+      console.error('Load datasets failed:', e)
+    }
+  }
+}
+
+function onSaveDatasetModeChange() {
+  if (saveDatasetMode.value !== 'new') {
+    saveDatasetName.value = ''
+  }
+}
+
+function buildDetectionsForModel(modelId) {
+  if (!validationResults.value?.images) return []
+  return validationResults.value.images.map((imgResult) => {
+    const r = imgResult.results?.find((x) => x.model_id === modelId)
+    if (!r || !r.detections) return []
+    return r.detections.map((d) => ({
+      class_id: d.class_id ?? 0,
+      class_name: d.class_name ?? 'unknown',
+      confidence: d.confidence ?? null,
+      bbox_normalized: d.bbox_normalized ?? null,
+      bbox: d.bbox ?? null,
+    }))
+  })
+}
+
+async function submitSaveToDataset() {
+  if (!projectId.value) {
+    ElMessage.warning('请先选择项目')
+    return
+  }
+  if (saveDatasetMode.value === 'new' && !saveDatasetName.value?.trim()) {
+    ElMessage.warning('请输入数据集名称')
+    return
+  }
+  if (!saveModelId.value) {
+    ElMessage.warning('请选择检测结果来源模型')
+    return
+  }
+
+  savingToDataset.value = true
+  try {
+    const formData = new FormData()
+    uploadedFiles.value.forEach((f) => formData.append('files', f))
+    formData.append('project_id', projectId.value)
+    if (saveDatasetMode.value === 'new') {
+      formData.append('dataset_name', saveDatasetName.value.trim())
+    } else {
+      formData.append('dataset_id', saveDatasetMode.value)
+    }
+    const detections = buildDetectionsForModel(saveModelId.value)
+    formData.append('detections_json', JSON.stringify(detections))
+
+    const res = await axios.post('/api/v1/validation/save-to-dataset', formData)
+    ElMessage.success(res.data?.message ?? '保存成功')
+    saveDialogVisible.value = false
+  } catch (e) {
+    ElMessage.error('保存失败: ' + (e.response?.data?.detail || e.message))
+  } finally {
+    savingToDataset.value = false
+  }
 }
 </script>
 
@@ -468,6 +629,8 @@ function handleTabChange(tabName) {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
 }
 
 .title {
@@ -485,11 +648,34 @@ function handleTabChange(tabName) {
   color: #303133;
 }
 
-.image-preview {
-  margin-top: 16px;
-  border: 1px solid #dcdfe6;
-  border-radius: 4px;
+.image-preview-list {
+  margin-top: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.preview-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+
+.preview-name {
+  font-size: 12px;
+  color: #606266;
+  max-width: 90px;
   overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.results-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 16px;
 }
 
 .results {

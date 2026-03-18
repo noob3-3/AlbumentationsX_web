@@ -4,14 +4,16 @@ Model deployment and inference API endpoints
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 from loguru import logger
 
 from app.core.database import get_db
+from app.models import Model, ImageSource
 from app.schemas.schemas import (
     DeploymentCreate, DeploymentResponse, InferenceResponse,
     SuccessResponse
 )
-from app.services import DeploymentService
+from app.services import DeploymentService, DatasetService
 
 router = APIRouter(prefix="/deployments", tags=["deployment"])
 
@@ -175,6 +177,37 @@ async def delete_deployment(
     return {"success": True, "message": "Deployment deleted"}
 
 
+def _detections_to_annotations(detections: list) -> list:
+    """将检测结果转换为 Annotation 格式 (x_center, y_center, bbox_width, bbox_height 归一化)"""
+    anns = []
+    for d in detections or []:
+        norm = d.get("bbox_normalized") or [0.5, 0.5, 0.1, 0.1]
+        if len(norm) >= 4:
+            cx, cy, w, h = norm[0], norm[1], norm[2], norm[3]
+        else:
+            bbox = d.get("bbox", [0, 0, 10, 10])
+            if len(bbox) >= 4:
+                x1, y1, x2, y2 = bbox[0], bbox[1], bbox[2], bbox[3]
+                img_w = d.get("_img_width") or 1
+                img_h = d.get("_img_height") or 1
+                cx = (x1 + x2) / 2 / img_w
+                cy = (y1 + y2) / 2 / img_h
+                w = (x2 - x1) / img_w
+                h = (y2 - y1) / img_h
+            else:
+                cx, cy, w, h = 0.5, 0.5, 0.1, 0.1
+        anns.append({
+            "class_id": d.get("class_id", 0),
+            "class_name": d.get("class_name") or "unknown",
+            "x_center": max(0, min(1, cx)),
+            "y_center": max(0, min(1, cy)),
+            "bbox_width": max(0.01, min(1, w)),
+            "bbox_height": max(0.01, min(1, h)),
+            "confidence": d.get("confidence"),
+        })
+    return anns
+
+
 @router.post("/{deployment_id}/predict", response_model=InferenceResponse, summary="Run inference")
 async def predict(
     deployment_id: str,
@@ -183,7 +216,7 @@ async def predict(
     iou: Optional[float] = Query(None, ge=0.0, le=1.0),
     db: AsyncSession = Depends(get_db),
 ):
-    """使用部署的模型进行推理"""
+    """使用部署的模型进行推理。推理图片与结果会自动保存到项目的「API推理数据」数据集中。"""
     try:
         # Read image data
         image_data = await file.read()
@@ -196,6 +229,43 @@ async def predict(
             confidence=confidence,
             iou=iou,
         )
+
+        # 自动保存推理图片和结果到数据集（不阻塞响应，失败仅记录日志）
+        try:
+            deployment = await DeploymentService.get_deployment(db, deployment_id)
+            if deployment:
+                model_res = await db.execute(select(Model).where(Model.id == deployment.model_id))
+                model = model_res.scalar_one_or_none()
+                if model and model.project_id:
+                    dataset = await DatasetService.get_or_create_api_inference_dataset(db, model.project_id)
+                    if dataset:
+                        allowed_ext = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif"}
+                        original_filename = file.filename or "inference.jpg"
+                        if "." not in original_filename or original_filename[original_filename.rfind("."):].lower() not in allowed_ext:
+                            original_filename = "inference.jpg"
+                        anns = _detections_to_annotations(result.get("detections", []))
+                        saved = await DatasetService.save_uploaded_image(
+                            db=db,
+                            dataset_id=dataset.id,
+                            file_data=image_data,
+                            original_filename=original_filename,
+                            source=ImageSource.API,
+                            source_url=None,
+                            annotations=anns,
+                        )
+                        if saved:
+                            # 合并新类别到数据集
+                            existing = set(dataset.classes or [])
+                            for a in anns:
+                                if a.get("class_name") and a["class_name"] not in existing:
+                                    existing.add(a["class_name"])
+                            if existing != set(dataset.classes or []):
+                                dataset.classes = list(existing)
+                            await db.commit()
+                            logger.info(f"Saved inference image to dataset {dataset.id} ({dataset.name})")
+        except Exception as save_err:
+            logger.warning(f"Failed to save inference to dataset: {save_err}")
+
         return result
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
