@@ -174,7 +174,7 @@
                 </el-button>
               </div>
 
-              <el-collapse v-model="activeImageIndex">
+              <el-collapse v-model="activeImageIndex" @change="onResultsCollapseChange">
                 <el-collapse-item
                   v-for="(imgResult, imgIdx) in (validationResults.images || [])"
                   :key="imgIdx"
@@ -314,12 +314,12 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, watch, nextTick } from 'vue'
-import { ElMessage } from 'element-plus'
-import { UploadFilled, View, FolderOpened } from '@element-plus/icons-vue'
+import {nextTick, onMounted, ref, watch} from 'vue'
+import {ElMessage} from 'element-plus'
+import {FolderOpened, UploadFilled, View} from '@element-plus/icons-vue'
 import axios from 'axios'
-import { useProjectStore } from '@/stores/project'
-import { storeToRefs } from 'pinia'
+import {useProjectStore} from '@/stores/project'
+import {storeToRefs} from 'pinia'
 
 const COLORS = [
   '#FF6B6B', '#4ECDC4', '#45B7D1', '#96E6A1', '#DDA0DD',
@@ -336,8 +336,11 @@ function drawDetections(canvas, imageSrc, detections) {
   const ctx = canvas.getContext('2d')
   const img = new Image()
   img.onload = () => {
-    const maxW = canvas.parentElement.clientWidth - 16
-    const scale = Math.min(maxW / img.width, 1)
+    const parentW = canvas.parentElement?.clientWidth ?? 0
+    // 未展开的面板或尚未布局时 parent 宽度为 0，避免 scale=0 导致画布为 0、检测框不显示
+    const availW =
+        parentW > 32 ? parentW - 16 : Math.min(1200, Math.max(320, img.width))
+    const scale = Math.min(availW / img.width, 1)
     canvas.width = img.width * scale
     canvas.height = img.height * scale
     ctx.drawImage(img, 0, 0, canvas.width, canvas.height)
@@ -520,10 +523,31 @@ async function runValidation() {
 }
 
 function setCanvasRef(imgIdx, modelId, el) {
+  if (!canvasRefs.value[imgIdx]) canvasRefs.value[imgIdx] = {}
   if (el) {
-    if (!canvasRefs.value[imgIdx]) canvasRefs.value[imgIdx] = {}
     canvasRefs.value[imgIdx][modelId] = el
+  } else {
+    delete canvasRefs.value[imgIdx][modelId]
   }
+}
+
+/** 展开某张结果图后父容器才有宽度，需按实际宽度重绘检测框 */
+function onResultsCollapseChange(activeNames) {
+  const names = Array.isArray(activeNames)
+      ? activeNames
+      : activeNames != null
+          ? [activeNames]
+          : []
+  nextTick(() => {
+    for (const name of names) {
+      const imgIdx = Number(name)
+      if (Number.isNaN(imgIdx) || !validationResults.value?.images?.[imgIdx]) continue
+      const modelId = activeTabByImage.value[imgIdx]
+      if (modelId && !String(modelId).startsWith('comparison_')) {
+        drawResultForModel(imgIdx, modelId)
+      }
+    }
+  })
 }
 
 function drawResultForModel(imgIdx, modelId) {

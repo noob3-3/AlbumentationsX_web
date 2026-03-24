@@ -278,6 +278,7 @@
                 <el-radio value="auto">自动</el-radio>
                 <el-radio value="cpu">CPU</el-radio>
                 <el-radio value="0">GPU 0</el-radio>
+                <el-radio value="1">GPU 1</el-radio>
                 <el-radio value="0,1">GPU 0+1 (双卡)</el-radio>
               </el-radio-group>
               <div v-if="form.device === '0,1'" style="color: #909399; font-size: 12px; margin-top: 4px">
@@ -493,15 +494,15 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
-import { Refresh } from '@element-plus/icons-vue'
-import { ElMessage } from 'element-plus'
-import { trainingApi } from '@/api'
-import { useTrainingStore } from '@/stores/training'
-import { useDatasetStore } from '@/stores/dataset'
-import { useProjectStore } from '@/stores/project'
-import { storeToRefs } from 'pinia'
-import { useRouter } from 'vue-router'
+import {computed, onMounted, onUnmounted, ref, watch} from 'vue'
+import {Refresh} from '@element-plus/icons-vue'
+import {ElMessage} from 'element-plus'
+import {trainingApi} from '@/api'
+import {useTrainingStore} from '@/stores/training'
+import {useDatasetStore} from '@/stores/dataset'
+import {useProjectStore} from '@/stores/project'
+import {storeToRefs} from 'pinia'
+import {useRouter} from 'vue-router'
 
 const router = useRouter()
 const trainingStore = useTrainingStore()
