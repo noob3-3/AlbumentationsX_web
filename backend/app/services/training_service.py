@@ -1,25 +1,24 @@
 """
 Training service using Ultralytics YOLO
 """
+import asyncio
 import os
 import shutil
-import asyncio
-from datetime import datetime, timedelta
-from pathlib import Path
-from typing import Optional, Dict, Any
-from loguru import logger
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
-from sqlalchemy.orm.attributes import flag_modified
-
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal, create_background_session_maker
 from app.core.websocket import ws_manager
 from app.models import Dataset, Image, Annotation, TrainingJob, Model, JobStatus, Project
 from app.schemas.schemas import TrainingJobCreate
-from app.utils import build_yolo_dataset_yaml, write_yolo_annotation
-from app.services.webhook_service import webhook_service
 from app.services.pretrained_model_service import PretrainedModelService
+from app.services.webhook_service import webhook_service
+from app.utils import build_yolo_dataset_yaml, write_yolo_annotation
+from datetime import datetime, timedelta
+from loguru import logger
+from pathlib import Path
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
+from typing import Optional, Dict, Any
 
 AVAILABLE_MODELS = [
     "yolo11n.pt", "yolo11s.pt", "yolo11m.pt", "yolo11l.pt", "yolo11x.pt",
@@ -75,6 +74,14 @@ async def _cleanup_gpu_memory(gpu_id: Optional[int] = None):
         logger.debug("PyTorch not available, skipping GPU cleanup")
     except Exception as e:
         logger.warning(f"Failed to cleanup GPU memory: {e}")
+
+
+async def _gc_and_empty_cuda() -> None:
+    """强制 GC 并清空 CUDA 缓存（须在调用方已 del model 之后调用）。"""
+    import gc
+
+    gc.collect()
+    await _cleanup_gpu_memory()
 
 
 class TrainingService:
@@ -646,13 +653,6 @@ async def _execute_training(db: AsyncSession, job_id: str, main_loop):
         except Exception as e:
             logger.warning(f"Failed to send training started webhook: {e}")
 
-    await ws_manager.send_message(job_id, {
-        "type": "training_started",
-        "job_id": job_id,
-        "message": "Training started",
-        "data_info": data_stats
-    })
-
     # Resolve device
     device = job.device
     if device == "auto":
@@ -668,6 +668,7 @@ async def _execute_training(db: AsyncSession, job_id: str, main_loop):
 
     # 确定初始模型
     initial_model = job.model_name
+    resume_from_artifact_name: Optional[str] = None
 
     # 如果是继续训练，使用基础模型
     if job.extra_params.get('resume_training') and job.extra_params.get('base_model_id'):
@@ -678,6 +679,7 @@ async def _execute_training(db: AsyncSession, job_id: str, main_loop):
         base_model = base_model_result.scalar_one_or_none()
         if base_model and Path(base_model.model_path).exists():
             initial_model = base_model.model_path
+            resume_from_artifact_name = base_model.name
             logger.info(f"Resume training from model: {base_model.name} ({initial_model})")
         else:
             logger.warning(f"Base model not found, using default: {job.model_name}")
@@ -696,6 +698,31 @@ async def _execute_training(db: AsyncSession, job_id: str, main_loop):
                 logger.warning(f"Failed to locate pretrained model locally, will let Ultralytics download: {e}")
                 # 如果获取失败，仍然使用原始模型名，让Ultralytics自己处理
                 initial_model = job.model_name
+
+    # 供前端展示：任务配置名 vs 实际加载的权重
+    _im_str = str(initial_model)
+    weights_basename = Path(_im_str).name
+    if resume_from_artifact_name:
+        effective_label = f"{resume_from_artifact_name}（{weights_basename}）"
+    else:
+        effective_label = weights_basename
+    ep = dict(job.extra_params or {})
+    ep["effective_model_label"] = effective_label
+    ep["effective_model_path"] = _im_str[:900]
+    ep["configured_model_name"] = job.model_name
+    job.extra_params = ep
+    flag_modified(job, "extra_params")
+    await db.commit()
+
+    await ws_manager.send_message(job_id, {
+        "type": "training_started",
+        "job_id": job_id,
+        "message": "Training started",
+        "data_info": data_stats,
+        "effective_model_label": effective_label,
+        "effective_model_path": _im_str[:900],
+        "configured_model_name": job.model_name,
+    })
 
     # Load model
     model = YOLO(initial_model)
@@ -758,6 +785,8 @@ async def _execute_training(db: AsyncSession, job_id: str, main_loop):
                         j.current_epoch = epoch
                         j.metrics_history = metrics_history.copy()
                         await db2.commit()
+                        if j.status == JobStatus.CANCELLED:
+                            return True
                         return bool(j.extra_params and j.extra_params.get('stop_requested'))
             except Exception as e:
                 logger.warning(f"Failed to update training job progress: {e}")
@@ -767,7 +796,7 @@ async def _execute_training(db: AsyncSession, job_id: str, main_loop):
             future = asyncio.run_coroutine_threadsafe(_update_db_and_check_stop(), main_loop)
             stop_requested = future.result(timeout=10)
             if stop_requested:
-                logger.info(f"Job {job_id}: Stop requested, terminating training after this epoch")
+                logger.info(f"Job {job_id}: Stop or cancel requested, terminating training after this epoch")
                 trainer.stop = True
         except Exception as e:
             logger.debug(f"Failed to schedule progress update: {e}")
@@ -969,6 +998,9 @@ async def _execute_training(db: AsyncSession, job_id: str, main_loop):
         # 已在 train_args 中显式处理的参数，不再从 extra_params 覆盖
         skip_keys = {
             'resume_training', 'base_model_id', 'class_weights', 'focus_classes',
+            'stop_requested',  # 前端停止训练标记，非 YOLO 参数
+            'effective_model_label', 'effective_model_path', 'configured_model_name',  # 仅用于 API/前端展示
+            'use_validation_dataset', 'validation_dataset_id',  # 数据集准备阶段已消费，非 train() 参数
             'resume',  # 始终由我们显式设为 False，避免 extra_params 覆盖
             'amp',    # 继续训练时设为 False 避免 check_amp 下载
             'patience', 'save_period', 'enable_webhook', 'workers',
@@ -1001,10 +1033,18 @@ async def _execute_training(db: AsyncSession, job_id: str, main_loop):
         logger.info("model.train() completed successfully")
     except Exception as train_error:
         logger.error(f"Training failed: {train_error}")
-        await _cleanup_gpu_memory()
-
-        # 重新抛出异常以便外层捕获
+        try:
+            del model
+        except Exception:
+            pass
+        await _gc_and_empty_cuda()
         raise
+
+    try:
+        del model
+    except Exception:
+        pass
+    await _gc_and_empty_cuda()
 
     # Get best model path
     # best.pt: 验证集上表现最好的模型（推荐使用）

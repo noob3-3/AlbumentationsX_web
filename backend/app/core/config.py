@@ -3,8 +3,8 @@ Application configuration settings
 """
 import os
 from pathlib import Path
-from typing import List
 from pydantic_settings import BaseSettings
+from typing import List
 
 
 class Settings(BaseSettings):
@@ -24,7 +24,8 @@ class Settings(BaseSettings):
     BASE_DIR: Path = Path(__file__).parent.parent.parent
     DATA_DIR: Path = BASE_DIR / "data"
     UPLOAD_DIR: Path = DATA_DIR / "uploads"
-    DATASET_DIR: Path = DATA_DIR / "datasets"
+    # 数据集图片/标签/缩略图根目录（Docker 可单独挂载 /app/data/static-file）
+    DATASET_DIR: Path = DATA_DIR / "static-file"
     AUGMENTED_DIR: Path = DATA_DIR / "augmented"
     MODEL_DIR: Path = DATA_DIR / "models"
     EXPORT_DIR: Path = DATA_DIR / "exports"

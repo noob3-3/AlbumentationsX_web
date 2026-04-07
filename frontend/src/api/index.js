@@ -77,6 +77,7 @@ export const trainingApi = {
   getJob: (id) => http.get(`/training/jobs/${id}`),
   cancelJob: (id) => http.post(`/training/jobs/${id}/cancel`),
   stopJob: (id) => http.post(`/training/jobs/${id}/stop`),
+    downloadJobBestUrl: (jobId) => `/api/v1/training/jobs/${jobId}/download-best`,
   availableModels: () => http.get('/training/available-models'),
 
   // Models
@@ -86,6 +87,118 @@ export const trainingApi = {
   deleteModel: (id) => http.delete(`/training/models/${id}`),
   downloadModel: (id) => `/api/v1/training/models/${id}/download`,
   downloadModelPackage: (id) => `/api/v1/training/models/${id}/download-package`,
+}
+
+/**
+ * 下载训练 run 目录下当前的 best.pt（训练中即可拉取快照）。失败抛出 Error(message 为服务端 detail)。
+ */
+export async function downloadTrainingJobBestFile(jobId, nameHint = 'training') {
+    const res = await fetch(`${window.location.origin}/api/v1/training/jobs/${jobId}/download-best`, {
+        credentials: 'include',
+    })
+    if (!res.ok) {
+        let detail = '下载失败'
+        try {
+            const j = await res.json()
+            if (typeof j.detail === 'string') detail = j.detail
+            else if (Array.isArray(j.detail) && j.detail[0]?.msg) detail = j.detail[0].msg
+        } catch {
+            /* ignore */
+        }
+        throw new Error(detail)
+    }
+    const blob = await res.blob()
+    const cd = res.headers.get('content-disposition')
+    let filename = `${nameHint}_training_best.pt`
+    if (cd) {
+        const utf8 = /filename\*=UTF-8''([^;\s]+)/i.exec(cd)
+        if (utf8) {
+            try {
+                filename = decodeURIComponent(utf8[1])
+            } catch {
+                filename = utf8[1]
+            }
+        } else {
+            const m = /filename="([^"]+)"/i.exec(cd) || /filename=([^;\s]+)/i.exec(cd)
+            if (m) filename = m[1].replace(/["']/g, '')
+        }
+    }
+    const url = URL.createObjectURL(blob)
+    try {
+        const a = document.createElement('a')
+        a.href = url
+        a.download = filename
+        a.click()
+    } finally {
+        URL.revokeObjectURL(url)
+    }
+}
+
+/** @param {Record<string, unknown>} [opts] */
+function appendOnnxQuery(q, opts = {}) {
+    q.set('opset', String(opts.opset ?? 18))
+    q.set('dynamic', String(!!opts.dynamic))
+    q.set('batch', String(opts.batch ?? 1))
+    q.set('simplify', String(!!opts.simplify))
+    q.set('half', String(!!opts.half))
+    if (opts.imgsz != null && opts.imgsz !== '') {
+        q.set('imgsz', String(opts.imgsz))
+    }
+}
+
+export function buildTrainingModelOnnxUrl(modelId, opts = {}) {
+    const q = new URLSearchParams()
+    appendOnnxQuery(q, opts)
+    return `/api/v1/training/models/${modelId}/export-onnx?${q.toString()}`
+}
+
+export function buildTrainingJobOnnxUrl(jobId, opts = {}) {
+    const q = new URLSearchParams()
+    appendOnnxQuery(q, opts)
+    return `/api/v1/training/jobs/${jobId}/export-onnx?${q.toString()}`
+}
+
+/** @param {string} pathWithQuery 以 /api/v1 开头的路径（含 query） */
+export async function downloadOnnxExport(pathWithQuery) {
+    const res = await fetch(`${window.location.origin}${pathWithQuery}`, {
+        credentials: 'include',
+    })
+    if (!res.ok) {
+        let detail = 'ONNX 导出失败'
+        try {
+            const j = await res.json()
+            if (typeof j.detail === 'string') detail = j.detail
+            else if (Array.isArray(j.detail) && j.detail[0]?.msg) detail = j.detail[0].msg
+        } catch {
+            /* ignore */
+        }
+        throw new Error(detail)
+    }
+    const blob = await res.blob()
+    const cd = res.headers.get('content-disposition')
+    let filename = 'model.onnx'
+    if (cd) {
+        const utf8 = /filename\*=UTF-8''([^;\s]+)/i.exec(cd)
+        if (utf8) {
+            try {
+                filename = decodeURIComponent(utf8[1])
+            } catch {
+                filename = utf8[1]
+            }
+        } else {
+            const m = /filename="([^"]+)"/i.exec(cd) || /filename=([^;\s]+)/i.exec(cd)
+            if (m) filename = m[1].replace(/["']/g, '')
+        }
+    }
+    const url = URL.createObjectURL(blob)
+    try {
+        const a = document.createElement('a')
+        a.href = url
+        a.download = filename
+        a.click()
+    } finally {
+        URL.revokeObjectURL(url)
+    }
 }
 
 // Annotation APIs

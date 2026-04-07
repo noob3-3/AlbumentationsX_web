@@ -123,7 +123,7 @@ services:
 
       # Paths
       - UPLOAD_DIR=/app/data/uploads
-      - DATASET_DIR=/app/data/datasets
+      - DATASET_DIR=/app/data/static-file
       - AUGMENTED_DIR=/app/data/augmented
       - MODEL_DIR=/app/data/models
       - EXPORT_DIR=/app/data/exports

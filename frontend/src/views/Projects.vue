@@ -18,14 +18,15 @@
             placeholder="搜索项目名称或描述"
             :prefix-icon="Search"
             clearable
-            @input="loadProjects"
+            @input="onSearchInput"
           />
         </el-col>
         <el-col :span="12">
-          <el-radio-group v-model="statusFilter" @change="loadProjects">
-            <el-radio-button value="">全部</el-radio-button>
-            <el-radio-button value="active">活跃</el-radio-button>
-            <el-radio-button value="archived">已归档</el-radio-button>
+          <el-radio-group v-model="statusFilter" @change="onStatusFilterChange" class="status-filter-group">
+            <el-radio-button label="all">全部</el-radio-button>
+            <el-radio-button label="active">活跃</el-radio-button>
+            <!-- 与后端 status=deleted 对应，界面统称「已归档」 -->
+            <el-radio-button label="deleted">已归档</el-radio-button>
           </el-radio-group>
         </el-col>
       </el-row>
@@ -43,8 +44,11 @@
                     <el-dropdown-item command="view">查看详情</el-dropdown-item>
                     <el-dropdown-item command="edit">编辑</el-dropdown-item>
                     <el-dropdown-item command="archive" v-if="project.status === 'active'">归档</el-dropdown-item>
-                    <el-dropdown-item command="activate" v-if="project.status === 'archived'">激活</el-dropdown-item>
-                    <el-dropdown-item command="delete" divided>删除</el-dropdown-item>
+                    <el-dropdown-item command="activate" v-if="isInactiveProject(project)">取消归档</el-dropdown-item>
+                    <el-dropdown-item command="delete"
+                                      v-if="project.status === 'active' || project.status === 'archived'" divided>
+                      删除
+                    </el-dropdown-item>
                   </el-dropdown-menu>
                 </template>
               </el-dropdown>
@@ -72,8 +76,8 @@
             <el-divider style="margin: 16px 0" />
 
             <div class="project-footer">
-              <el-tag :type="project.status === 'active' ? 'success' : 'info'" size="small">
-                {{ project.status === 'active' ? '活跃' : '已归档' }}
+              <el-tag :type="projectStatusTagType(project.status)" size="small">
+                {{ projectStatusLabel(project.status) }}
               </el-tag>
               <span class="project-date">{{ formatDate(project.created_at) }}</span>
             </div>
@@ -194,8 +198,8 @@
         <el-descriptions :column="2" border>
           <el-descriptions-item label="项目名称">{{ selectedProject.name }}</el-descriptions-item>
           <el-descriptions-item label="状态">
-            <el-tag :type="selectedProject.status === 'active' ? 'success' : 'info'">
-              {{ selectedProject.status === 'active' ? '活跃' : '已归档' }}
+            <el-tag :type="projectStatusTagType(selectedProject.status)">
+              {{ projectStatusLabel(selectedProject.status) }}
             </el-tag>
           </el-descriptions-item>
           <el-descriptions-item label="数据集数量">{{ selectedProject.dataset_count }}</el-descriptions-item>
@@ -216,18 +220,21 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
-import { Plus, Search, MoreFilled, FolderOpened, Box, Connection } from '@element-plus/icons-vue'
-import { useRouter } from 'vue-router'
-import axios from 'axios'
+import {onMounted, ref} from 'vue'
+import {ElMessage, ElMessageBox} from 'element-plus'
+import {Box, Connection, FolderOpened, MoreFilled, Plus, Search} from '@element-plus/icons-vue'
+import {useRouter} from 'vue-router'
+import {useProjectStore} from '@/stores/project'
+import {projectApi} from '@/api'
 
 const router = useRouter()
+const projectStore = useProjectStore()
 
 const projects = ref([])
 const loading = ref(false)
 const searchText = ref('')
-const statusFilter = ref('')
+/** all=不传 status；勿用空字符串，易与 el-radio 的 value 解析不一致 */
+const statusFilter = ref('all')
 const currentPage = ref(1)
 const pageSize = ref(12)
 const total = ref(0)
@@ -256,9 +263,40 @@ const formRules = {
   ],
 }
 
-onMounted(() => {
-  loadProjects()
+/** 后端 archived=归档；deleted=软删，标签统一用「归档」系文案，不用「删除」 */
+function projectStatusLabel(status) {
+  if (status === 'active') return '活跃'
+  if (status === 'archived') return '已归档'
+  if (status === 'deleted') return '归档'
+  return status || '未知'
+}
+
+function projectStatusTagType(status) {
+  if (status === 'active') return 'success'
+  if (status === 'archived' || status === 'deleted') return 'info'
+  return 'info'
+}
+
+function isInactiveProject(project) {
+  return project.status === 'archived' || project.status === 'deleted'
+}
+
+onMounted(async () => {
+  await loadProjects()
+  await projectStore.syncHeaderProjects()
 })
+
+/** 切换状态筛选时回到第 1 页，并清空搜索（否则 search 与 status 叠加会经常筛出 0 条） */
+function onStatusFilterChange() {
+  currentPage.value = 1
+  searchText.value = ''
+  loadProjects()
+}
+
+function onSearchInput() {
+  currentPage.value = 1
+  loadProjects()
+}
 
 async function loadProjects() {
   loading.value = true
@@ -267,16 +305,16 @@ async function loadProjects() {
       page: currentPage.value,
       page_size: pageSize.value,
     }
-    if (statusFilter.value) {
+    if (statusFilter.value !== 'all') {
       params.status = statusFilter.value
     }
     if (searchText.value) {
       params.search = searchText.value
     }
 
-    const response = await axios.get('/api/v1/projects', { params })
-    projects.value = response.data.items
-    total.value = response.data.total
+    const res = await projectApi.list(params)
+    projects.value = res.items
+    total.value = res.total
   } catch (error) {
     ElMessage.error('加载项目列表失败')
   } finally {
@@ -299,15 +337,16 @@ async function submitProject() {
     submitting.value = true
     try {
       if (editingProject.value) {
-        await axios.put(`/api/v1/projects/${editingProject.value.id}`, projectForm.value)
+        await projectApi.update(editingProject.value.id, projectForm.value)
         ElMessage.success('项目已更新')
       } else {
-        await axios.post('/api/v1/projects', projectForm.value)
+        await projectApi.create(projectForm.value)
         ElMessage.success('项目已创建')
       }
 
       showCreateDialog.value = false
-      loadProjects()
+      await loadProjects()
+      await projectStore.syncHeaderProjects()
     } catch (error) {
       ElMessage.error(error.response?.data?.detail || '操作失败')
     } finally {
@@ -348,9 +387,10 @@ function handleCommand(command, project) {
 
 async function archiveProject(project) {
   try {
-    await axios.put(`/api/v1/projects/${project.id}`, { status: 'archived' })
+    await projectApi.update(project.id, {status: 'archived'})
     ElMessage.success('项目已归档')
-    loadProjects()
+    await loadProjects()
+    await projectStore.syncHeaderProjects()
   } catch (error) {
     ElMessage.error('归档失败')
   }
@@ -358,11 +398,16 @@ async function archiveProject(project) {
 
 async function activateProject(project) {
   try {
-    await axios.put(`/api/v1/projects/${project.id}`, { status: 'active' })
-    ElMessage.success('项目已激活')
-    loadProjects()
+    await projectApi.update(project.id, {status: 'active'})
+    ElMessage.success('已恢复为活跃项目')
+    await loadProjects()
+    await projectStore.fetchProjects()
+    const p = projectStore.projects.find((x) => x.id === project.id)
+    if (p) {
+      projectStore.setCurrentProject(p)
+    }
   } catch (error) {
-    ElMessage.error('激活失败')
+    ElMessage.error('恢复失败')
   }
 }
 
@@ -374,9 +419,14 @@ async function deleteProject(project) {
       type: 'warning',
     })
 
-    await axios.delete(`/api/v1/projects/${project.id}`)
+    const wasCurrent = projectStore.currentProject?.id === project.id
+    await projectApi.delete(project.id)
     ElMessage.success('项目已删除')
-    loadProjects()
+    await loadProjects()
+    if (wasCurrent) {
+      projectStore.clearCurrentProject()
+    }
+    await projectStore.fetchProjects()
   } catch (error) {
     if (error !== 'cancel') {
       ElMessage.error('删除失败')
@@ -410,7 +460,7 @@ async function testWebhookInDialog() {
 
   testingWebhook.value = true
   try {
-    await axios.post(`/api/v1/projects/${editingProject.value.id}/test-webhook`)
+    await projectApi.testWebhook(editingProject.value.id)
     ElMessage.success('Webhook 测试成功！请检查您的接收端')
   } catch (error) {
     ElMessage.error(error.response?.data?.detail || 'Webhook 测试失败')
@@ -446,6 +496,12 @@ function resetForm() {
 .title {
   font-size: 18px;
   font-weight: 600;
+}
+
+.status-filter-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
 }
 
 .projects-grid {

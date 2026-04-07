@@ -145,6 +145,12 @@
                     <el-icon><FolderOpened /></el-icon>
                     完整包 (权重+标签+说明)
                   </el-dropdown-item>
+                  <el-dropdown-item command="onnx">
+                    <el-icon>
+                      <Download/>
+                    </el-icon>
+                    导出 ONNX（可配置）…
+                  </el-dropdown-item>
                 </el-dropdown-menu>
               </template>
             </el-dropdown>
@@ -163,16 +169,24 @@
         </el-table-column>
       </el-table>
     </el-card>
+
+    <OnnxExportDialog
+        v-model="onnxDialogVisible"
+        kind="model"
+        :model-id="onnxTargetModelId"
+        title="导出 ONNX"
+    />
   </div>
 </template>
 
 <script setup>
-import { ref, onMounted, watch } from 'vue'
-import { Refresh, Download, FolderOpened, ArrowDown, Delete, Upload } from '@element-plus/icons-vue'
-import { ElMessage } from 'element-plus'
-import { trainingApi } from '@/api'
-import { useProjectStore } from '@/stores/project'
-import { storeToRefs } from 'pinia'
+import {onMounted, ref, watch} from 'vue'
+import {ArrowDown, Delete, Download, FolderOpened, Refresh, Upload} from '@element-plus/icons-vue'
+import {ElMessage} from 'element-plus'
+import {trainingApi} from '@/api'
+import OnnxExportDialog from '@/components/model/OnnxExportDialog.vue'
+import {useProjectStore} from '@/stores/project'
+import {storeToRefs} from 'pinia'
 
 const projectStore = useProjectStore()
 const { hasProject, projectId } = storeToRefs(projectStore)
@@ -191,6 +205,9 @@ const importForm = ref({
 const importRules = {
   name: [{ required: true, message: '请输入模型名称', trigger: 'blur' }],
 }
+
+const onnxDialogVisible = ref(false)
+const onnxTargetModelId = ref('')
 
 function showImportDialog() {
   importDialogVisible.value = true
@@ -292,6 +309,9 @@ function handleDownload(command, model) {
     // 下载完整包 (权重 + 标签 + 说明)
     ElMessage.success('正在下载完整模型包 (包含权重、标签文件和使用说明)...')
     window.open(trainingApi.downloadModelPackage(model.id), '_blank')
+  } else if (command === 'onnx') {
+    onnxTargetModelId.value = model.id
+    onnxDialogVisible.value = true
   }
 }
 

@@ -452,7 +452,13 @@
                   <el-tag :type="statusType(job.status)" size="small">{{ statusText(job.status) }}</el-tag>
                   <span class="job-name">{{ job.name }}</span>
                 </div>
-                <span class="job-model">{{ job.model_name }}</span>
+                <el-tooltip
+                    :content="jobTrainingWeightsTooltip(job)"
+                    placement="top"
+                    :disabled="!jobTrainingWeightsTooltip(job)"
+                >
+                  <span class="job-model">{{ jobTrainingWeightsLabel(job) }}</span>
+                </el-tooltip>
               </div>
 
               <el-progress
@@ -473,6 +479,15 @@
               <div class="job-footer">
                 <span class="job-time">{{ formatDate(job.created_at) }}</span>
                 <div v-if="job.status === 'running' || job.status === 'pending'" class="job-actions">
+                  <el-button
+                      v-if="job.status === 'running'"
+                      link
+                      type="primary"
+                      size="small"
+                      @click.stop="downloadJobBestSnapshot(job.id, job.name)"
+                      title="下载当前验证集最佳权重快照（best.pt）"
+                  >下载最佳
+                  </el-button>
                   <el-button
                     link type="warning" size="small"
                     @click.stop="stopJob(job.id)"
@@ -497,7 +512,7 @@
 import {computed, onMounted, onUnmounted, ref, watch} from 'vue'
 import {Refresh} from '@element-plus/icons-vue'
 import {ElMessage} from 'element-plus'
-import {trainingApi} from '@/api'
+import {downloadTrainingJobBestFile, trainingApi} from '@/api'
 import {useTrainingStore} from '@/stores/training'
 import {useDatasetStore} from '@/stores/dataset'
 import {useProjectStore} from '@/stores/project'
@@ -505,6 +520,27 @@ import {storeToRefs} from 'pinia'
 import {useRouter} from 'vue-router'
 
 const router = useRouter()
+
+function jobTrainingWeightsLabel(job) {
+  return job?.extra_params?.effective_model_label || job?.model_name || '—'
+}
+
+function jobTrainingWeightsTooltip(job) {
+  const p = job?.extra_params?.effective_model_path
+  if (!p || String(p).trim() === '') return ''
+  const label = jobTrainingWeightsLabel(job)
+  return String(p).trim() === label ? '' : String(p).trim()
+}
+
+async function downloadJobBestSnapshot(jobId, jobName) {
+  try {
+    await downloadTrainingJobBestFile(jobId, jobName || 'training')
+    ElMessage.success('已开始下载')
+  } catch (e) {
+    ElMessage.error(e?.message || '下载失败')
+  }
+}
+
 const trainingStore = useTrainingStore()
 const datasetStore = useDatasetStore()
 const projectStore = useProjectStore()

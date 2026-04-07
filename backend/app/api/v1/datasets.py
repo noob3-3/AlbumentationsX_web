@@ -1,21 +1,13 @@
 """
 Dataset API endpoints
 """
+import json
+import re
 import shutil
 import tempfile
 import zipfile
-import re
-from typing import Optional
-from pathlib import Path
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query, BackgroundTasks, Request
-from fastapi.responses import FileResponse, Response
-from sqlalchemy.ext.asyncio import AsyncSession
-from loguru import logger
-
-from sqlalchemy import select, func, and_, exists
-
-from app.core.database import get_db
 from app.core.config import settings
+from app.core.database import get_db
 from app.models import ImageSource, Image, Annotation
 from app.schemas.schemas import (
     DatasetCreate, DatasetUpdate, DatasetResponse,
@@ -24,7 +16,13 @@ from app.schemas.schemas import (
 )
 from app.services import DatasetService, collect_from_urls
 from app.utils import allowed_image, write_yolo_annotation, build_yolo_dataset_yaml
-import json
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query, BackgroundTasks, Request
+from fastapi.responses import FileResponse, Response
+from loguru import logger
+from pathlib import Path
+from sqlalchemy import select, func, and_, exists
+from sqlalchemy.ext.asyncio import AsyncSession
+from typing import Optional
 
 router = APIRouter(prefix="/datasets", tags=["datasets"])
 
@@ -146,6 +144,9 @@ async def delete_dataset(dataset_id: str, db: AsyncSession = Depends(get_db)):
 async def export_dataset(
     dataset_id: str,
     annotated_only: bool = Query(False, description="仅导出已标注的图片"),
+        include_augmented: bool = Query(True, description="是否包含增强生成的图片；为 False 时仅导出原始图"),
+        augmented_only: bool = Query(False,
+                                     description="为 True 时仅导出增强图片（与 include_augmented 同时传时以此为准）"),
     db: AsyncSession = Depends(get_db),
 ):
     """导出数据集为 YOLO 格式 ZIP 包（含 images/、labels/、dataset.yaml、classes.txt）"""
@@ -173,6 +174,16 @@ async def export_dataset(
         images = images_with_anns
         if not images:
             raise HTTPException(status_code=400, detail="Dataset has no images with annotations")
+
+    # 按原始/增强筛选
+    if augmented_only:
+        images = [img for img in images if getattr(img, "is_augmented", False)]
+        if not images:
+            raise HTTPException(status_code=400, detail="没有可导出的增强图片")
+    elif not include_augmented:
+        images = [img for img in images if not getattr(img, "is_augmented", False)]
+        if not images:
+            raise HTTPException(status_code=400, detail="没有可导出的原始图片")
 
     classes = dataset.classes or []
     if not classes:

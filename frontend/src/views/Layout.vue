@@ -48,6 +48,7 @@
               v-model="currentProjectId"
               placeholder="请选择项目"
               style="width: 240px"
+              popper-class="layout-project-select-dropdown"
               @change="handleProjectChange"
               clearable
               filterable
@@ -85,11 +86,11 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
-import { useProjectStore } from '@/stores/project'
-import { storeToRefs } from 'pinia'
-import { ElMessage } from 'element-plus'
+import {computed, onMounted, ref} from 'vue'
+import {useRoute, useRouter} from 'vue-router'
+import {useProjectStore} from '@/stores/project'
+import {storeToRefs} from 'pinia'
+import {ElMessage} from 'element-plus'
 
 const route = useRoute()
 const router = useRouter()
@@ -253,5 +254,22 @@ const currentTitle = computed(
 }
 .fade-enter-from, .fade-leave-to {
   opacity: 0;
+}
+</style>
+
+<!--
+  下拉挂载到 body，需非 scoped。
+  主题默认 .el-select-dropdown__wrap { max-height: 274px }，选项内自定义行（名称+标签）行高较大时约只能露出 6 条。
+  需提高 max-height，并同时命中 .el-select-dropdown__wrap（与 .el-scrollbar__wrap 常为同一元素）。
+-->
+<style>
+.layout-project-select-dropdown.el-select-dropdown > .el-scrollbar {
+  height: auto !important;
+  max-height: min(85vh, 720px) !important;
+}
+
+.layout-project-select-dropdown .el-select-dropdown__wrap,
+.layout-project-select-dropdown .el-scrollbar__wrap {
+  max-height: min(85vh, 720px) !important;
 }
 </style>

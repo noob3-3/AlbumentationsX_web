@@ -3,20 +3,20 @@ Training API endpoints
 """
 import asyncio
 import shutil
-from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query, File, Form, UploadFile
-from fastapi.responses import FileResponse
-from pathlib import Path
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, delete
-
-from app.core.database import get_db
 from app.core.config import settings
-from app.schemas.schemas import TrainingJobCreate, TrainingJobResponse, SuccessResponse, ModelResponse
-from app.services import TrainingService, AVAILABLE_MODELS
+from app.core.database import get_db
 from app.models import JobStatus, Model, ModelValidation, Dataset, Image, Annotation, TrainingJob
 from app.models.models import gen_uuid
+from app.schemas.schemas import TrainingJobCreate, TrainingJobResponse, SuccessResponse, ModelResponse
+from app.services import TrainingService, AVAILABLE_MODELS
+from app.services.model_export_service import export_pt_to_onnx
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query, File, Form, UploadFile
+from fastapi.responses import FileResponse
 from loguru import logger
+from pathlib import Path
+from sqlalchemy import select, delete
+from sqlalchemy.ext.asyncio import AsyncSession
+from typing import Optional
 
 router = APIRouter(prefix="/training", tags=["training"])
 
@@ -155,6 +155,80 @@ async def stop_training_job(job_id: str, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=400, detail="Cannot stop this job")
     await db.commit()
     return {"success": True, "message": "Training will stop after current epoch"}
+
+
+@router.get("/jobs/{job_id}/download-best", summary="Download best.pt during or after training")
+async def download_job_training_best(job_id: str, db: AsyncSession = Depends(get_db)):
+    """下载当前训练 run 目录下的 best.pt（训练中即可下载，为截至当前的验证最佳快照）"""
+    import re
+
+    job = await TrainingService.get_job(db, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Training job not found")
+
+    best_path = settings.MODEL_DIR / job_id / "train" / "weights" / "best.pt"
+    if not best_path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail="尚未生成 best.pt。请等待至少完成一轮带验证的训练后再试。",
+        )
+
+    safe_name = re.sub(r'[<>:"/\\|?*]', "_", job.name)
+    return FileResponse(
+        str(best_path),
+        filename=f"{safe_name}_training_best.pt",
+        media_type="application/octet-stream",
+    )
+
+
+@router.get("/jobs/{job_id}/export-onnx", summary="Export training best.pt to ONNX (download)")
+async def export_job_weights_onnx(
+        job_id: str,
+        opset: int = Query(18, ge=9, le=23, description="ONNX opset"),
+        dynamic: bool = Query(False, description="动态输入尺寸；False 为固定尺寸，利于部分部署端"),
+        batch: int = Query(1, ge=1, le=64, description="导出 batch 维度"),
+        simplify: bool = Query(False, description="是否 onnxsim 简化图（需安装 onnxsim）"),
+        half: bool = Query(False, description="FP16 导出"),
+        imgsz: Optional[int] = Query(None, ge=32, le=8192, description="导出输入边长；不传则沿用模型默认"),
+        db: AsyncSession = Depends(get_db),
+):
+    """将当前训练任务 run 目录下的 best.pt 在 CPU 上转为 ONNX 并下载。"""
+    import re
+
+    job = await TrainingService.get_job(db, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Training job not found")
+
+    best_path = settings.MODEL_DIR / job_id / "train" / "weights" / "best.pt"
+    if not best_path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail="尚未生成 best.pt，无法导出 ONNX。请等待至少完成一轮带验证的训练。",
+        )
+
+    try:
+        onnx_path = await asyncio.to_thread(
+            export_pt_to_onnx,
+            str(best_path),
+            opset=opset,
+            dynamic=dynamic,
+            batch=batch,
+            simplify=simplify,
+            half=half,
+            imgsz=imgsz,
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.exception("ONNX export failed for job {}", job_id)
+        raise HTTPException(status_code=500, detail=f"ONNX 导出失败: {e}")
+
+    safe_name = re.sub(r'[<>:"/\\|?*]', "_", job.name)
+    return FileResponse(
+        str(onnx_path),
+        filename=f"{safe_name}_training_best.onnx",
+        media_type="application/octet-stream",
+    )
 
 
 @router.get("/available-models", summary="List available base YOLO models")
@@ -341,6 +415,52 @@ async def download_model(model_id: str, db: AsyncSession = Depends(get_db)):
     return FileResponse(
         model.model_path,
         filename=f"{safe_name}_best.pt",
+        media_type="application/octet-stream",
+    )
+
+
+@router.get("/models/{model_id}/export-onnx", summary="Export model weights to ONNX (download)")
+async def export_registered_model_onnx(
+        model_id: str,
+        opset: int = Query(18, ge=9, le=23, description="ONNX opset"),
+        dynamic: bool = Query(False, description="动态输入尺寸"),
+        batch: int = Query(1, ge=1, le=64, description="导出 batch"),
+        simplify: bool = Query(False, description="onnxsim 简化（需安装 onnxsim）"),
+        half: bool = Query(False, description="FP16 导出"),
+        imgsz: Optional[int] = Query(None, ge=32, le=8192, description="导出输入边长；不传为模型默认"),
+        db: AsyncSession = Depends(get_db),
+):
+    """将已注册模型的 .pt 在 CPU 上导出为 ONNX 并下载。"""
+    import re
+
+    result = await db.execute(select(Model).where(Model.id == model_id))
+    model = result.scalar_one_or_none()
+    if not model:
+        raise HTTPException(status_code=404, detail="Model not found")
+    if not Path(model.model_path).exists():
+        raise HTTPException(status_code=404, detail="Model file not found on disk")
+
+    try:
+        onnx_path = await asyncio.to_thread(
+            export_pt_to_onnx,
+            str(Path(model.model_path).resolve()),
+            opset=opset,
+            dynamic=dynamic,
+            batch=batch,
+            simplify=simplify,
+            half=half,
+            imgsz=imgsz,
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.exception("ONNX export failed for model {}", model_id)
+        raise HTTPException(status_code=500, detail=f"ONNX 导出失败: {e}")
+
+    safe_name = re.sub(r'[<>:"/\\|?*]', "_", model.name)
+    return FileResponse(
+        str(onnx_path),
+        filename=f"{safe_name}.onnx",
         media_type="application/octet-stream",
     )
 

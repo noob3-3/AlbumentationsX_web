@@ -8,14 +8,33 @@
         </el-tag>
       </template>
       <template #extra>
-        <el-button
-          v-if="job?.status === 'running' || job?.status === 'pending'"
-          type="danger"
-          @click="cancelJob"
-        >
-          取消训练
-        </el-button>
-        <el-dropdown v-if="job?.model_path" @command="handleDownload" style="margin-left: 10px">
+        <el-space wrap>
+          <el-button
+              v-if="showDownloadTrainingBest"
+              type="primary"
+              plain
+              :icon="Download"
+              :loading="downloadingTrainingBest"
+              @click="downloadTrainingBest"
+          >
+            下载当前最佳
+          </el-button>
+          <el-button
+              v-if="showDownloadTrainingBest"
+              type="success"
+              plain
+              @click="openOnnxExportJob"
+          >
+            导出 ONNX
+          </el-button>
+          <el-button
+              v-if="job?.status === 'running' || job?.status === 'pending'"
+              type="danger"
+              @click="cancelJob"
+          >
+            取消训练
+          </el-button>
+          <el-dropdown v-if="job?.model_path" @command="handleDownload">
           <el-button type="primary">
             下载模型 <el-icon class="el-icon--right"><arrow-down /></el-icon>
           </el-button>
@@ -29,11 +48,50 @@
                 <el-icon><FolderOpened /></el-icon>
                 完整包 (权重+标签+说明)
               </el-dropdown-item>
+              <el-dropdown-item command="onnx">
+                <el-icon>
+                  <Download/>
+                </el-icon>
+                导出 ONNX（可配置）…
+              </el-dropdown-item>
             </el-dropdown-menu>
           </template>
         </el-dropdown>
+        </el-space>
       </template>
     </el-page-header>
+
+    <OnnxExportDialog
+        v-model="onnxDialogVisible"
+        :kind="onnxDialogKind"
+        :job-id="onnxDialogKind === 'job' ? id : ''"
+        :model-id="onnxDialogKind === 'model' ? onnxDialogModelId : ''"
+        title="导出 ONNX"
+    />
+
+    <el-alert
+        v-if="job && displayTrainingModel"
+        type="info"
+        :closable="false"
+        show-icon
+        class="training-model-alert"
+    >
+      <template #title>
+        <el-tooltip
+            :content="trainingModelTooltip"
+            placement="bottom"
+            :disabled="!trainingModelTooltip || trainingModelTooltip === displayTrainingModel"
+        >
+          <span class="training-model-title">当前训练权重：{{ displayTrainingModel }}</span>
+        </el-tooltip>
+      </template>
+      <div
+          v-if="showConfiguredModelHint"
+          class="training-model-sub"
+      >
+        任务创建时选择：{{ job?.extra_params?.configured_model_name || job?.model_name }}
+      </div>
+    </el-alert>
 
     <el-row :gutter="16" style="margin-top:20px">
       <!-- Job Info -->
@@ -41,13 +99,34 @@
         <el-card shadow="never">
           <template #header><span>训练信息</span></template>
           <el-descriptions :column="1" size="small">
-            <el-descriptions-item label="基础模型">{{ job?.model_name }}</el-descriptions-item>
+            <el-descriptions-item label="训练权重">
+              {{ displayTrainingModel }}
+            </el-descriptions-item>
+            <el-descriptions-item
+                v-if="showConfiguredModelHint"
+                label="配置模型名"
+            >
+              {{ job?.extra_params?.configured_model_name || job?.model_name }}
+            </el-descriptions-item>
             <el-descriptions-item label="数据集">{{ job?.dataset_id?.slice(0,8) }}...</el-descriptions-item>
             <el-descriptions-item label="训练轮数">{{ job?.current_epoch }} / {{ job?.epochs }}</el-descriptions-item>
             <el-descriptions-item label="批大小">{{ job?.batch_size }}</el-descriptions-item>
             <el-descriptions-item label="图片尺寸">{{ job?.img_size }}</el-descriptions-item>
             <el-descriptions-item label="学习率">{{ job?.learning_rate }}</el-descriptions-item>
             <el-descriptions-item label="设备">{{ job?.device }}</el-descriptions-item>
+
+            <el-descriptions-item v-if="showDownloadTrainingBest" label="权重快照">
+              <el-button
+                  type="primary"
+                  link
+                  size="small"
+                  :loading="downloadingTrainingBest"
+                  @click="downloadTrainingBest"
+              >
+                下载当前 best.pt
+              </el-button>
+              <span style="font-size: 12px; color: #909399; margin-left: 8px">训练中随时可拉取验证集上当前最佳</span>
+            </el-descriptions-item>
 
             <!-- 数据使用情况 -->
             <el-descriptions-item v-if="dataInfo" label="训练数据">
@@ -143,17 +222,18 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
-import { Download, FolderOpened, ArrowDown } from '@element-plus/icons-vue'
-import { ElMessage } from 'element-plus'
+import {computed, onMounted, onUnmounted, ref} from 'vue'
+import {useRoute, useRouter} from 'vue-router'
+import {ArrowDown, Download, FolderOpened} from '@element-plus/icons-vue'
+import {ElMessage} from 'element-plus'
 import VChart from 'vue-echarts'
-import { use } from 'echarts/core'
-import { LineChart } from 'echarts/charts'
-import { GridComponent, TitleComponent, TooltipComponent, LegendComponent } from 'echarts/components'
-import { CanvasRenderer } from 'echarts/renderers'
-import { trainingApi } from '@/api'
-import { useTrainingStore } from '@/stores/training'
+import {use} from 'echarts/core'
+import {LineChart} from 'echarts/charts'
+import {GridComponent, LegendComponent, TitleComponent, TooltipComponent} from 'echarts/components'
+import {CanvasRenderer} from 'echarts/renderers'
+import {downloadTrainingJobBestFile, trainingApi} from '@/api'
+import OnnxExportDialog from '@/components/model/OnnxExportDialog.vue'
+import {useTrainingStore} from '@/stores/training'
 
 use([LineChart, GridComponent, TitleComponent, TooltipComponent, LegendComponent, CanvasRenderer])
 
@@ -163,6 +243,10 @@ const trainingStore = useTrainingStore()
 const id = route.params.id
 const job = ref(null)
 const dataInfo = ref(null)
+const downloadingTrainingBest = ref(false)
+const onnxDialogVisible = ref(false)
+const onnxDialogKind = ref('job')
+const onnxDialogModelId = ref('')
 let pollTimer = null
 
 // 时间预估信息
@@ -174,6 +258,28 @@ const estimatedInfo = ref({
 
 const metricsHistory = computed(() => job.value?.metrics_history || [])
 const hasMapData = computed(() => metricsHistory.value.some((m) => m['val/map50'] !== undefined))
+
+const displayTrainingModel = computed(() => {
+  const ep = job.value?.extra_params
+  return ep?.effective_model_label || job.value?.model_name || '—'
+})
+
+const trainingModelTooltip = computed(() => {
+  const p = job.value?.extra_params?.effective_model_path
+  return p && String(p).trim() ? String(p).trim() : ''
+})
+
+const showConfiguredModelHint = computed(() => {
+  const cfg = job.value?.extra_params?.configured_model_name || job.value?.model_name
+  const eff = job.value?.extra_params?.effective_model_label
+  return Boolean(eff && cfg && eff !== cfg)
+})
+
+/** 训练中，或失败/取消后仍可能留有 best.pt */
+const showDownloadTrainingBest = computed(() => {
+  const s = job.value?.status
+  return s === 'running' || s === 'failed' || s === 'cancelled'
+})
 
 const statusType = (s) => ({ pending: 'info', running: 'warning', completed: 'success', failed: 'danger', cancelled: '' })[s] || ''
 const statusText = (s) => ({ pending: '等待', running: '训练中', completed: '完成', failed: '失败', cancelled: '已取消' })[s] || s
@@ -277,9 +383,16 @@ function handleWsMessage(data) {
   console.log('📊 Training WS:', data.type)
 
   if (data.type === 'training_started') {
-    // 保存数据信息
     if (data.data_info) {
       dataInfo.value = data.data_info
+    }
+    if (job.value && (data.effective_model_label || data.effective_model_path)) {
+      job.value.extra_params = {
+        ...(job.value.extra_params || {}),
+        ...(data.effective_model_label && {effective_model_label: data.effective_model_label}),
+        ...(data.effective_model_path && {effective_model_path: data.effective_model_path}),
+        ...(data.configured_model_name && {configured_model_name: data.configured_model_name}),
+      }
     }
   }
 
@@ -332,20 +445,50 @@ async function cancelJob() {
   await loadJob()
 }
 
-async function handleDownload(command) {
-  if (!job.value?.model_path) return
+async function downloadTrainingBest() {
+  downloadingTrainingBest.value = true
+  try {
+    await downloadTrainingJobBestFile(id, job.value?.name || 'training')
+    ElMessage.success('已开始下载')
+  } catch (e) {
+    ElMessage.error(e?.message || '下载失败')
+  } finally {
+    downloadingTrainingBest.value = false
+  }
+}
 
-  // 获取模型ID - 需要通过训练任务查找对应的模型
-  let modelId = null
+function openOnnxExportJob() {
+  onnxDialogKind.value = 'job'
+  onnxDialogModelId.value = ''
+  onnxDialogVisible.value = true
+}
+
+async function resolveRegisteredModelId() {
   try {
     const res = await trainingApi.listModels()
     const allModels = res.models || res.items || []
-    const model = allModels.find(m => m.training_job_id === id)
-    if (model) {
-      modelId = model.id
-    }
+    const model = allModels.find((m) => m.training_job_id === id)
+    return model?.id || null
   } catch (error) {
     console.error('Failed to find model:', error)
+    return null
+  }
+}
+
+async function handleDownload(command) {
+  if (!job.value?.model_path) return
+
+  const modelId = await resolveRegisteredModelId()
+
+  if (command === 'onnx') {
+    if (!modelId) {
+      ElMessage.warning('未找到已注册的模型记录，请稍后在模型管理中导出 ONNX，或训练中用「导出 ONNX」基于当前 best.pt')
+      return
+    }
+    onnxDialogKind.value = 'model'
+    onnxDialogModelId.value = modelId
+    onnxDialogVisible.value = true
+    return
   }
 
   if (!modelId) {
@@ -354,11 +497,9 @@ async function handleDownload(command) {
   }
 
   if (command === 'weights') {
-    // 下载权重文件 (best.pt)
     ElMessage.info('正在下载模型权重文件 (best.pt)...')
     window.open(trainingApi.downloadModel(modelId), '_blank')
   } else if (command === 'package') {
-    // 下载完整包 (权重 + 标签 + 说明)
     ElMessage.success('正在下载完整模型包 (包含权重、标签文件和使用说明)...')
     window.open(trainingApi.downloadModelPackage(modelId), '_blank')
   }
@@ -369,4 +510,20 @@ async function handleDownload(command) {
 .metric-item { margin-bottom: 12px; }
 .metric-item span { font-size: 12px; color: #606266; display: block; margin-bottom: 4px; }
 .error-card :deep(.el-card__header) { background: #fef0f0; }
+
+.training-model-alert {
+  margin-top: 16px;
+}
+
+.training-model-title {
+  font-size: 14px;
+  font-weight: 600;
+  cursor: default;
+}
+
+.training-model-sub {
+  font-size: 12px;
+  color: #909399;
+  margin-top: 6px;
+}
 </style>

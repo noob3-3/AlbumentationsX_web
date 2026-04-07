@@ -24,10 +24,18 @@
                     <el-dropdown-item command="archive" v-if="project.status === 'active'">
                       <el-icon><FolderDelete /></el-icon>归档项目
                     </el-dropdown-item>
-                    <el-dropdown-item command="activate" v-if="project.status === 'archived'">
-                      <el-icon><FolderOpened /></el-icon>激活项目
+                    <el-dropdown-item command="activate"
+                                      v-if="project.status === 'archived' || project.status === 'deleted'">
+                      <el-icon>
+                        <FolderOpened/>
+                      </el-icon>
+                      取消归档
                     </el-dropdown-item>
-                    <el-dropdown-item command="delete" divided>
+                    <el-dropdown-item
+                        v-if="project.status === 'active' || project.status === 'archived'"
+                        command="delete"
+                        divided
+                    >
                       <el-icon><Delete /></el-icon>删除项目
                     </el-dropdown-item>
                   </el-dropdown-menu>
@@ -132,7 +140,7 @@
                   <el-button link type="primary" size="small" @click="$router.push(`/annotation?dataset=${row.id}`)">
                     标注
                   </el-button>
-                  <el-button link type="primary" size="small" @click="exportDataset(row)">
+                  <el-button link type="primary" size="small" @click="openExportDatasetDialog(row)">
                     导出
                   </el-button>
                   <el-popconfirm title="确认删除?" @confirm="deleteDataset(row.id)">
@@ -299,20 +307,53 @@
         <el-button type="primary" @click="createDataset" :loading="creatingDataset">创建</el-button>
       </template>
     </el-dialog>
+
+    <el-dialog v-model="showExportDatasetDialog" title="导出 YOLO 数据集" width="460px"
+               @closed="onExportDatasetDialogClosed">
+      <div v-if="exportDatasetTarget" class="export-dataset-name">数据集：{{ exportDatasetTarget.name }}</div>
+      <el-form label-width="108px">
+        <el-form-item label="图片范围">
+          <el-radio-group v-model="exportDatasetForm.scope" class="export-scope-group">
+            <el-radio value="all">原始 + 增强</el-radio>
+            <el-radio value="original">仅原始</el-radio>
+            <el-radio value="augmented" :disabled="!(exportDatasetTarget?.augmented_count > 0)">仅增强</el-radio>
+          </el-radio-group>
+          <div v-if="!(exportDatasetTarget?.augmented_count > 0)" class="export-hint">当前数据集无增强图片</div>
+        </el-form-item>
+        <el-form-item label="标注筛选">
+          <el-checkbox v-model="exportDatasetForm.annotatedOnly">仅导出已标注图片</el-checkbox>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="showExportDatasetDialog = false">取消</el-button>
+        <el-button type="primary" :loading="exportDatasetLoading" @click="confirmExportDataset">下载 ZIP</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <script setup>
-import { ref, computed, onMounted, watch } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import {computed, onMounted, ref, watch} from 'vue'
+import {useRoute, useRouter} from 'vue-router'
+import {ElMessage, ElMessageBox} from 'element-plus'
 import {
-  Edit, MoreFilled, Plus, FolderOpened, FolderDelete, Delete, Box, Picture, EditPen, Connection
+  Box,
+  Connection,
+  Delete,
+  Edit,
+  EditPen,
+  FolderDelete,
+  FolderOpened,
+  MoreFilled,
+  Picture,
+  Plus
 } from '@element-plus/icons-vue'
-import { projectApi, datasetApi } from '@/api'
+import {datasetApi, projectApi} from '@/api'
+import {useProjectStore} from '@/stores/project'
 
 const route = useRoute()
 const router = useRouter()
+const projectStore = useProjectStore()
 
 const projectId = computed(() => route.params.id)
 const loading = ref(false)
@@ -321,6 +362,10 @@ const modelsLoading = ref(false)
 const updating = ref(false)
 const creatingDataset = ref(false)
 const testingWebhook = ref(false)
+const showExportDatasetDialog = ref(false)
+const exportDatasetTarget = ref(null)
+const exportDatasetLoading = ref(false)
+const exportDatasetForm = ref({scope: 'all', annotatedOnly: false})
 
 const project = ref(null)
 const datasets = ref([])
@@ -425,7 +470,8 @@ async function updateProject() {
     await projectApi.update(projectId.value, editForm.value)
     ElMessage.success('项目已更新')
     showEditDialog.value = false
-    loadProject()
+    await loadProject()
+    await projectStore.syncHeaderProjects()
   } catch (error) {
     ElMessage.error('更新失败')
   } finally {
@@ -468,18 +514,50 @@ async function deleteDataset(datasetId) {
   }
 }
 
-async function exportDataset(dataset) {
+function buildProjectExportParams() {
+  const {scope, annotatedOnly} = exportDatasetForm.value
+  const params = {annotated_only: annotatedOnly}
+  if (scope === 'original') {
+    params.include_augmented = false
+    params.augmented_only = false
+  } else if (scope === 'augmented') {
+    params.augmented_only = true
+  } else {
+    params.include_augmented = true
+    params.augmented_only = false
+  }
+  return params
+}
+
+function openExportDatasetDialog(row) {
+  exportDatasetTarget.value = row
+  exportDatasetForm.value = {scope: 'all', annotatedOnly: false}
+  showExportDatasetDialog.value = true
+}
+
+function onExportDatasetDialogClosed() {
+  exportDatasetTarget.value = null
+  exportDatasetForm.value = {scope: 'all', annotatedOnly: false}
+}
+
+async function confirmExportDataset() {
+  const ds = exportDatasetTarget.value
+  if (!ds) return
+  exportDatasetLoading.value = true
   try {
-    const blob = await datasetApi.export(dataset.id)
+    const blob = await datasetApi.export(ds.id, buildProjectExportParams())
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
-    a.download = `${dataset.name || 'dataset'}_yolo.zip`
+    a.download = `${ds.name || 'dataset'}_yolo.zip`
     a.click()
     URL.revokeObjectURL(url)
     ElMessage.success('数据集导出成功')
+    showExportDatasetDialog.value = false
   } catch (error) {
     ElMessage.error(error.response?.data?.detail || error.message || '导出失败')
+  } finally {
+    exportDatasetLoading.value = false
   }
 }
 
@@ -502,12 +580,18 @@ async function handleProjectCommand(command) {
     case 'archive':
       await projectApi.update(projectId.value, { status: 'archived' })
       ElMessage.success('项目已归档')
-      loadProject()
+      await loadProject()
+      await projectStore.syncHeaderProjects()
       break
     case 'activate':
       await projectApi.update(projectId.value, { status: 'active' })
-      ElMessage.success('项目已激活')
-      loadProject()
+      ElMessage.success('已恢复为活跃项目')
+      await loadProject()
+      await projectStore.fetchProjects()
+    {
+      const p = projectStore.projects.find((x) => x.id === projectId.value)
+      if (p) projectStore.setCurrentProject(p)
+    }
       break
     case 'delete':
       try {
@@ -518,6 +602,10 @@ async function handleProjectCommand(command) {
         })
         await projectApi.delete(projectId.value)
         ElMessage.success('项目已删除')
+        if (projectStore.currentProject?.id === projectId.value) {
+          projectStore.clearCurrentProject()
+        }
+        await projectStore.fetchProjects()
         router.push('/projects')
       } catch (error) {
         if (error !== 'cancel') {
@@ -580,6 +668,25 @@ function formatFileSize(bytes) {
 
 .project-info-card {
   border-top: 4px solid #409eff;
+}
+
+.export-dataset-name {
+  margin-bottom: 12px;
+  font-weight: 600;
+  color: #303133;
+}
+
+.export-scope-group {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.export-hint {
+  color: #909399;
+  font-size: 12px;
+  margin-top: 6px;
 }
 </style>
 

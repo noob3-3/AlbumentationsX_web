@@ -16,17 +16,9 @@
       <template #extra>
         <el-space>
           <el-button :icon="Download" @click="$router.push(`/collect?dataset=${id}`)">采集图片</el-button>
-          <el-dropdown @command="(cmd) => exportDataset(cmd === 'annotated')">
-            <el-button :icon="Upload" :loading="exportLoading">
-              导出数据集<el-icon class="el-icon--right"><ArrowDown /></el-icon>
-            </el-button>
-            <template #dropdown>
-              <el-dropdown-menu>
-                <el-dropdown-item command="all">导出全部</el-dropdown-item>
-                <el-dropdown-item command="annotated">仅导出已标注</el-dropdown-item>
-              </el-dropdown-menu>
-            </template>
-          </el-dropdown>
+          <el-button :icon="Upload" :loading="exportLoading" @click="openExportDialog">
+            导出数据集
+          </el-button>
           <el-button type="primary" :icon="MagicStick" @click="showAugDialog = true">数据增强</el-button>
           <el-button type="success" :icon="Cpu" @click="showTrainDialog = true">开始训练</el-button>
         </el-space>
@@ -163,6 +155,26 @@
       </template>
     </el-dialog>
 
+    <el-dialog v-model="showExportDialog" title="导出 YOLO 数据集" width="460px" @closed="onExportDialogClosed">
+      <el-form label-width="108px">
+        <el-form-item label="图片范围">
+          <el-radio-group v-model="exportForm.scope" class="export-scope-group">
+            <el-radio value="all">原始 + 增强</el-radio>
+            <el-radio value="original">仅原始</el-radio>
+            <el-radio value="augmented" :disabled="!(dataset?.augmented_count > 0)">仅增强</el-radio>
+          </el-radio-group>
+          <div v-if="!(dataset?.augmented_count > 0)" class="export-hint">当前数据集无增强图片</div>
+        </el-form-item>
+        <el-form-item label="标注筛选">
+          <el-checkbox v-model="exportForm.annotatedOnly">仅导出已标注图片</el-checkbox>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="showExportDialog = false">取消</el-button>
+        <el-button type="primary" :loading="exportLoading" @click="confirmExport">下载 ZIP</el-button>
+      </template>
+    </el-dialog>
+
     <!-- Train quick dialog -->
     <el-dialog v-model="showTrainDialog" title="快速启动训练" width="500px">
       <el-form :model="trainForm" label-width="100px">
@@ -190,13 +202,13 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
-import { Delete, Download, Upload, MagicStick, Cpu, Picture, Edit, Operation, ArrowDown } from '@element-plus/icons-vue'
-import { ElMessage } from 'element-plus'
-import { datasetApi, augmentationApi, trainingApi } from '@/api'
-import { useDatasetStore } from '@/stores/dataset'
-import { storeToRefs } from 'pinia'
+import {onMounted, ref} from 'vue'
+import {useRoute, useRouter} from 'vue-router'
+import {Cpu, Delete, Download, Edit, MagicStick, Operation, Picture, Upload} from '@element-plus/icons-vue'
+import {ElMessage} from 'element-plus'
+import {augmentationApi, datasetApi, trainingApi} from '@/api'
+import {useDatasetStore} from '@/stores/dataset'
+import {storeToRefs} from 'pinia'
 import AnnotationView from '@/components/annotation/AnnotationView.vue'
 import AugmentationManager from '@/components/augmentation/AugmentationManager.vue'
 
@@ -216,6 +228,11 @@ const augLoading = ref(false)
 const showTrainDialog = ref(false)
 const trainLoading = ref(false)
 const exportLoading = ref(false)
+const showExportDialog = ref(false)
+const exportForm = ref({
+  scope: 'all',
+  annotatedOnly: false,
+})
 const availableModels = ref([])
 const otherDatasets = ref([])
 
@@ -325,10 +342,34 @@ async function startAugmentation() {
   }
 }
 
-async function exportDataset(annotatedOnly = false) {
+function buildExportQueryParams() {
+  const {scope, annotatedOnly} = exportForm.value
+  const params = {annotated_only: annotatedOnly}
+  if (scope === 'original') {
+    params.include_augmented = false
+    params.augmented_only = false
+  } else if (scope === 'augmented') {
+    params.augmented_only = true
+  } else {
+    params.include_augmented = true
+    params.augmented_only = false
+  }
+  return params
+}
+
+function openExportDialog() {
+  exportForm.value = {scope: 'all', annotatedOnly: false}
+  showExportDialog.value = true
+}
+
+function onExportDialogClosed() {
+  exportForm.value = {scope: 'all', annotatedOnly: false}
+}
+
+async function confirmExport() {
   exportLoading.value = true
   try {
-    const blob = await datasetApi.export(id, { annotated_only: annotatedOnly })
+    const blob = await datasetApi.export(id, buildExportQueryParams())
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
@@ -336,6 +377,7 @@ async function exportDataset(annotatedOnly = false) {
     a.click()
     URL.revokeObjectURL(url)
     ElMessage.success('数据集导出成功')
+    showExportDialog.value = false
   } catch (error) {
     ElMessage.error(error.response?.data?.detail || error.message || '导出失败')
   } finally {
@@ -423,5 +465,18 @@ async function startTraining() {
   align-items: center;
   justify-content: space-between;
   border-top: 1px solid #f5f5f5;
+}
+
+.export-scope-group {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.export-hint {
+  color: #909399;
+  font-size: 12px;
+  margin-top: 6px;
 }
 </style>
