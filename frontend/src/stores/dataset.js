@@ -1,8 +1,8 @@
-import { defineStore } from 'pinia'
-import { ref, computed } from 'vue'
-import { datasetApi } from '@/api'
-import { ElMessage } from 'element-plus'
-import { useProjectStore } from './project'
+import {defineStore} from 'pinia'
+import {ref} from 'vue'
+import {datasetApi} from '@/api'
+import {ElMessage} from 'element-plus'
+import {useProjectStore} from './project'
 
 export const useDatasetStore = defineStore('dataset', () => {
   const datasets = ref([])
@@ -46,11 +46,16 @@ export const useDatasetStore = defineStore('dataset', () => {
     }
   }
 
-  async function deleteDataset(id) {
-    await datasetApi.delete(id)
+    async function deleteDataset(id, options = {}) {
+        const data = await datasetApi.delete(id, options)
+        if (options.purge_augmented_only) {
+            ElMessage.success(data?.message || '已清除增强数据')
+            await fetchDatasets()
+            return
+        }
     datasets.value = datasets.value.filter((d) => d.id !== id)
     total.value--
-    ElMessage.success('数据集已删除')
+        ElMessage.success(data?.message || '数据集已删除')
   }
 
   async function fetchImages(datasetId, params = {}) {

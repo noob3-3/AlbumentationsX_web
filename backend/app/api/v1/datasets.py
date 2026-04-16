@@ -8,7 +8,7 @@ import tempfile
 import zipfile
 from app.core.config import settings
 from app.core.database import get_db
-from app.models import ImageSource, Image, Annotation
+from app.models import ImageSource, Image, Annotation, Dataset
 from app.schemas.schemas import (
     DatasetCreate, DatasetUpdate, DatasetResponse,
     ImageResponse, ImageUploadResponse, AnnotationCreate,
@@ -46,6 +46,144 @@ def _merge_resolved_class_names_into_dataset(dataset, resolved: List[str]) -> No
             out.append(name)
     dataset.classes = out
     flag_modified(dataset, "classes")
+
+
+def _resolve_image_disk_path(raw: Optional[str]) -> tuple[Optional[Path], List[str]]:
+    """
+    DB 中 file_path 可能仍为 static-file，实际文件在 datasets（或相反）。依次尝试互转路径。
+    返回 (首个存在的文件 Path, 所有尝试过的路径字符串)。
+    """
+    if not raw:
+        return None, []
+    norm = str(raw).replace("\\", "/").strip()
+    variants = [norm]
+    if "data/static-file/" in norm:
+        variants.append(norm.replace("data/static-file/", "data/datasets/", 1))
+    if "data/datasets/" in norm:
+        variants.append(norm.replace("data/datasets/", "data/static-file/", 1))
+    tried: List[str] = []
+    seen = set()
+    for v in variants:
+        if v in seen:
+            continue
+        seen.add(v)
+        tried.append(v)
+        p = Path(v)
+        if p.is_file():
+            if v != norm:
+                logger.info("serve_image: 路径回退成功 db 原路径={} -> {}", norm, v)
+            return p, tried
+    return None, tried
+
+
+def _find_image_in_dir_case_insensitive(images_dir: Path, filename: str) -> Optional[Path]:
+    """与 training_service 一致：大小写不一致时仍能匹配文件名。"""
+    if not filename or not images_dir.is_dir():
+        return None
+    direct = images_dir / filename
+    if direct.is_file():
+        return direct
+    fn_low = filename.lower()
+    try:
+        for p in images_dir.iterdir():
+            if p.is_file() and p.name.lower() == fn_low:
+                return p
+    except OSError as e:
+        logger.debug("serve_image list dir failed {}: {}", images_dir, e)
+    return None
+
+
+def _resolve_serve_image_path(
+        image: Image,
+        dataset: Optional[Dataset],
+        thumbnail: bool,
+) -> tuple[Optional[Path], List[str]]:
+    """
+    解析标注/缩略图可读路径：DB 路径互换 + dataset.storage_path + 标准 DATA_DIR 布局 + 文件名大小写。
+    缩略图文件不存在时回退为原图（避免列表首屏全 404）。
+    """
+    tried: List[str] = []
+    seen = set()
+
+    def add_tried(s: str) -> None:
+        if s not in seen:
+            seen.add(s)
+            tried.append(s)
+
+    file_path_str = image.thumbnail_path if thumbnail and image.thumbnail_path else image.file_path
+    if not file_path_str:
+        return None, tried
+
+    # 1) DB 存的路径 + static-file ↔ datasets
+    p, part = _resolve_image_disk_path(file_path_str)
+    for x in part:
+        add_tried(x)
+    if p is not None:
+        return p, tried
+
+    # 1b) 与训练导出一致：路径中含 data/datasets 或 data/static-file 时，拼到 BASE_DIR（纠正盘符/前缀错误）
+    norm_one = str(file_path_str).replace("\\", "/").strip()
+    nl = norm_one.lower()
+    for anchor in ("data/static-file/", "data/datasets/"):
+        pos = nl.find(anchor)
+        if pos >= 0:
+            tail = norm_one[pos:]
+            p = settings.BASE_DIR / tail
+            add_tried(str(p))
+            if p.is_file():
+                logger.info("serve_image: BASE_DIR+路径后缀回退 {}", p)
+                return p, tried
+
+    name = (image.filename or "").strip()
+    if not name or dataset is None:
+        return None, tried
+
+    sub = "thumbnails" if thumbnail else "images"
+
+    def try_direct(path: Path) -> Optional[Path]:
+        add_tried(str(path))
+        if path.is_file():
+            return path
+        alt = _find_image_in_dir_case_insensitive(path.parent, name)
+        if alt is not None:
+            add_tried(str(alt))
+            return alt
+        return None
+
+    # 2) dataset.storage_path（可能已指向 datasets 或 static-file）
+    if dataset.storage_path:
+        sp_raw = str(dataset.storage_path).replace("\\", "/").strip()
+        sp = Path(sp_raw)
+        sp_bases = [sp]
+        if not sp.is_absolute():
+            for base in (settings.BASE_DIR, settings.DATA_DIR, Path.cwd()):
+                sp_bases.append((base / sp_raw.lstrip("/")).resolve(strict=False))
+        for cbase in sp_bases:
+            hit = try_direct(cbase / sub / name)
+            if hit is not None:
+                logger.info("serve_image: 使用 dataset.storage_path 下文件 {}", hit)
+                return hit, tried
+
+    # 3) 标准目录：DATASET_DIR、data/datasets、data/static-file
+    for base in (
+            settings.DATASET_DIR / dataset.id,
+            settings.DATA_DIR / "datasets" / dataset.id,
+            settings.DATA_DIR / "static-file" / dataset.id,
+    ):
+        hit = try_direct(base / sub / name)
+        if hit is not None:
+            logger.info("serve_image: 使用标准目录 {}", hit)
+            return hit, tried
+
+    # 4) 缩略图缺失 → 回退原图
+    if thumbnail and image.file_path:
+        p2, t2 = _resolve_serve_image_path(image, dataset, thumbnail=False)
+        tried.extend(x for x in t2 if x not in seen)
+        if p2 is not None:
+            logger.info("serve_image: 缩略图缺失，回退原图 {}", p2)
+            return p2, tried
+
+    return None, tried
 
 
 # ─────────────────────────────────────────────
@@ -153,7 +291,20 @@ async def update_dataset(
 
 
 @router.delete("/{dataset_id}", response_model=SuccessResponse, summary="Delete dataset")
-async def delete_dataset(dataset_id: str, db: AsyncSession = Depends(get_db)):
+async def delete_dataset(
+        dataset_id: str,
+        purge_augmented_only: bool = Query(
+            False,
+            description="为 True 时仅删除增强生成的图片与标注，并清除数据增强任务记录，保留数据集与原图",
+        ),
+        db: AsyncSession = Depends(get_db),
+):
+    if purge_augmented_only:
+        ok = await DatasetService.purge_augmented_images(db, dataset_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail="Dataset not found")
+        await db.commit()
+        return {"success": True, "message": "已清除增强数据"}
     deleted = await DatasetService.delete_dataset(db, dataset_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Dataset not found")
@@ -673,8 +824,9 @@ async def serve_image(
         )
         raise HTTPException(status_code=404, detail="File not found on disk")
 
-    file_path = Path(str(file_path_str).replace("\\", "/"))
-    on_disk = file_path.is_file()
+    dataset = await DatasetService.get_dataset(db, image.dataset_id)
+    resolved_path, tried_paths = _resolve_serve_image_path(image, dataset, thumbnail)
+    on_disk = resolved_path is not None
 
     # 仅当磁盘上仍存在文件时才返回 304；旧逻辑不校验磁盘会导致浏览器长期显示已删除/迁移前的缓存图，
     # 与训练导出「找不到源文件」表现不一致。
@@ -689,19 +841,19 @@ async def serve_image(
 
     if not on_disk:
         logger.warning(
-            "serve_image: 磁盘文件不存在（标注页与训练导出均无法读到此图） image_id={} dataset_id={} thumbnail={} "
-            "resolved={} db.file_path={} db.thumbnail_path={}",
+            "serve_image: 磁盘文件不存在（已尝试路径互换、storage_path、标准目录、缩略图回退原图等） "
+            "image_id={} dataset_id={} thumbnail={} db.file_path={} db.thumbnail_path={} 尝试数={}",
             image_id,
             image.dataset_id,
             thumbnail,
-            file_path,
             image.file_path,
             image.thumbnail_path,
+            len(tried_paths),
         )
         raise HTTPException(status_code=404, detail="File not found on disk")
 
     return FileResponse(
-        str(file_path),
+        str(resolved_path),
         media_type="image/jpeg",
         headers={
             "Cache-Control": "public, max-age=31536000, immutable",

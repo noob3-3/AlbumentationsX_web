@@ -1,29 +1,28 @@
 """
 Augmentation service using AlbumentationsX
 """
+import albumentations as A
+import asyncio
+import numpy as np
 import os
 import uuid
-import asyncio
-from datetime import datetime
-from pathlib import Path
-from typing import Optional, Dict, Any, List
-import numpy as np
-import albumentations as A
-from loguru import logger
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
-
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
 from app.core.websocket import ws_manager
 from app.models import Dataset, Image, Annotation, AugmentationJob, DatasetStatus, JobStatus, ImageSource, Project
 from app.schemas.schemas import AugmentationJobCreate, AugmentationConfig
+from app.services.webhook_service import webhook_service
 from app.utils import (
     ensure_rgb, save_image, generate_filename,
     get_image_info, create_thumbnail
 )
-from app.services.webhook_service import webhook_service
-
+from app.utils.yolo_label_import import points_to_four_corners, _axis_bbox_from_points
+from datetime import datetime
+from loguru import logger
+from pathlib import Path
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from typing import Optional, Dict, Any, List
 
 # ─────────────────────────────────────────────
 # Default augmentation pipeline for object detection
@@ -105,8 +104,34 @@ AVAILABLE_TRANSFORMS = {
 }
 
 
-def build_pipeline(config: Optional[Dict[str, Any]] = None) -> A.Compose:
-    """Build an albumentations pipeline from config dict"""
+def _annotation_to_four_corners_norm(a) -> List[List[float]]:
+    """归一化 [0,1] 四角；有 polygon 时规范化，否则由 YOLO 水平框生成四角。"""
+    poly = getattr(a, "polygon_points", None) or None
+    if poly and len(poly) >= 3:
+        pts = [[float(p[0]), float(p[1])] for p in poly]
+        return points_to_four_corners(pts)
+    cx = float(a.x_center)
+    cy = float(a.y_center)
+    w = float(a.bbox_width)
+    h = float(a.bbox_height)
+    hw, hh = w / 2.0, h / 2.0
+    return [
+        [cx - hw, cy - hh],
+        [cx + hw, cy - hh],
+        [cx + hw, cy + hh],
+        [cx - hw, cy + hh],
+    ]
+
+
+def build_pipeline(
+        config: Optional[Dict[str, Any]] = None,
+        obb_mode: bool = False,
+) -> A.Compose:
+    """Build an albumentations pipeline from config dict.
+
+    obb_mode=True：用四角 keypoints 与几何变换一致变换，适用于旋转框数据集；
+    False：经典 YOLO 水平框。
+    """
     if config is None:
         config = DEFAULT_AUGMENTATION_CONFIG
 
@@ -143,6 +168,14 @@ def build_pipeline(config: Optional[Dict[str, Any]] = None) -> A.Compose:
                 logger.warning(f"Could not create transform {name} with params {params}: {e}")
         else:
             logger.warning(f"Unknown transform: {name}")
+
+    if obb_mode:
+        keypoint_params = A.KeypointParams(
+            format="xy",
+            label_fields=["class_labels"],
+            remove_invisible=False,
+        )
+        return A.Compose(transforms_list, keypoint_params=keypoint_params)
 
     bbox_params = A.BboxParams(
         format="yolo",
@@ -259,8 +292,9 @@ class AugmentationService:
             except Exception as e:
                 logger.warning(f"Failed to send augmentation started webhook: {e}")
 
-        # Build augmentation pipeline
-        pipeline = build_pipeline(job.config)
+        is_obb = getattr(dataset, "label_task", None) == "obb"
+        # Build augmentation pipeline（OBB 用四角 keypoints，与旋转框一致）
+        pipeline = build_pipeline(job.config, obb_mode=is_obb)
 
         # Save augmented images to the SAME dataset
         output_images_dir = Path(dataset.storage_path) / "images"
@@ -282,15 +316,43 @@ class AugmentationService:
                 select(Annotation).where(Annotation.image_id == image.id)
             )
             img_annotations = img_annotations_result.scalars().all()
-            bboxes = [
-                [a.x_center, a.y_center, a.bbox_width, a.bbox_height]
-                for a in img_annotations
-            ]
-            class_labels = [a.class_id for a in img_annotations]
+            ih, iw = img_array.shape[0], img_array.shape[1]
+
+            if is_obb:
+                keypoints: List[List[float]] = []
+                kp_class_labels: List[int] = []
+                for a in img_annotations:
+                    corners_norm = _annotation_to_four_corners_norm(a)
+                    for xy in corners_norm:
+                        keypoints.append([float(xy[0]) * iw, float(xy[1]) * ih])
+                        kp_class_labels.append(int(a.class_id))
+            else:
+                bboxes = [
+                    [a.x_center, a.y_center, a.bbox_width, a.bbox_height]
+                    for a in img_annotations
+                ]
+                class_labels = [a.class_id for a in img_annotations]
 
             for i in range(job.multiplier):
                 try:
-                    if bboxes:
+                    if is_obb:
+                        if keypoints:
+                            result = pipeline(
+                                image=img_array,
+                                keypoints=keypoints,
+                                class_labels=kp_class_labels,
+                            )
+                        else:
+                            result = pipeline(
+                                image=img_array,
+                                keypoints=[],
+                                class_labels=[],
+                            )
+                        aug_image = result["image"]
+                        aug_kps = result.get("keypoints") or []
+                        aug_labels = result.get("class_labels") or []
+                        aug_h, aug_w = aug_image.shape[0], aug_image.shape[1]
+                    elif bboxes:
                         result = pipeline(image=img_array, bboxes=bboxes, class_labels=class_labels)
                         aug_image = result["image"]
                         aug_bboxes = result["bboxes"]
@@ -326,34 +388,67 @@ class AugmentationService:
                     db.add(aug_image_record)
                     await db.flush()
 
-                    for bbox, label in zip(aug_bboxes, aug_labels):
-                        # Handle both 4-element and 5-element bbox (with conf)
-                        cx, cy, bw, bh = bbox[0], bbox[1], bbox[2], bbox[3]
-
-                        # Convert label to int (albumentations may return float)
-                        label_int = int(label)
-
-                        class_name = None
-                        if dataset.classes and label_int < len(dataset.classes):
-                            class_name = dataset.classes[label_int]
-
-                        ann = Annotation(
-                            image_id=aug_image_record.id,
-                            class_id=label_int,
-                            class_name=class_name,
-                            x_center=float(cx),
-                            y_center=float(cy),
-                            bbox_width=float(bw),
-                            bbox_height=float(bh),
-                        )
-                        db.add(ann)
+                    ann_n = 0
+                    if is_obb:
+                        n_kp = len(aug_kps)
+                        if n_kp % 4 != 0:
+                            logger.warning(
+                                f"OBB augmentation: keypoint count {n_kp} is not a multiple of 4, "
+                                f"image {image.id} iter {i}; truncating"
+                            )
+                        for j in range(0, n_kp - (n_kp % 4), 4):
+                            pts_pix = aug_kps[j: j + 4]
+                            label_int = int(aug_labels[j])
+                            poly_norm = []
+                            for p in pts_pix:
+                                px, py = float(p[0]), float(p[1])
+                                poly_norm.append(
+                                    [
+                                        max(0.0, min(1.0, px / float(width))),
+                                        max(0.0, min(1.0, py / float(height))),
+                                    ]
+                                )
+                            cx, cy, bw, bh = _axis_bbox_from_points(poly_norm)
+                            class_name = None
+                            if dataset.classes and label_int < len(dataset.classes):
+                                class_name = dataset.classes[label_int]
+                            ann = Annotation(
+                                image_id=aug_image_record.id,
+                                class_id=label_int,
+                                class_name=class_name,
+                                x_center=float(cx),
+                                y_center=float(cy),
+                                bbox_width=float(bw),
+                                bbox_height=float(bh),
+                                polygon_points=poly_norm,
+                            )
+                            db.add(ann)
+                            ann_n += 1
+                    else:
+                        for bbox, label in zip(aug_bboxes, aug_labels):
+                            cx, cy, bw, bh = bbox[0], bbox[1], bbox[2], bbox[3]
+                            label_int = int(label)
+                            class_name = None
+                            if dataset.classes and label_int < len(dataset.classes):
+                                class_name = dataset.classes[label_int]
+                            ann = Annotation(
+                                image_id=aug_image_record.id,
+                                class_id=label_int,
+                                class_name=class_name,
+                                x_center=float(cx),
+                                y_center=float(cy),
+                                bbox_width=float(bw),
+                                bbox_height=float(bh),
+                            )
+                            db.add(ann)
+                            ann_n += 1
 
                     processed += 1
                     job.processed_images = processed
                     job.generated_images = processed  # Track generated count
                     dataset.image_count += 1
                     dataset.augmented_count += 1  # Track augmented images separately
-                    dataset.annotation_count += len(aug_bboxes)
+                    dataset.annotation_count += ann_n
 
                     # Send progress via WebSocket
                     await ws_manager.send_message(job_id, {

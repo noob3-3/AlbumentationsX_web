@@ -85,7 +85,7 @@
         :imageId="currentImage.id"
         :imageUrl="imageUrl(currentImage.id)"
         :classes="classes"
-        :initialAnnotations="currentImage.annotations || []"
+        :initialAnnotations="editorInitialAnnotations"
         :preloadedImage="currentPreloadedImage"
         :polygon-style="polygonStyleProp"
         :require-class-first="true"
@@ -175,6 +175,15 @@ const currentPreloadedImage = computed(() => {
 
 const currentImage = computed(() => {
   return props.images.find((img) => img.id === selectedImageId.value)
+})
+
+/** 避免模板里 `|| []` 每次渲染新建数组，导致子组件 watch 误触发、画布标签不刷新 */
+const EMPTY_ANNOTATIONS = Object.freeze([])
+
+const editorInitialAnnotations = computed(() => {
+  const ann = currentImage.value?.annotations
+  if (Array.isArray(ann)) return ann
+  return EMPTY_ANNOTATIONS
 })
 
 const currentImageIndex = computed(() => {

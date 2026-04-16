@@ -345,16 +345,31 @@ watch(() => props.imageId, (newImageId, oldImageId) => {
   }
 })
 
-// Watch for annotation changes (when props.initialAnnotations updates)
-watch(() => props.initialAnnotations, (newAnnotations) => {
-  if (newAnnotations) {
-    annotations.value = JSON.parse(JSON.stringify(newAnnotations))
+// 父组件刷新同一图片的标注时（如批量替换类别、重新 loadImages），同步到画布
+watch(
+    () => JSON.stringify(props.initialAnnotations ?? []),
+    (serialized, prevSerialized) => {
+      if (serialized === prevSerialized) return
+      try {
+        const parsed = JSON.parse(serialized)
+        annotations.value = Array.isArray(parsed) ? parsed : []
+      } catch {
+        annotations.value = []
+      }
     savedSnapshot.value = annotationsSnapshot(annotations.value)
     if (imageLoaded.value) {
-      redraw()
+      nextTick(() => redraw())
     }
-  }
-}, { deep: true })
+    },
+)
+
+watch(
+    () => props.classes,
+    () => {
+      if (imageLoaded.value) nextTick(() => redraw())
+    },
+    {deep: true},
+)
 
 const DEBUG_LOAD = false
 const loadStartTime = { current: 0 }
@@ -610,12 +625,20 @@ function drawAnnotationLabel(annotation, x, y, isSelected) {
   ctx.value.fillStyle = isSelected ? '#4CAF50' : '#2196F3'
   ctx.value.font = 'bold 14px Arial'
   const labelText = `${annotation.class_name} ${annotation.confidence ? `(${(annotation.confidence * 100).toFixed(0)}%)` : ''}`
-  const textMetrics = ctx.value.measureText(labelText)
   const labelPadding = 4
   const labelHeight = 20
-  ctx.value.fillRect(x, y - labelHeight, textMetrics.width + labelPadding * 2, labelHeight)
+  const textMetrics = ctx.value.measureText(labelText)
+  const labelWidth = textMetrics.width + labelPadding * 2
+  const cw = canvasWidth.value
+  const ch = canvasHeight.value
+  // 画在框内顶部，避免贴画布边缘时标签画到图片外看不见
+  let lx = x
+  let ly = y
+  lx = Math.max(0, Math.min(lx, cw - labelWidth))
+  ly = Math.max(0, Math.min(ly, ch - labelHeight))
+  ctx.value.fillRect(lx, ly, labelWidth, labelHeight)
   ctx.value.fillStyle = 'white'
-  ctx.value.fillText(labelText, x + labelPadding, y - 5)
+  ctx.value.fillText(labelText, lx + labelPadding, ly + 15)
 }
 
 function drawBBox(annotation, isSelected = false, index = -1) {
@@ -1166,7 +1189,7 @@ function onClassChange(index, newClassName) {
   const ann = annotations.value[index]
   ann.class_name = newClassName
   ann.class_id = props.classes.indexOf(newClassName)
-  redraw()
+  nextTick(() => redraw())
 }
 
 function undoAnnotation() {

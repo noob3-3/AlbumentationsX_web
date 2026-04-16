@@ -129,7 +129,7 @@
                   <el-tag :type="getStatusType(row.status)" size="small">{{ row.status }}</el-tag>
                 </template>
               </el-table-column>
-              <el-table-column label="操作" width="280" fixed="right">
+              <el-table-column label="操作" width="360" fixed="right">
                 <template #default="{ row }">
                   <el-button link type="primary" size="small" @click="$router.push(`/datasets/${row.id}`)">
                     查看
@@ -143,11 +143,15 @@
                   <el-button link type="primary" size="small" @click="openExportDatasetDialog(row)">
                     导出
                   </el-button>
-                  <el-popconfirm title="确认删除?" @confirm="deleteDataset(row.id)">
-                    <template #reference>
-                      <el-button link type="danger" size="small">删除</el-button>
-                    </template>
-                  </el-popconfirm>
+                  <el-button
+                      v-if="(row.augmented_count || 0) > 0"
+                      link
+                      type="warning"
+                      size="small"
+                      @click="purgeAugmentedOnly(row.id)"
+                  >清除增强
+                  </el-button>
+                  <el-button link type="danger" size="small" @click="deleteDataset(row.id)">删除</el-button>
                 </template>
               </el-table-column>
             </el-table>
@@ -349,6 +353,7 @@ import {
   Plus
 } from '@element-plus/icons-vue'
 import {datasetApi, projectApi} from '@/api'
+import {confirmDatasetDelete, confirmPurgeAugmentedOnly} from '@/utils/datasetDeleteConfirm'
 import {useProjectStore} from '@/stores/project'
 
 const route = useRoute()
@@ -502,10 +507,32 @@ async function createDataset() {
   }
 }
 
+async function purgeAugmentedOnly(datasetId) {
+  try {
+    await confirmPurgeAugmentedOnly()
+  } catch {
+    return
+  }
+  try {
+    const data = await datasetApi.delete(datasetId, {purge_augmented_only: true})
+    ElMessage.success(data?.message || '已清除增强数据')
+    loadDatasets()
+    await projectApi.updateCounts(projectId.value)
+    loadProject()
+  } catch {
+    ElMessage.error('清除失败')
+  }
+}
+
 async function deleteDataset(datasetId) {
   try {
-    await datasetApi.delete(datasetId)
-    ElMessage.success('数据集已删除')
+    await confirmDatasetDelete()
+  } catch {
+    return
+  }
+  try {
+    const data = await datasetApi.delete(datasetId)
+    ElMessage.success(data?.message || '数据集已删除')
     loadDatasets()
     await projectApi.updateCounts(projectId.value)
     loadProject()

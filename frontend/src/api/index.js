@@ -19,7 +19,7 @@ export const datasetApi = {
   create: (data) => http.post('/datasets', data),
   get: (id) => http.get(`/datasets/${id}`),
   update: (id, data) => http.put(`/datasets/${id}`, data),
-  delete: (id) => http.delete(`/datasets/${id}`),
+    delete: (id, params) => http.delete(`/datasets/${id}`, {params}),
 
   // Images
   uploadImages: (datasetId, formData, onProgress) =>

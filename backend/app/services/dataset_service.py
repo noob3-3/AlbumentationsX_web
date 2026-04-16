@@ -4,12 +4,21 @@ Dataset management service
 import os
 import shutil
 from app.core.config import settings
-from app.models import Dataset, Image, Annotation, DatasetStatus, ImageSource, AnnotationStatus
+from app.models import (
+    Dataset,
+    Image,
+    Annotation,
+    DatasetStatus,
+    ImageSource,
+    AnnotationStatus,
+    AugmentationJob,
+    TrainingJob,
+)
 from app.schemas.schemas import DatasetCreate, DatasetUpdate
 from app.utils import generate_filename, get_image_info, create_thumbnail, allowed_image
 from loguru import logger
 from pathlib import Path
-from sqlalchemy import select, func, update, delete
+from sqlalchemy import select, func, update, delete, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from typing import List, Optional
@@ -111,14 +120,85 @@ class DatasetService:
         return dataset
 
     @staticmethod
-    async def delete_dataset(db: AsyncSession, dataset_id: str) -> bool:
+    async def purge_augmented_images(db: AsyncSession, dataset_id: str) -> bool:
+        """仅删除增强生成的图片与标注，并清理数据增强任务记录；保留数据集与原图。"""
         dataset = await DatasetService.get_dataset(db, dataset_id)
         if not dataset:
             return False
-        # Remove storage directory
-        if dataset.storage_path and Path(dataset.storage_path).exists():
-            shutil.rmtree(dataset.storage_path, ignore_errors=True)
-        await db.delete(dataset)
+        result = await db.execute(
+            select(Image)
+            .where(Image.dataset_id == dataset_id, Image.is_augmented == True)
+            .options(selectinload(Image.annotations))
+        )
+        aug_images = result.scalars().all()
+        ann_removed = sum(len(img.annotations) for img in aug_images)
+        for img in aug_images:
+            for path in [img.file_path, img.thumbnail_path]:
+                if path and Path(path).exists():
+                    Path(path).unlink(missing_ok=True)
+            await db.delete(img)
+        if aug_images:
+            dataset.image_count = max(0, (dataset.image_count or 0) - len(aug_images))
+            dataset.annotation_count = max(0, (dataset.annotation_count or 0) - ann_removed)
+        dataset.augmented_count = 0
+        await db.execute(delete(AugmentationJob).where(AugmentationJob.dataset_id == dataset_id))
+        return True
+
+    @staticmethod
+    async def delete_dataset(db: AsyncSession, dataset_id: str) -> bool:
+        """
+        删除数据集。使用显式 SQL 顺序删子表，避免 ORM delete 时懒加载 relationship 在已中止事务上报错；
+        annotation_jobs 等可选表放在 savepoint 中，失败不污染外层事务（PostgreSQL）。
+        """
+        r = await db.execute(select(Dataset.storage_path).where(Dataset.id == dataset_id))
+        storage_path = r.scalar_one_or_none()
+        if storage_path is None:
+            return False
+
+        await db.execute(delete(AugmentationJob).where(AugmentationJob.dataset_id == dataset_id))
+        await db.execute(delete(TrainingJob).where(TrainingJob.dataset_id == dataset_id))
+
+        for stmt, msg in (
+                (
+                        text("DELETE FROM annotation_jobs WHERE dataset_id = :did"),
+                        "annotation_jobs",
+                ),
+                (
+                        text(
+                            "DELETE FROM collection_images WHERE image_id IN "
+                            "(SELECT id FROM images WHERE dataset_id = :did)"
+                        ),
+                        "collection_images",
+                ),
+        ):
+            try:
+                async with db.begin_nested():
+                    await db.execute(stmt, {"did": dataset_id})
+            except Exception as e:
+                logger.debug("{} 清理跳过: {}", msg, e)
+
+        await db.execute(
+            text(
+                "DELETE FROM annotations WHERE image_id IN "
+                "(SELECT id FROM images WHERE dataset_id = :did)"
+            ),
+            {"did": dataset_id},
+        )
+        # 增强图 parent_id 指向原图：先删增强行再删其余
+        await db.execute(
+            text("DELETE FROM images WHERE dataset_id = :did AND is_augmented = true"),
+            {"did": dataset_id},
+        )
+        await db.execute(
+            text("DELETE FROM images WHERE dataset_id = :did"),
+            {"did": dataset_id},
+        )
+
+        await db.execute(delete(Dataset).where(Dataset.id == dataset_id))
+
+        sp = storage_path
+        if sp and Path(sp).exists():
+            shutil.rmtree(sp, ignore_errors=True)
         return True
 
     @staticmethod

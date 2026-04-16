@@ -228,23 +228,54 @@ class DeploymentService:
             elif image_np.shape[2] == 3:  # RGB
                 image_np = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
 
-        # Draw bounding boxes（OBB 优先画旋转四边形）
+        # Draw bounding boxes（OBB 优先画旋转四边形；标签画在框内顶部，避免贴图像边缘时溢出看不见）
+        h_img, w_img = image_np.shape[:2]
+        pad = 4
         for detection in detections:
             class_name = detection["class_name"]
             confidence = detection["confidence"]
             bbox = detection["bbox"]
             x1, y1, x2, y2 = map(int, bbox)
 
+            label = f"{class_name}: {confidence:.2f}"
+            (label_width, label_height), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            box_h = label_height + baseline + pad * 2
+
             if detection.get("task") == "obb" and detection.get("obb_xyxyxyxy"):
                 pts = np.array(detection["obb_xyxyxyxy"], dtype=np.float32).reshape(-1, 2).astype(np.int32)
                 cv2.polylines(image_np, [pts], True, (0, 255, 0), 2)
+                cx = float(np.mean(pts[:, 0]))
+                top_y = float(np.min(pts[:, 1]))
+                lx = int(cx - label_width / 2 - pad)
+                ty = int(top_y)
+                lx = max(0, min(lx, w_img - label_width - pad * 2))
+                ty = max(0, min(ty, h_img - box_h))
+                cv2.rectangle(
+                    image_np,
+                    (lx, ty),
+                    (lx + label_width + pad * 2, ty + box_h),
+                    (0, 255, 0),
+                    -1,
+                )
+                cv2.putText(
+                    image_np, label, (lx + pad, ty + label_height + pad),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1,
+                )
             else:
                 cv2.rectangle(image_np, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
-            label = f"{class_name}: {confidence:.2f}"
-            (label_width, label_height), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-            cv2.rectangle(image_np, (x1, y1 - label_height - 10), (x1 + label_width, y1), (0, 255, 0), -1)
-            cv2.putText(image_np, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+                lx = max(0, min(x1, w_img - label_width - pad * 2))
+                ty = max(0, min(y1, h_img - box_h))
+                cv2.rectangle(
+                    image_np,
+                    (lx, ty),
+                    (lx + label_width + pad * 2, ty + box_h),
+                    (0, 255, 0),
+                    -1,
+                )
+                cv2.putText(
+                    image_np, label, (lx + pad, ty + label_height + pad),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1,
+                )
 
         # Encode image to base64
         _, buffer = cv2.imencode('.jpg', image_np)

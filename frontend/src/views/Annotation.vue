@@ -451,8 +451,12 @@ async function confirmDeleteClass() {
 }
 
 function onAnnotationsSaved() {
-  // Reload images to update annotation count
   loadImages()
+  if (selectedDatasetId.value) {
+    datasetApi.get(selectedDatasetId.value).then((ds) => {
+      currentDataset.value = ds
+    })
+  }
 }
 </script>
 

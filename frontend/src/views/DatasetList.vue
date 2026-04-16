@@ -54,15 +54,19 @@
         <el-table-column prop="created_at" label="创建时间" width="160">
           <template #default="{ row }">{{ formatDate(row.created_at) }}</template>
         </el-table-column>
-        <el-table-column label="操作" width="180" fixed="right">
+        <el-table-column label="操作" width="240" fixed="right">
           <template #default="{ row }">
             <el-button link type="primary" size="small" @click="$router.push(`/datasets/${row.id}`)">查看</el-button>
             <el-button link type="primary" size="small" @click="$router.push(`/collect?dataset=${row.id}`)">采集</el-button>
-            <el-popconfirm title="确认删除该数据集?" @confirm="handleDelete(row.id)">
-              <template #reference>
-                <el-button link type="danger" size="small">删除</el-button>
-              </template>
-            </el-popconfirm>
+            <el-button
+                v-if="(row.augmented_count || 0) > 0"
+                link
+                type="warning"
+                size="small"
+                @click="handlePurgeAugmented(row.id)"
+            >清除增强
+            </el-button>
+            <el-button link type="danger" size="small" @click="handleDelete(row.id)">删除</el-button>
           </template>
         </el-table-column>
       </el-table>
@@ -97,11 +101,13 @@
 </template>
 
 <script setup>
-import { ref, onMounted, watch } from 'vue'
-import { Plus } from '@element-plus/icons-vue'
-import { useDatasetStore } from '@/stores/dataset'
-import { useProjectStore } from '@/stores/project'
-import { storeToRefs } from 'pinia'
+import {onMounted, ref, watch} from 'vue'
+import {Plus} from '@element-plus/icons-vue'
+import {ElMessage} from 'element-plus'
+import {useDatasetStore} from '@/stores/dataset'
+import {useProjectStore} from '@/stores/project'
+import {confirmDatasetDelete, confirmPurgeAugmentedOnly} from '@/utils/datasetDeleteConfirm'
+import {storeToRefs} from 'pinia'
 
 const store = useDatasetStore()
 const projectStore = useProjectStore()
@@ -134,6 +140,28 @@ async function handleCreate() {
 }
 
 async function handleDelete(id) {
-  await store.deleteDataset(id)
+  try {
+    await confirmDatasetDelete()
+  } catch {
+    return
+  }
+  try {
+    await store.deleteDataset(id)
+  } catch {
+    ElMessage.error('删除失败')
+  }
+}
+
+async function handlePurgeAugmented(id) {
+  try {
+    await confirmPurgeAugmentedOnly()
+  } catch {
+    return
+  }
+  try {
+    await store.deleteDataset(id, {purge_augmented_only: true})
+  } catch {
+    ElMessage.error('清除失败')
+  }
 }
 </script>
