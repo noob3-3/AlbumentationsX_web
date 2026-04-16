@@ -1,17 +1,17 @@
 """
 Model deployment and inference service
 """
-import time
-from pathlib import Path
-from typing import Optional, List, Dict, Any
-from loguru import logger
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
-from PIL import Image as PILImage
 import numpy as np
-
+import time
+from PIL import Image as PILImage
 from app.models import Model, Deployment, DeploymentStatus
 from app.schemas.schemas import DeploymentCreate
+from app.utils.yolo_result_parse import detections_from_ultralytics_result
+from loguru import logger
+from pathlib import Path
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from typing import Optional, List, Dict, Any
 
 # Global model cache
 _model_cache: Dict[str, Any] = {}
@@ -207,29 +207,12 @@ class DeploymentService:
         )
         inference_time = (time.time() - start_time) * 1000  # ms
 
-        # Parse results
+        # Parse results（OBB 模型使用 result.obb，boxes 可能为 None）
         detections = []
         if results and len(results) > 0:
             result = results[0]
-            if result.boxes is not None and len(result.boxes) > 0:
-                boxes = result.boxes
-                for box in boxes:
-                    # Get xyxy format (absolute coordinates)
-                    xyxy = box.xyxy[0].cpu().numpy()
-                    # Get xywhn format (normalized)
-                    xywhn = box.xywhn[0].cpu().numpy()
-
-                    cls_id = int(box.cls[0].cpu().numpy())
-                    conf_val = float(box.conf[0].cpu().numpy())
-                    class_name = yolo_model.names.get(cls_id, f"class_{cls_id}")
-
-                    detections.append({
-                        "class_id": cls_id,
-                        "class_name": class_name,
-                        "confidence": conf_val,
-                        "bbox": [float(x) for x in xyxy],  # [x1, y1, x2, y2]
-                        "bbox_normalized": [float(x) for x in xywhn],  # [x_center, y_center, w, h]
-                    })
+            w, h = image_size[0], image_size[1]
+            detections = detections_from_ultralytics_result(yolo_model, result, w, h)
 
         # Generate image with bounding boxes
         import cv2
@@ -245,22 +228,22 @@ class DeploymentService:
             elif image_np.shape[2] == 3:  # RGB
                 image_np = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
 
-        # Draw bounding boxes
+        # Draw bounding boxes（OBB 优先画旋转四边形）
         for detection in detections:
-            bbox = detection["bbox"]
-            x1, y1, x2, y2 = map(int, bbox)
             class_name = detection["class_name"]
             confidence = detection["confidence"]
+            bbox = detection["bbox"]
+            x1, y1, x2, y2 = map(int, bbox)
 
-            # Draw rectangle
-            cv2.rectangle(image_np, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            if detection.get("task") == "obb" and detection.get("obb_xyxyxyxy"):
+                pts = np.array(detection["obb_xyxyxyxy"], dtype=np.float32).reshape(-1, 2).astype(np.int32)
+                cv2.polylines(image_np, [pts], True, (0, 255, 0), 2)
+            else:
+                cv2.rectangle(image_np, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
-            # Draw label background
             label = f"{class_name}: {confidence:.2f}"
             (label_width, label_height), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
             cv2.rectangle(image_np, (x1, y1 - label_height - 10), (x1 + label_width, y1), (0, 255, 0), -1)
-
-            # Draw label text
             cv2.putText(image_np, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
 
         # Encode image to base64

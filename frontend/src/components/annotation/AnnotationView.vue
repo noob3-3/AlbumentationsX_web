@@ -87,6 +87,8 @@
         :classes="classes"
         :initialAnnotations="currentImage.annotations || []"
         :preloadedImage="currentPreloadedImage"
+        :polygon-style="polygonStyleProp"
+        :require-class-first="true"
         @save="saveAnnotations"
         @image-ready="onImageReady"
       />
@@ -126,12 +128,12 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, watch, reactive, nextTick } from 'vue'
-import { ElMessage } from 'element-plus'
-import { Delete, FolderOpened, ArrowDown } from '@element-plus/icons-vue'
+import {computed, nextTick, onMounted, reactive, ref, watch} from 'vue'
+import {ElMessage} from 'element-plus'
+import {ArrowDown, FolderOpened} from '@element-plus/icons-vue'
 import AnnotationEditor from './AnnotationEditor.vue'
 import AutoAnnotationDialog from './AutoAnnotationDialog.vue'
-import { datasetApi } from '@/api'
+import {datasetApi} from '@/api'
 
 const props = defineProps({
   datasetId: String,
@@ -149,7 +151,14 @@ const props = defineProps({
     default: () => [],
   },
   imageUrlFunc: Function,
+  /** 标注场景：obb 时默认四边形工具；其它为自由多边形 */
+  annotationMode: {
+    type: String,
+    default: '',
+  },
 })
+
+const polygonStyleProp = computed(() => (props.annotationMode === 'obb' ? 'quad' : 'free'))
 
 const emit = defineEmits(['annotationsSaved', 'imageDeleted', 'imageMoved'])
 

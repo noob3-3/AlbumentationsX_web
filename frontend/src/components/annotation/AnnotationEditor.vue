@@ -10,6 +10,31 @@
           <el-radio-button value="polygon">多边形</el-radio-button>
           <el-radio-button value="view">查看</el-radio-button>
         </el-radio-group>
+        <el-radio-group
+            v-if="selectedTool === 'polygon'"
+            v-model="polygonStyleLocal"
+            size="small"
+        >
+          <el-radio-button value="quad">四边形 (OBB)</el-radio-button>
+          <el-radio-button value="free">多边形</el-radio-button>
+        </el-radio-group>
+        <el-button
+            v-if="selectedTool === 'polygon'"
+            type="primary"
+            size="small"
+            :disabled="!canFinishPolygon"
+            @click="finishPolygon"
+        >
+          {{ polygonStyleLocal === 'quad' ? '完成四边形' : '完成多边形' }}
+        </el-button>
+        <span v-if="selectedTool === 'polygon'" class="hint-text">
+          <template v-if="polygonStyleLocal === 'quad'">
+            依次点击四个顶点（旋转框）；第 4 点自动闭合；Backspace 撤销上一点
+          </template>
+          <template v-else>
+            依次点击顶点，双击或 Enter 闭合；至少 3 点；Backspace 撤销上一点
+          </template>
+        </span>
       </div>
 
       <div class="toolbar-section">
@@ -25,6 +50,16 @@
         <el-button type="primary" @click="saveAnnotations" :loading="saving" icon="Check" size="small">保存</el-button>
       </div>
     </div>
+
+    <el-alert
+        v-if="requireClassFirst && classes.length > 0 && !selectedClass && (selectedTool === 'rect' || selectedTool === 'polygon')"
+        type="warning"
+        :closable="false"
+        show-icon
+        class="class-first-banner"
+    >
+      请先在上方选择「类别」，再绘制矩形或多边形
+    </el-alert>
 
     <!-- Canvas area -->
     <div
@@ -99,6 +134,13 @@
             <span v-else style="font-size: 12px; color: #909399">手动</span>
           </template>
         </el-table-column>
+        <el-table-column label="类型" width="96" align="center">
+          <template #default="{ row }">
+            <el-tag size="small" :type="shapeTagType(row)">
+              {{ shapeLabel(row) }}
+            </el-tag>
+          </template>
+        </el-table-column>
         <el-table-column label="位置" width="120">
           <template #default="{ row }">
             <span style="font-size: 12px; color: #909399">
@@ -124,9 +166,9 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, nextTick, watch } from 'vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
-import { Loading } from '@element-plus/icons-vue'
+import {computed, nextTick, onMounted, onUnmounted, ref, watch} from 'vue'
+import {ElMessage, ElMessageBox} from 'element-plus'
+import {Loading} from '@element-plus/icons-vue'
 import Pica from 'pica'
 
 const props = defineProps({
@@ -143,6 +185,17 @@ const props = defineProps({
   preloadedImage: {
     type: Object,
     default: null,
+  },
+  /** 绘制矩形/多边形前是否必须先选类别 */
+  requireClassFirst: {
+    type: Boolean,
+    default: true,
+  },
+  /** 多边形工具：四边形(OBB 四角) 或 自由多边形 */
+  polygonStyle: {
+    type: String,
+    default: 'free',
+    validator: (v) => ['free', 'quad'].includes(v),
   },
 })
 
@@ -170,6 +223,9 @@ function annotationsSnapshot(anns) {
     yc: Math.round((a.y_center || 0) * 100000),
     bw: Math.round((a.bbox_width || 0) * 100000),
     bh: Math.round((a.bbox_height || 0) * 100000),
+    poly: a.polygon_points?.length
+        ? a.polygon_points.map(p => [Math.round(p[0] * 1e6), Math.round(p[1] * 1e6)])
+        : null,
   })))
 }
 
@@ -201,6 +257,30 @@ const startX = ref(0)
 const startY = ref(0)
 const currentAnnotation = ref(null)
 const polygonPoints = ref([])
+/** 多边形绘制时鼠标位置（画布坐标），用于预览末边 */
+const polygonHover = ref(null)
+/** 四边形(OBB) / 自由多边形，可与父组件 polygonStyle 同步 */
+const polygonStyleLocal = ref(props.polygonStyle)
+watch(() => props.polygonStyle, (v) => {
+  polygonStyleLocal.value = v
+})
+
+const polygonMinPoints = computed(() => (polygonStyleLocal.value === 'quad' ? 4 : 3))
+const canFinishPolygon = computed(() => polygonPoints.value.length >= polygonMinPoints.value)
+
+function shapeLabel(row) {
+  const n = row.polygon_points?.length || 0
+  if (n === 4) return '四边形'
+  if (n >= 3) return '多边形'
+  return '矩形'
+}
+
+function shapeTagType(row) {
+  const n = row.polygon_points?.length || 0
+  if (n === 4) return 'success'
+  if (n >= 3) return 'warning'
+  return 'info'
+}
 
 // Editing state
 const selectedAnnotationIndex = ref(-1)
@@ -210,8 +290,24 @@ const resizeHandle = ref('') // 'tl', 'tr', 'bl', 'br', 'l', 'r', 't', 'b'
 const dragStartX = ref(0)
 const dragStartY = ref(0)
 const originalBBox = ref(null)
+/** 拖动/缩放多边形标注开始时备份 */
+const originalPolygon = ref(null)
+
+function onPolygonHotkey(e) {
+  if (selectedTool.value !== 'polygon') return
+  if (e.key === 'Enter' && polygonPoints.value.length >= polygonMinPoints.value) {
+    e.preventDefault()
+    finishPolygon()
+  }
+  if (e.key === 'Backspace' && polygonPoints.value.length > 0) {
+    e.preventDefault()
+    polygonPoints.value.pop()
+    redraw()
+  }
+}
 
 onMounted(async () => {
+  window.addEventListener('keydown', onPolygonHotkey)
   await nextTick()
   if (canvas.value) {
     ctx.value = canvas.value.getContext('2d')
@@ -221,6 +317,10 @@ onMounted(async () => {
     annotations.value = JSON.parse(JSON.stringify(props.initialAnnotations))
   }
   savedSnapshot.value = annotationsSnapshot(annotations.value)
+})
+
+onUnmounted(() => {
+  window.removeEventListener('keydown', onPolygonHotkey)
 })
 
 // Watch for image changes
@@ -389,7 +489,7 @@ function redraw() {
   // Draw annotations
   annotations.value.forEach((ann, index) => {
     const isSelected = index === selectedAnnotationIndex.value
-    drawBBox(ann, isSelected, index)
+    drawOneAnnotation(ann, isSelected, index)
   })
 
   // Draw current drawing
@@ -403,24 +503,20 @@ function redraw() {
     ctx.value.strokeRect(x, y, width, height)
   }
 
-  // Draw polygon points
+  // Draw polygon in progress
   if (selectedTool.value === 'polygon' && polygonPoints.value.length > 0) {
-    ctx.value.fillStyle = 'rgba(255, 107, 107, 0.2)'
     ctx.value.strokeStyle = '#FF6B6B'
     ctx.value.lineWidth = 2
-
-    if (polygonPoints.value.length > 1) {
-      ctx.value.beginPath()
-      ctx.value.moveTo(polygonPoints.value[0].x, polygonPoints.value[0].y)
-      for (let i = 1; i < polygonPoints.value.length; i++) {
-        ctx.value.lineTo(polygonPoints.value[i].x, polygonPoints.value[i].y)
-      }
-      ctx.value.closePath()
-      ctx.value.stroke()
-      ctx.value.fill()
+    ctx.value.beginPath()
+    ctx.value.moveTo(polygonPoints.value[0].x, polygonPoints.value[0].y)
+    for (let i = 1; i < polygonPoints.value.length; i++) {
+      ctx.value.lineTo(polygonPoints.value[i].x, polygonPoints.value[i].y)
     }
+    if (polygonHover.value && polygonPoints.value.length > 0) {
+      ctx.value.lineTo(polygonHover.value.x, polygonHover.value.y)
+    }
+    ctx.value.stroke()
 
-    // Draw points
     polygonPoints.value.forEach((pt) => {
       ctx.value.fillStyle = '#FF6B6B'
       ctx.value.beginPath()
@@ -428,6 +524,98 @@ function redraw() {
       ctx.value.fill()
     })
   }
+}
+
+function clamp01(v) {
+  return Math.max(0, Math.min(1, v))
+}
+
+function recomputeBBoxFromPolygon(ann) {
+  const pts = ann.polygon_points
+  if (!pts?.length) return
+  let minX = Infinity
+  let minY = Infinity
+  let maxX = -Infinity
+  let maxY = -Infinity
+  pts.forEach(([x, y]) => {
+    minX = Math.min(minX, x)
+    minY = Math.min(minY, y)
+    maxX = Math.max(maxX, x)
+    maxY = Math.max(maxY, y)
+  })
+  const w = maxX - minX
+  const h = maxY - minY
+  ann.x_center = (minX + maxX) / 2
+  ann.y_center = (minY + maxY) / 2
+  ann.bbox_width = w
+  ann.bbox_height = h
+}
+
+function canvasPolygonPoints(ann) {
+  if (!ann.polygon_points?.length) return []
+  return ann.polygon_points.map(([nx, ny]) => ({
+    x: nx * canvasWidth.value,
+    y: ny * canvasHeight.value,
+  }))
+}
+
+function pointInPolygonCanvas(x, y, poly) {
+  if (poly.length < 3) return false
+  let inside = false
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const xi = poly[i].x
+    const yi = poly[i].y
+    const xj = poly[j].x
+    const yj = poly[j].y
+    const intersect =
+        (yi > y) !== (yj > y) && x < ((xj - xi) * (y - yi)) / (yj - yi + 1e-12) + xi
+    if (intersect) inside = !inside
+  }
+  return inside
+}
+
+function drawOneAnnotation(annotation, isSelected = false, index = -1) {
+  if (annotation.polygon_points?.length >= 3) {
+    const pts = canvasPolygonPoints(annotation)
+    ctx.value.beginPath()
+    ctx.value.moveTo(pts[0].x, pts[0].y)
+    for (let i = 1; i < pts.length; i++) {
+      ctx.value.lineTo(pts[i].x, pts[i].y)
+    }
+    ctx.value.closePath()
+    if (isSelected) {
+      ctx.value.fillStyle = 'rgba(76, 175, 80, 0.12)'
+      ctx.value.fill()
+    }
+    ctx.value.strokeStyle = isSelected ? '#4CAF50' : '#2196F3'
+    ctx.value.lineWidth = isSelected ? 3 : 2
+    ctx.value.stroke()
+
+    const xs = pts.map(p => p.x)
+    const ys = pts.map(p => p.y)
+    const x = Math.min(...xs)
+    const y = Math.min(...ys)
+    drawAnnotationLabel(annotation, x, y, isSelected)
+    if (isSelected) {
+      const bw = Math.max(...xs) - Math.min(...xs)
+      const bh = Math.max(...ys) - Math.min(...ys)
+      drawResizeHandles(Math.min(...xs), Math.min(...ys), bw, bh)
+    }
+    return
+  }
+  drawBBox(annotation, isSelected, index)
+}
+
+function drawAnnotationLabel(annotation, x, y, isSelected) {
+  ctx.value.fillStyle = isSelected ? '#4CAF50' : '#2196F3'
+  ctx.value.font = 'bold 14px Arial'
+  const labelText = `${annotation.class_name} ${annotation.confidence ? `(${(annotation.confidence * 100).toFixed(0)}%)` : ''}`
+  const textMetrics = ctx.value.measureText(labelText)
+  const labelPadding = 4
+  const labelHeight = 20
+  ctx.value.fillRect(x, y - labelHeight, textMetrics.width + labelPadding * 2, labelHeight)
+  ctx.value.fillStyle = 'white'
+  ctx.value.fillText(labelText, x + labelPadding, y - 5)
 }
 
 function drawBBox(annotation, isSelected = false, index = -1) {
@@ -447,20 +635,7 @@ function drawBBox(annotation, isSelected = false, index = -1) {
   ctx.value.lineWidth = isSelected ? 3 : 2
   ctx.value.strokeRect(x, y, width, height)
 
-  // Draw class label
-  ctx.value.fillStyle = isSelected ? '#4CAF50' : '#2196F3'
-  ctx.value.font = 'bold 14px Arial'
-  const labelText = `${annotation.class_name} ${annotation.confidence ? `(${(annotation.confidence * 100).toFixed(0)}%)` : ''}`
-  const textMetrics = ctx.value.measureText(labelText)
-  const labelPadding = 4
-  const labelHeight = 20
-
-  // Draw label background
-  ctx.value.fillRect(x, y - labelHeight, textMetrics.width + labelPadding * 2, labelHeight)
-
-  // Draw label text
-  ctx.value.fillStyle = 'white'
-  ctx.value.fillText(labelText, x + labelPadding, y - 5)
+  drawAnnotationLabel(annotation, x, y, isSelected)
 
   // Draw resize handles if selected
   if (isSelected) {
@@ -518,6 +693,10 @@ function onCanvasMouseDown(e) {
         resizeHandle.value = handle
         const ann = annotations.value[selectedAnnotationIndex.value]
         originalBBox.value = { ...ann }
+        originalPolygon.value =
+            ann.polygon_points?.length >= 3
+                ? JSON.parse(JSON.stringify(ann.polygon_points))
+                : null
         dragStartX.value = coords.x
         dragStartY.value = coords.y
         return
@@ -531,6 +710,10 @@ function onCanvasMouseDown(e) {
       isDragging.value = true
       const ann = annotations.value[clickedIndex]
       originalBBox.value = { ...ann }
+      originalPolygon.value =
+          ann.polygon_points?.length >= 3
+              ? JSON.parse(JSON.stringify(ann.polygon_points))
+              : null
       dragStartX.value = coords.x
       dragStartY.value = coords.y
       redraw()
@@ -546,11 +729,24 @@ function onCanvasMouseDown(e) {
   // Drawing mode
   if (selectedTool.value === 'view') return
 
+  if (
+      props.requireClassFirst &&
+      props.classes?.length > 0 &&
+      !selectedClass.value &&
+      (selectedTool.value === 'rect' || selectedTool.value === 'polygon')
+  ) {
+    ElMessage.warning('请先在上方的「类别」中选择分类，再开始绘制')
+    return
+  }
+
   isDrawing.value = true
 
   if (selectedTool.value === 'polygon') {
     polygonPoints.value.push({ x: coords.x, y: coords.y })
     redraw()
+    if (polygonStyleLocal.value === 'quad' && polygonPoints.value.length === 4) {
+      finishPolygon()
+    }
   } else if (selectedTool.value === 'rect') {
     currentAnnotation.value = { x: coords.x, y: coords.y }
   }
@@ -560,6 +756,11 @@ function onCanvasMouseMove(e) {
   if (!imageLoaded.value) return
 
   const coords = getCanvasCoordinates(e)
+
+  if (selectedTool.value === 'polygon' && polygonPoints.value.length > 0) {
+    polygonHover.value = {x: coords.x, y: coords.y}
+    redraw()
+  }
 
   // Update cursor based on context
   updateCursor(coords.x, coords.y)
@@ -596,6 +797,7 @@ function onCanvasMouseUp() {
     isDragging.value = false
     resizeHandle.value = ''
     originalBBox.value = null
+    originalPolygon.value = null
     // Save to history
     if (selectedAnnotationIndex.value >= 0) {
       annotationHistory.value.push(JSON.stringify(annotations.value))
@@ -638,6 +840,7 @@ function onCanvasMouseUp() {
     bbox_width: width / canvasWidth.value,
     bbox_height: height / canvasHeight.value,
     confidence: 1.0,
+    polygon_points: null,
   }
 
   annotationHistory.value.push(JSON.stringify(annotations.value))
@@ -651,6 +854,13 @@ function getAnnotationAtPoint(x, y) {
   // Check from last to first (top to bottom)
   for (let i = annotations.value.length - 1; i >= 0; i--) {
     const ann = annotations.value[i]
+    if (ann.polygon_points?.length >= 3) {
+      const poly = canvasPolygonPoints(ann)
+      if (pointInPolygonCanvas(x, y, poly)) {
+        return i
+      }
+      continue
+    }
     const bx = ann.x_center * canvasWidth.value - (ann.bbox_width * canvasWidth.value) / 2
     const by = ann.y_center * canvasHeight.value - (ann.bbox_height * canvasHeight.value) / 2
     const bw = ann.bbox_width * canvasWidth.value
@@ -667,10 +877,24 @@ function getResizeHandle(x, y) {
   if (selectedAnnotationIndex.value < 0) return null
 
   const ann = annotations.value[selectedAnnotationIndex.value]
-  const bx = ann.x_center * canvasWidth.value - (ann.bbox_width * canvasWidth.value) / 2
-  const by = ann.y_center * canvasHeight.value - (ann.bbox_height * canvasHeight.value) / 2
-  const bw = ann.bbox_width * canvasWidth.value
-  const bh = ann.bbox_height * canvasHeight.value
+  let bx
+  let by
+  let bw
+  let bh
+  if (ann.polygon_points?.length >= 3) {
+    const pts = canvasPolygonPoints(ann)
+    const xs = pts.map(p => p.x)
+    const ys = pts.map(p => p.y)
+    bx = Math.min(...xs)
+    by = Math.min(...ys)
+    bw = Math.max(...xs) - bx
+    bh = Math.max(...ys) - by
+  } else {
+    bx = ann.x_center * canvasWidth.value - (ann.bbox_width * canvasWidth.value) / 2
+    by = ann.y_center * canvasHeight.value - (ann.bbox_height * canvasHeight.value) / 2
+    bw = ann.bbox_width * canvasWidth.value
+    bh = ann.bbox_height * canvasHeight.value
+  }
 
   const handleSize = 8
   const threshold = handleSize
@@ -699,6 +923,14 @@ function getResizeHandle(x, y) {
 
 function moveAnnotation(index, dx, dy) {
   const ann = annotations.value[index]
+  if (originalPolygon.value?.length >= 3) {
+    ann.polygon_points = originalPolygon.value.map(([px, py]) => [
+      clamp01(px + dx / canvasWidth.value),
+      clamp01(py + dy / canvasHeight.value),
+    ])
+    recomputeBBoxFromPolygon(ann)
+    return
+  }
   const newCenterX = originalBBox.value.x_center + dx / canvasWidth.value
   const newCenterY = originalBBox.value.y_center + dy / canvasHeight.value
 
@@ -757,6 +989,22 @@ function resizeAnnotation(index, dx, dy) {
   // Clamp to canvas
   ann.x_center = Math.max(ann.bbox_width / 2, Math.min(1 - ann.bbox_width / 2, ann.x_center))
   ann.y_center = Math.max(ann.bbox_height / 2, Math.min(1 - ann.bbox_height / 2, ann.y_center))
+
+  if (originalPolygon.value?.length >= 3) {
+    const ob = originalBBox.value
+    const oldX1 = ob.x_center - ob.bbox_width / 2
+    const oldY1 = ob.y_center - ob.bbox_height / 2
+    const newX1 = ann.x_center - ann.bbox_width / 2
+    const newY1 = ann.y_center - ann.bbox_height / 2
+    ann.polygon_points = originalPolygon.value.map(([px, py]) => {
+      const rx = (px - oldX1) / ob.bbox_width
+      const ry = (py - oldY1) / ob.bbox_height
+      return [
+        clamp01(newX1 + rx * ann.bbox_width),
+        clamp01(newY1 + ry * ann.bbox_height),
+      ]
+    })
+  }
 }
 
 function updateCursor(x, y) {
@@ -788,7 +1036,7 @@ function onCanvasClick(e) {
   if (!imageLoaded.value) return
 
   // Polygon mode: double click to finish
-  if (selectedTool.value === 'polygon' && e.detail === 2 && polygonPoints.value.length >= 3) {
+  if (selectedTool.value === 'polygon' && e.detail === 2 && polygonPoints.value.length >= polygonMinPoints.value) {
     finishPolygon()
     return
   }
@@ -824,21 +1072,34 @@ async function editAnnotationClass(index) {
 }
 
 function finishPolygon() {
-  if (!selectedClass.value || polygonPoints.value.length < 3) {
-    ElMessage.warning('需要至少3个点来绘制多边形')
+  if (!selectedClass.value) {
+    ElMessage.warning('请先选择类别')
+    return
+  }
+  const minPts = polygonMinPoints.value
+  if (polygonPoints.value.length < minPts) {
+    ElMessage.warning(
+        polygonStyleLocal.value === 'quad'
+            ? '四边形需要恰好 4 个顶点'
+            : '需要至少 3 个点来绘制多边形'
+    )
     return
   }
 
-  // 计算边界框
-  let minX = Infinity,
-    minY = Infinity,
-    maxX = -Infinity,
-    maxY = -Infinity
-  polygonPoints.value.forEach((pt) => {
-    minX = Math.min(minX, pt.x)
-    minY = Math.min(minY, pt.y)
-    maxX = Math.max(maxX, pt.x)
-    maxY = Math.max(maxY, pt.y)
+  const polyNorm = polygonPoints.value.map((pt) => [
+    pt.x / canvasWidth.value,
+    pt.y / canvasHeight.value,
+  ])
+
+  let minX = Infinity
+  let minY = Infinity
+  let maxX = -Infinity
+  let maxY = -Infinity
+  polyNorm.forEach(([nx, ny]) => {
+    minX = Math.min(minX, nx)
+    minY = Math.min(minY, ny)
+    maxX = Math.max(maxX, nx)
+    maxY = Math.max(maxY, ny)
   })
 
   const width = maxX - minX
@@ -847,22 +1108,27 @@ function finishPolygon() {
   const ann = {
     class_id: props.classes.indexOf(selectedClass.value),
     class_name: selectedClass.value,
-    x_center: (minX + width / 2) / canvasWidth.value,
-    y_center: (minY + height / 2) / canvasHeight.value,
-    bbox_width: width / canvasWidth.value,
-    bbox_height: height / canvasHeight.value,
+    x_center: (minX + width / 2),
+    y_center: (minY + height / 2),
+    bbox_width: width,
+    bbox_height: height,
     confidence: 1.0,
+    polygon_points: polyNorm,
   }
 
   annotationHistory.value.push(JSON.stringify(annotations.value))
   annotations.value.push(ann)
   polygonPoints.value = []
+  polygonHover.value = null
   redraw()
 }
 
 function onCanvasMouseLeave() {
   if (selectedTool.value === 'rect' && isDrawing.value) {
     isDrawing.value = false
+  }
+  if (selectedTool.value === 'polygon') {
+    polygonHover.value = null
   }
   redraw()
 }
@@ -933,7 +1199,9 @@ async function saveAnnotations() {
 }
 
 function toolChanged() {
+  polygonStyleLocal.value = props.polygonStyle
   polygonPoints.value = []
+  polygonHover.value = null
   currentAnnotation.value = null
   selectedAnnotationIndex.value = -1
   isDragging.value = false
@@ -970,6 +1238,11 @@ defineExpose({
   overflow: hidden;
 }
 
+.class-first-banner {
+  margin: 0 12px 8px;
+  flex-shrink: 0;
+}
+
 .editor-toolbar {
   display: flex;
   align-items: center;
@@ -990,6 +1263,13 @@ defineExpose({
   font-weight: 500;
   color: #606266;
   min-width: 50px;
+}
+
+.hint-text {
+  font-size: 12px;
+  color: #909399;
+  max-width: 320px;
+  line-height: 1.4;
 }
 
 .canvas-container {

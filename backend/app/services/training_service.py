@@ -4,6 +4,7 @@ Training service using Ultralytics YOLO
 import asyncio
 import os
 import shutil
+import socket
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal, create_background_session_maker
 from app.core.websocket import ws_manager
@@ -11,20 +12,265 @@ from app.models import Dataset, Image, Annotation, TrainingJob, Model, JobStatus
 from app.schemas.schemas import TrainingJobCreate
 from app.services.pretrained_model_service import PretrainedModelService
 from app.services.webhook_service import webhook_service
-from app.utils import build_yolo_dataset_yaml, write_yolo_annotation
+from app.utils import build_yolo_dataset_yaml, write_yolo_annotation, YOLOV8_POSE_NUM_KEYPOINTS
 from datetime import datetime, timedelta
 from loguru import logger
 from pathlib import Path
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
 
 AVAILABLE_MODELS = [
+    # YOLO11 检测
     "yolo11n.pt", "yolo11s.pt", "yolo11m.pt", "yolo11l.pt", "yolo11x.pt",
+    # YOLO11 OBB / 姿态（官方文件名：yolo11n-obb / yolo11n-pose，勿写成 yolov11n-*）
+    "yolo11n-obb.pt", "yolo11n-pose.pt",
+    # YOLOv8 检测
     "yolov8n.pt", "yolov8s.pt", "yolov8m.pt", "yolov8l.pt", "yolov8x.pt",
+    # YOLOv8 OBB / 姿态
+    "yolov8n-obb.pt", "yolov8n-pose.pt",
+    # 其它
     "yolo11n-det.pt", "yolo11s-det.pt",
 ]
+
+
+def _yolo_train_image_suffixes() -> frozenset:
+    """与 Ultralytics get_img_files 支持的图片后缀对齐（用于导出目录校验）。统一为小写，避免版本差异导致计数为 0。"""
+    fallback = frozenset({
+        ".bmp", ".jpg", ".jpeg", ".jp2", ".j2k", ".png", ".tif", ".tiff", ".webp",
+        ".heic", ".heif", ".avif", ".dng", ".mpo", ".gif",
+    })
+    try:
+        from ultralytics.data.base import IMG_FORMATS
+
+        extra: set = set()
+        for x in IMG_FORMATS:
+            s = str(x).strip().lower()
+            if not s or s.startswith("*"):
+                continue
+            if not s.startswith("."):
+                s = "." + s
+            extra.add(s)
+        return frozenset(fallback | extra)
+    except Exception:
+        return fallback
+
+
+def _log_dataset_storage_diagnostics(dataset: Dataset) -> None:
+    """找不到源文件时打印存储目录是否存在，便于排查 Docker 空目录挂载等问题。"""
+    logger.error("—— 数据集存储诊断 dataset_id={} hostname={} ——", dataset.id, socket.gethostname())
+    sp = dataset.storage_path
+    logger.error("  dataset.storage_path={}", sp)
+    if sp:
+        p = Path(str(sp).replace("\\", "/"))
+        logger.error("  storage_path.exists={} is_dir={}", p.exists(), p.is_dir() if p.exists() else None)
+        for sub in ("images", "thumbnails", "labels"):
+            subp = p / sub
+            n = -1
+            if subp.is_dir():
+                try:
+                    n = len(list(subp.iterdir()))
+                except OSError as e:
+                    n = -2
+                    logger.error("  列出 {} 失败: {}", subp, e)
+            logger.error("  {}/ exists={} 条目数={}", sub, subp.exists(), n)
+
+    root = settings.DATASET_DIR
+    logger.error("  DATASET_DIR={} exists={}", root, root.exists())
+    if root.exists() and root.is_dir():
+        try:
+            names = [x.name for x in root.iterdir()]
+            logger.error("  DATASET_DIR 下子目录/文件(最多40): {}", names[:40])
+            if dataset.id and names and dataset.id not in names:
+                logger.error(
+                    "  【常见原因】数据库中的数据集目录在磁盘上不存在：若 compose 将「空的」宿主机目录挂载到 "
+                    "/app/data/datasets 或 static-file 的空目录挂载会覆盖容器内原有上传文件。"
+                    "请确认 compose 中 ./data/datasets 与 DATASET_DIR 一致，或重新上传图片。"
+                )
+        except OSError as e:
+            logger.error("  列出 DATASET_DIR 失败: {}", e)
+
+    logger.error("  DATA_DIR={} exists={}", settings.DATA_DIR, settings.DATA_DIR.exists())
+
+
+def _find_image_in_dir_case_insensitive(images_dir: Path, filename: str) -> Optional[Path]:
+    """Linux 区分大小写时，DB 中文件名与实际磁盘不一致（如 .JPG vs .jpg）时仍能找到文件。"""
+    if not filename or not images_dir.is_dir():
+        return None
+    direct = images_dir / filename
+    if direct.is_file():
+        return direct
+    fn_low = filename.lower()
+    try:
+        for p in images_dir.iterdir():
+            if p.is_file() and p.name.lower() == fn_low:
+                return p
+    except OSError as e:
+        logger.debug("list images dir failed {}: {}", images_dir, e)
+    return None
+
+
+def _resolve_training_image_path(img: Image, dataset: Dataset) -> Tuple[Optional[Path], List[str]]:
+    """
+    解析训练导出时要复制的源图片路径。
+    DB 中的 file_path 在 Docker / 跨机迁移 / Windows→Linux 后常失效；按多种规则回退。
+    """
+    name = (img.filename or "").strip()
+    candidates: List[Path] = []
+    seen: set = set()
+
+    def add(p: Optional[Path]) -> None:
+        if p is None:
+            return
+        try:
+            q = Path(str(p).replace("\\", "/"))
+        except Exception:
+            return
+        key = str(q)
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append(q)
+
+    # ── file_path：原样、相对路径、以及从任意盘符路径中截取 data/static-file 或 data/datasets 后缀 ──
+    if img.file_path:
+        norm = str(img.file_path).replace("\\", "/").strip()
+        fp = Path(norm)
+        add(fp)
+        if not fp.is_absolute():
+            add(settings.BASE_DIR / fp)
+            add(settings.DATA_DIR / fp)
+            add(Path.cwd() / fp)
+        # 迁移库常见：Windows 全路径或含重复前缀，截取从 data/static-file 或 data/datasets 起的一段拼到当前 BASE_DIR
+        norm_lower = norm.lower()
+        for anchor in ("data/static-file/", "data/datasets/", "data/augmented/"):
+            pos = norm_lower.find(anchor)
+            if pos >= 0:
+                tail = norm[pos:]
+                add(settings.BASE_DIR / tail)
+        # 相对路径且以 static-file/ 开头（缺省 data/ 前缀）
+        rel = norm.lstrip("/")
+        if not fp.is_absolute() and rel.lower().startswith("static-file/"):
+            add(settings.DATA_DIR / rel)
+
+    # ── storage_path：可能是相对路径（相对仓库 data 或工作目录）──
+    if dataset.storage_path:
+        sp_raw = str(dataset.storage_path).replace("\\", "/").strip()
+        sp = Path(sp_raw)
+        if name:
+            if sp.is_absolute():
+                add(sp / "images" / name)
+                if not (sp / "images" / name).is_file():
+                    ci = _find_image_in_dir_case_insensitive(sp / "images", name)
+                    if ci is not None:
+                        add(ci)
+            else:
+                for base in (settings.BASE_DIR, settings.DATA_DIR, Path.cwd()):
+                    add((base / sp / "images" / name).resolve(strict=False))
+                # sp 形如 static-file/<uuid> 而 BASE_DIR 下已有 data 目录
+                if not str(sp).startswith("data/"):
+                    add((settings.DATA_DIR / sp / "images" / name).resolve(strict=False))
+
+    # ── 标准数据集目录（与创建数据集时 DATASET_DIR / id 一致）──
+    if name:
+        sid_dir = settings.DATASET_DIR / dataset.id / "images"
+        p_sid = sid_dir / name
+        add(p_sid)
+        if not p_sid.is_file():
+            ci2 = _find_image_in_dir_case_insensitive(sid_dir, name)
+            if ci2 is not None:
+                add(ci2)
+        add(settings.DATA_DIR / "datasets" / dataset.id / "images" / name)
+        ddir = settings.DATA_DIR / "datasets" / dataset.id / "images"
+        if not (ddir / name).is_file():
+            ci3 = _find_image_in_dir_case_insensitive(ddir, name)
+            if ci3 is not None:
+                add(ci3)
+
+    if not candidates:
+        logger.warning(
+            "训练导出源图无候选路径（请检查 DB 中 file_path、filename、dataset.storage_path）: "
+            "image_id={} filename={} file_path={} storage_path={}",
+            img.id,
+            name or "(空)",
+            img.file_path,
+            dataset.storage_path,
+        )
+        return None, []
+
+    tried: List[str] = []
+    tried_detail: List[str] = []
+    for i, p in enumerate(candidates, start=1):
+        tried.append(str(p))
+        try:
+            rp = p.resolve(strict=False)
+        except Exception as ex:
+            rp = p
+            tried_detail.append(f"[{i}] {p} | resolve_err={ex}")
+            continue
+        exists = rp.exists()
+        is_f = rp.is_file() if exists else False
+        par = rp.parent
+        par_ok = par.exists()
+        par_is_dir = par.is_dir() if par_ok else False
+        tried_detail.append(
+            f"[{i}] {rp} | exists={exists} is_file={is_f} parent={par} parent_exists={par_ok} parent_is_dir={par_is_dir}"
+        )
+        if is_f:
+            logger.info(
+                "训练导出源图解析成功: image_id={} filename={} -> {} (第 {}/{} 个候选)",
+                img.id,
+                name or "(空)",
+                rp,
+                i,
+                len(candidates),
+            )
+            return rp, tried
+
+    raw_fp = Path(str(img.file_path).replace("\\", "/")) if img.file_path else None
+    raw_exists = raw_fp.is_file() if raw_fp else False
+    th_fp = Path(str(img.thumbnail_path).replace("\\", "/")) if img.thumbnail_path else None
+    th_exists = th_fp.is_file() if th_fp else False
+    logger.warning(
+        "训练导出源图解析失败: image_id={} dataset_id={} filename={}\n"
+        "  db.file_path={}\n"
+        "  dataset.storage_path={}\n"
+        "  【与标注 API 对齐】/datasets/files/image 仅使用 db 路径直读磁盘: file_path.exists={} thumbnail_path.exists={}\n"
+        "    （若此前标注能看图而此处 file_path.exists=False，多为旧版 304 未校验磁盘导致浏览器缓存假象；已修复）\n"
+        "  BASE_DIR={} DATA_DIR={} DATASET_DIR={} cwd={} hostname={}\n"
+        "  共 {} 个候选路径:\n  {}",
+        img.id,
+        dataset.id,
+        name or "(空)",
+        img.file_path,
+        dataset.storage_path,
+        raw_exists,
+        th_exists,
+        settings.BASE_DIR,
+        settings.DATA_DIR,
+        settings.DATASET_DIR,
+        Path.cwd(),
+        socket.gethostname(),
+        len(candidates),
+        "\n  ".join(tried_detail) if tried_detail else "(无候选)",
+    )
+    return None, tried
+
+
+def infer_ultralytics_task_from_model_name(model_name: str) -> str:
+    """
+    从权重文件名推断 Ultralytics 任务类型，用于与平台标注能力匹配校验。
+    返回: detect | pose | obb | segment
+    """
+    m = (model_name or "").lower()
+    if "-pose" in m:
+        return "pose"
+    if "-obb" in m:
+        return "obb"
+    if "-seg" in m:
+        return "segment"
+    return "detect"
 
 
 def _patch_nms_max_time_img(seconds_per_img: float = 2.0):
@@ -322,6 +568,11 @@ class TrainingService:
                 f"Cannot train without labeled data. Please add annotations to at least some images."
             )
 
+        is_pose = bool(job.model_name and "-pose" in job.model_name.lower())
+        is_obb = bool(job.model_name and "-obb" in job.model_name.lower())
+        if is_pose and is_obb:
+            is_obb = False
+
         # 警告：增强数据未标注
         if use_augmented and len(augmented_without_annotations) > 0:
             warning_msg = (
@@ -388,11 +639,30 @@ class TrainingService:
                 "message": f"使用独立验证集: 训练 {len(train_images)} 张，验证 {len(val_images)} 张（来自 {val_dataset.name}）",
             })
         else:
-            # 按比例从训练集划分
+            # 按比例从训练集划分（保证 val 非空，避免导出后 images/val 为空或 Ultralytics 异常）
             val_split = min(job.val_split, 0.9)  # Cap at 90% validation max
-            train_count = max(1, int(len(all_images) * (1 - val_split)))
+            n = len(all_images)
+            train_count = max(1, int(n * (1 - val_split)))
+            if train_count >= n and n > 1:
+                train_count = n - 1
             train_images = all_images[:train_count]
             val_images = all_images[train_count:]
+            if not val_images:
+                if n == 1:
+                    val_images = list(all_images)
+                    logger.info(
+                        "Dataset split: 仅 1 张已标注图片，train/val 使用同一张以避免验证集为空"
+                    )
+                elif len(train_images) > 1:
+                    val_images = [train_images.pop()]
+                    logger.info(
+                        "Dataset split: 验证集为空，已从训练集自动挪 1 张到验证集"
+                    )
+                else:
+                    val_images = list(all_images)
+                    logger.info(
+                        "Dataset split: 验证集仍为空，train/val 使用相同图片集"
+                    )
 
             logger.info(
                 f"Dataset split: {len(train_images)} training, {len(val_images)} validation "
@@ -418,15 +688,40 @@ class TrainingService:
                     else:
                         logger.warning(f"Validation dataset has class '{name}' not in training dataset, such annotations will be skipped")
 
+        logger.info(
+            "训练导出环境: job_id={} dataset_id={} BASE_DIR={} DATA_DIR={} DATASET_DIR={} EXPORT_DIR={} "
+            "dataset.storage_path={} cwd={} hostname={}",
+            job.id,
+            dataset.id,
+            settings.BASE_DIR,
+            settings.DATA_DIR,
+            settings.DATASET_DIR,
+            settings.EXPORT_DIR,
+            dataset.storage_path,
+            Path.cwd(),
+            socket.gethostname(),
+        )
+
+        missing_src_count = 0
         for split_name, split_images in [("train", train_images), ("val", val_images)]:
             is_val_from_separate = split_name == "val" and use_validation_dataset
             for img in split_images:
-                # Copy image
-                src = Path(img.file_path)
-                if not src.exists():
+                src, tried_paths = _resolve_training_image_path(img, dataset)
+                if src is None:
+                    missing_src_count += 1
+                    # 详情已在 _resolve_training_image_path 中打印 WARNING（含每路径 exists/parent）
                     continue
-                dst_img = output_dir / "images" / split_name / img.filename
+                # 导出文件名与磁盘上一致（避免 DB 中 filename 为空或与实际大小写不一致导致 YOLO 不识别）
+                dst_name = (img.filename or "").strip() or src.name
+                dst_img = output_dir / "images" / split_name / dst_name
                 shutil.copy2(str(src), str(dst_img))
+                logger.debug(
+                    "训练导出复制: split={} image_id={} {} -> {}",
+                    split_name,
+                    img.id,
+                    src,
+                    dst_img,
+                )
 
                 # Write annotations
                 anns_result = await db.execute(
@@ -449,11 +744,14 @@ class TrainingService:
                             train_cid = a.class_id
                         else:
                             continue
-                        mapped_anns.append({
+                        m = {
                             "class_id": train_cid,
                             "x_center": a.x_center, "y_center": a.y_center,
                             "bbox_width": a.bbox_width, "bbox_height": a.bbox_height,
-                        })
+                        }
+                        if getattr(a, "polygon_points", None):
+                            m["polygon_points"] = a.polygon_points
+                        mapped_anns.append(m)
                     ann_list = mapped_anns
                 else:
                     ann_list = [
@@ -463,13 +761,20 @@ class TrainingService:
                             "y_center": a.y_center,
                             "bbox_width": a.bbox_width,
                             "bbox_height": a.bbox_height,
+                            **({"polygon_points": a.polygon_points} if getattr(a, "polygon_points", None) else {}),
                         }
                         for a in anns
                     ]
 
-                label_filename = Path(img.filename).stem + ".txt"
+                label_filename = Path(dst_name).stem + ".txt"
                 label_path = output_dir / "labels" / split_name / label_filename
-                write_yolo_annotation(str(label_path), ann_list)
+                write_yolo_annotation(
+                    str(label_path),
+                    ann_list,
+                    pose=is_pose,
+                    obb=is_obb,
+                    num_keypoints=YOLOV8_POSE_NUM_KEYPOINTS,
+                )
 
         # Build dataset.yaml
         classes = dataset.classes or []
@@ -500,12 +805,69 @@ class TrainingService:
             else:
                 raise ValueError("Dataset has no classes and no annotations found. Cannot start training.")
 
+        # task 由 model.train(task=...) 传入更可靠；yaml 内 task 部分版本与 OBB 数据加载器不兼容
         yaml_path = build_yolo_dataset_yaml(
             dataset_dir=str(output_dir),
             classes=classes,
             train_path="images/train",
             val_path="images/val",
+            kpt_shape=[YOLOV8_POSE_NUM_KEYPOINTS, 3] if is_pose else None,
+            task=None,
         )
+
+        if missing_src_count:
+            logger.error(
+                "训练导出共有 {} 张图片在服务器上找不到源文件。",
+                missing_src_count,
+            )
+            _log_dataset_storage_diagnostics(dataset)
+
+        _train_img_dir = output_dir / "images" / "train"
+        _val_img_dir = output_dir / "images" / "val"
+        _img_ext = _yolo_train_image_suffixes()
+
+        def _count_images(split_dir: Path) -> int:
+            if not split_dir.is_dir():
+                return 0
+            return sum(
+                1 for p in split_dir.iterdir()
+                if p.suffix.lower() in _img_ext and p.is_file()
+            )
+
+        _nt, _nv = _count_images(_train_img_dir), _count_images(_val_img_dir)
+        logger.info(
+            "训练导出目录校验: job_id={} output_dir={} images/train 有效图={} images/val 有效图={} "
+            "missing_src={} YOLO后缀规则数量={}",
+            job.id,
+            output_dir,
+            _nt,
+            _nv,
+            missing_src_count,
+            len(_img_ext),
+        )
+        if _nt == 0:
+            dbg_files = ""
+            if _train_img_dir.is_dir():
+                found = [p for p in _train_img_dir.iterdir() if p.is_file()]
+                if found:
+                    dbg_files = (
+                        " 目录内已有文件但后缀未匹配 YOLO 图片列表，请检查扩展名；"
+                        f"示例: {[p.name for p in found[:8]]}"
+                    )
+                elif missing_src_count > 0:
+                    dbg_files = f" 本次导出因找不到源文件已跳过 {missing_src_count} 张图。"
+            raise ValueError(
+                "导出后 images/train 下没有有效图片。"
+                "若 parent_exists=False：容器内无该路径。请确认 DATASET_DIR 与 compose 挂载一致（默认 data/datasets），"
+                "且宿主机 ./data/datasets/<数据集ID>/images 下有图片。旧库若仍指向 static-file，请把文件迁到 datasets 下同名 UUID 或新建数据集重传。"
+                "（.bmp 等格式在支持列表内，问题通常是文件路径/挂载而非扩展名。）"
+                + dbg_files
+            )
+        if _nv == 0:
+            raise ValueError(
+                "验证集为空（images/val 无图片）。请增加数据、减小 val_split，或关闭独立验证集。"
+            )
+
         data_stats = {
             "total_images": len(all_images),
             "train_images": len(train_images),
@@ -696,8 +1058,8 @@ async def _execute_training(db: AsyncSession, job_id: str, main_loop):
                 logger.info(f"Using pretrained model from: {initial_model}")
             except Exception as e:
                 logger.warning(f"Failed to locate pretrained model locally, will let Ultralytics download: {e}")
-                # 如果获取失败，仍然使用原始模型名，让Ultralytics自己处理
-                initial_model = job.model_name
+                # 使用官方文件名（含 yolov11n-* -> yolo11n-* 别名），避免无效相对路径
+                initial_model = PretrainedModelService.resolve_model_filename(job.model_name)
 
     # 供前端展示：任务配置名 vs 实际加载的权重
     _im_str = str(initial_model)
@@ -1003,6 +1365,8 @@ async def _execute_training(db: AsyncSession, job_id: str, main_loop):
             'use_validation_dataset', 'validation_dataset_id',  # 数据集准备阶段已消费，非 train() 参数
             'resume',  # 始终由我们显式设为 False，避免 extra_params 覆盖
             'amp',    # 继续训练时设为 False 避免 check_amp 下载
+            'task',  # 由模型类型与下方逻辑显式设置（OBB/pose）
+            'overlap_mask',  # 非分割任务须关闭，见下方
             'patience', 'save_period', 'enable_webhook', 'workers',
             # 新增的 YOLO 参数已在 train_args 中直接设置
             'imgsz', 'augment', 'hsv_h', 'hsv_s', 'hsv_v',
@@ -1010,12 +1374,21 @@ async def _execute_training(db: AsyncSession, job_id: str, main_loop):
             'flipud', 'fliplr', 'mosaic', 'mixup',
             'dropout', 'weight_decay', 'lrf', 'warmup_epochs',
             'box', 'cls', 'dfl',
-            'close_mosaic', 'overlap_mask', 'single_cls', 'nbs',
+            'close_mosaic', 'single_cls', 'nbs',
             'save', 'val',
         }
         for key, value in job.extra_params.items():
             if key not in skip_keys:
                 train_args[key] = value
+
+    # OBB / 姿态：显式 task；overlap_mask 仅分割有效，否则易在加载 OBB 数据时报错
+    _ul_task = infer_ultralytics_task_from_model_name(job.model_name)
+    if _ul_task == "obb":
+        train_args["task"] = "obb"
+    elif _ul_task == "pose":
+        train_args["task"] = "pose"
+    if _ul_task != "segment":
+        train_args["overlap_mask"] = False
 
     # 打印最终训练参数，便于排查
     log_args = {k: v for k, v in train_args.items() if k not in ['data', 'project']}

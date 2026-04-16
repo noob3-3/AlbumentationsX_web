@@ -75,12 +75,23 @@
           </template>
         </el-alert>
 
-        <el-form :model="labelUploadForm" label-width="100px" style="max-width: 600px">
+        <el-form :model="labelUploadForm" label-width="120px" style="max-width: 640px">
           <el-form-item label="目标数据集" required>
             <el-select v-model="labelUploadForm.datasetId" placeholder="选择数据集" style="width:100%">
               <el-option v-for="d in datasets" :key="d.id" :label="d.name" :value="d.id" />
             </el-select>
             <el-button link style="margin-left:8px" @click="goToCreateDataset">+ 新建数据集</el-button>
+          </el-form-item>
+          <el-form-item label="标签格式">
+            <el-radio-group v-model="labelUploadForm.labelFormat">
+              <el-radio label="auto">自动识别</el-radio>
+              <el-radio label="detect">水平框 (cx,cy,w,h)</el-radio>
+              <el-radio label="obb">旋转框 / OBB（至少 3 个顶点或标准四角）</el-radio>
+            </el-radio-group>
+            <div style="margin-top:6px;color:#909399;font-size:12px;line-height:1.5">
+              OBB 与 Ultralytics 一致：常见为每行 <code>class + 8 个数</code>（四角）；
+              也支持 <strong>至少 3 个顶点</strong>（<code>class + 6 个数</code> 起，三角形及以上），将用最小外接矩形得到四角再导出训练。
+            </div>
           </el-form-item>
         </el-form>
 
@@ -273,14 +284,14 @@ https://example.com/image2.png"
 </template>
 
 <script setup>
-import { ref, computed, onMounted, watch } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
-import { UploadFilled, Document } from '@element-plus/icons-vue'
-import { datasetApi } from '@/api'
-import { useDatasetStore } from '@/stores/dataset'
-import { useProjectStore } from '@/stores/project'
-import { storeToRefs } from 'pinia'
+import {computed, onMounted, ref, watch} from 'vue'
+import {useRoute, useRouter} from 'vue-router'
+import {ElMessage} from 'element-plus'
+import {Document, UploadFilled} from '@element-plus/icons-vue'
+import {datasetApi} from '@/api'
+import {useDatasetStore} from '@/stores/dataset'
+import {useProjectStore} from '@/stores/project'
+import {storeToRefs} from 'pinia'
 
 const route = useRoute()
 const router = useRouter()
@@ -311,7 +322,7 @@ const labelUploadResult = ref(null)
 
 const uploadForm = ref({ datasetId: route.query.dataset || '' })
 const urlForm = ref({ datasetId: route.query.dataset || '', urlText: '' })
-const labelUploadForm = ref({ datasetId: route.query.dataset || '' })
+const labelUploadForm = ref({datasetId: route.query.dataset || '', labelFormat: 'auto'})
 
 const urlList = computed(() =>
   urlForm.value.urlText
@@ -446,11 +457,13 @@ async function startLabelUpload() {
       formData,
       (e) => {
         labelUploadProgress.value = Math.round((e.loaded / e.total) * 100)
-      }
+      },
+        labelUploadForm.value.labelFormat || 'auto',
     )
 
     labelUploadResult.value = res
-    ElMessage.success(`成功上传 ${res.uploaded} 张图片，共 ${res.total_annotations} 个标注`)
+    ElMessage.success(`成功上传 ${res.uploaded} 张图片，共 ${res.total_annotations} 个标注；类别已写入数据集并绑定到标注`)
+    await store.fetchDatasets()
 
     // Clear after successful upload
     clearLabelUpload()

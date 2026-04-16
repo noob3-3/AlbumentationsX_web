@@ -175,6 +175,9 @@ services:
       - YOLO_VERBOSE=True
       # 禁止 Ultralytics 自动联网下载模型/检查更新（国内服务器访问 GitHub 极慢会导致训练卡住）
       - YOLO_OFFLINE=1
+      # 预训练权重走 GitHub Release 时使用的镜像（前缀拼接完整 https://github.com/... ）
+      # 设为空字符串可改回直连 GitHub
+      - ULTRALYTICS_GITHUB_MIRROR=https://gh.felicity.ac.cn/
     deploy:
       resources:
         reservations:

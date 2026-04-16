@@ -3,28 +3,29 @@ Dataset management service
 """
 import os
 import shutil
-from pathlib import Path
-from typing import List, Optional
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, update, delete
-from sqlalchemy.orm import selectinload
-from loguru import logger
-
 from app.core.config import settings
 from app.models import Dataset, Image, Annotation, DatasetStatus, ImageSource, AnnotationStatus
 from app.schemas.schemas import DatasetCreate, DatasetUpdate
 from app.utils import generate_filename, get_image_info, create_thumbnail, allowed_image
+from loguru import logger
+from pathlib import Path
+from sqlalchemy import select, func, update, delete
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+from typing import List, Optional
 
 
 class DatasetService:
 
     @staticmethod
     async def create_dataset(db: AsyncSession, data: DatasetCreate) -> Dataset:
+        lt = getattr(data, "label_task", None) or "detect"
         dataset = Dataset(
             name=data.name,
             description=data.description,
             project_id=data.project_id,
             classes=data.classes or [],
+            label_task=lt,
             status=DatasetStatus.ACTIVE,
         )
 
@@ -431,6 +432,7 @@ class DatasetService:
                 bbox_width=ann.bbox_width,
                 bbox_height=ann.bbox_height,
                 confidence=ann.confidence,
+                polygon_points=getattr(ann, "polygon_points", None),
             )
             db.add(new_ann)
 

@@ -1,17 +1,16 @@
 """
 SQLAlchemy ORM Models
 """
+import enum
 import uuid
+from app.core.database import Base
 from datetime import datetime
-from typing import Optional
 from sqlalchemy import (
     String, Integer, Float, Boolean, DateTime, Text,
     ForeignKey, JSON, Enum as SAEnum
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-import enum
-
-from app.core.database import Base
+from typing import Optional
 
 
 def gen_uuid() -> str:
@@ -98,6 +97,8 @@ class Dataset(Base):
         SAEnum(DatasetStatus, native_enum=False), default=DatasetStatus.PENDING
     )
     classes: Mapped[Optional[dict]] = mapped_column(JSON, default=list)  # 标注时自动生成的类别列表
+    # 标签任务类型：detect=水平框，obb=旋转框/OBB，pose=姿态（与训练可选模型联动）
+    label_task: Mapped[str] = mapped_column(String(32), default="detect")
     image_count: Mapped[int] = mapped_column(Integer, default=0)
     annotation_count: Mapped[int] = mapped_column(Integer, default=0)
     augmented_count: Mapped[int] = mapped_column(Integer, default=0)  # 增强数据数量
@@ -161,6 +162,8 @@ class Annotation(Base):
     bbox_width: Mapped[float] = mapped_column(Float, nullable=False)
     bbox_height: Mapped[float] = mapped_column(Float, nullable=False)
     confidence: Mapped[Optional[float]] = mapped_column(Float)
+    # 归一化多边形顶点 [[x,y],...]（0–1），用于界面展示与 YOLO pose 标签生成
+    polygon_points: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     # Relationship

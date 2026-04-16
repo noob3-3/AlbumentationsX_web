@@ -2,13 +2,12 @@
 Model validation service for testing multiple models on single image
 """
 import time
+from app.core.logging import logger
+from app.models.models import Model, ModelValidation, Deployment, DeploymentStatus
 from pathlib import Path
-from typing import List, Optional, Dict, Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-
-from app.models.models import Model, ModelValidation, Deployment, DeploymentStatus
-from app.core.logging import logger
+from typing import List, Optional, Dict, Any
 
 
 class ModelValidationService:
@@ -28,6 +27,7 @@ class ModelValidationService:
         """
         from ultralytics import YOLO
         from app.services.deployment_service import DeploymentService
+        from app.utils.yolo_result_parse import detections_from_ultralytics_result
         import cv2
 
         # Load image
@@ -101,36 +101,12 @@ class ModelValidationService:
                     )
                     inference_time = (time.time() - start_time) * 1000
 
-                    # Parse detections
+                    # Parse detections（OBB 模型无 boxes，需解析 obb）
                     detections = []
                     if predictions and len(predictions) > 0:
-                        pred = predictions[0]
-                        boxes = pred.boxes
-
-                        for i, box in enumerate(boxes):
-                            # Get box coordinates (xyxy format)
-                            xyxy = box.xyxy[0].cpu().numpy()
-                            x1, y1, x2, y2 = xyxy
-
-                            # Normalize coordinates
-                            cx = (x1 + x2) / 2 / width
-                            cy = (y1 + y2) / 2 / height
-                            w = (x2 - x1) / width
-                            h = (y2 - y1) / height
-
-                            class_id = int(box.cls[0].cpu().numpy())
-                            confidence = float(box.conf[0].cpu().numpy())
-
-                            # Get class name
-                            class_name = yolo_model.names.get(class_id, f"class_{class_id}")
-
-                            detections.append({
-                                "class_id": class_id,
-                                "class_name": class_name,
-                                "confidence": confidence,
-                                "bbox": [float(x1), float(y1), float(x2), float(y2)],
-                                "bbox_normalized": [float(cx), float(cy), float(w), float(h)],
-                            })
+                        detections = detections_from_ultralytics_result(
+                            yolo_model, predictions[0], width, height
+                        )
 
                 # Save validation record
                 validation = ModelValidation(

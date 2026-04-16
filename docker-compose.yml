@@ -33,10 +33,13 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - CLIENT_API_TOKEN=${CLIENT_API_TOKEN:-your-secret-token-change-this}
       - STATIC_DIR=/app/static
+      - DATASET_DIR=/app/data/datasets
       # Ultralytics 缓存配置 - 使用持久化目录
       - ULTRALYTICS_DATASETS_DIR=/app/data/ultralytics/datasets
       - ULTRALYTICS_WEIGHTS_DIR=/app/data/ultralytics/weights
       - ULTRALYTICS_RUNS_DIR=/app/data/ultralytics/runs
+      # GitHub Release 镜像（Ultralytics 官方 .pt）；默认可与 gh.felicity.ac.cn 联用
+      - ULTRALYTICS_GITHUB_MIRROR=https://gh.felicity.ac.cn/
 
     volumes:
       - ./data/uploads:/app/data/uploads       # 用户上传的原始图片

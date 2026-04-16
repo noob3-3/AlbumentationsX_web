@@ -39,7 +39,7 @@
                 <el-option
                   v-for="d in datasets"
                   :key="d.id"
-                  :label="`${d.name} (${d.image_count}张)`"
+                  :label="datasetOptionLabel(d)"
                   :value="d.id"
                 />
               </el-select>
@@ -107,14 +107,15 @@
             </el-form-item>
 
             <el-form-item label="基础模型">
-              <el-select v-model="form.model_name" style="width:100%">
+              <el-select v-model="form.model_name" style="width:100%" :loading="baseCheckpointLoading">
                 <el-option-group label="YOLO11">
-                  <el-option v-for="m in yolo11Models" :key="m" :label="m" :value="m" />
+                  <el-option v-for="m in yolo11BaseModels" :key="m" :label="m" :value="m"/>
                 </el-option-group>
                 <el-option-group label="YOLOv8">
-                  <el-option v-for="m in yolov8Models" :key="m" :label="m" :value="m" />
+                  <el-option v-for="m in yolov8BaseModels" :key="m" :label="m" :value="m"/>
                 </el-option-group>
               </el-select>
+              <div v-if="modelTaskHint" class="model-task-hint">{{ modelTaskHint }}</div>
             </el-form-item>
 
             <el-divider />
@@ -550,7 +551,11 @@ const { hasProject, projectId } = storeToRefs(projectStore)
 
 const formRef = ref()
 const creating = ref(false)
+/** 注册表中可选的「继续训练」模型 */
 const availableModels = ref([])
+/** 基础权重列表（与后端 GET /training/available-models 一致，含 obb/pose） */
+const baseCheckpointModels = ref([])
+const baseCheckpointLoading = ref(false)
 const datasetClasses = ref([])
 const selectedDatasetInfo = ref(null)
 const selectedValidationDatasetInfo = ref(null)
@@ -651,10 +656,60 @@ const rules = {
   }],
 }
 
-const yolo11Models = ['yolo11n.pt', 'yolo11s.pt', 'yolo11m.pt', 'yolo11l.pt', 'yolo11x.pt']
-const yolov8Models = ['yolov8n.pt', 'yolov8s.pt', 'yolov8m.pt', 'yolov8l.pt', 'yolov8x.pt']
+const selectedDatasetLabelTask = computed(() => {
+  const d = datasets.value.find((x) => x.id === form.value.dataset_id)
+  return d?.label_task || 'detect'
+})
+
+function filterCheckpointModelsByLabelTask(list, task, hasDataset) {
+  if (!hasDataset) return list
+  const t = task || 'detect'
+  return list.filter((m) => {
+    const low = (m || '').toLowerCase()
+    const isObb = low.includes('-obb')
+    const isPose = low.includes('-pose')
+    if (t === 'obb') return isObb
+    if (t === 'pose') return isPose
+    return !isObb && !isPose
+  })
+}
+
+// yolo11*、yolov11*（含 obb/pose）归为 YOLO11 组；yolov8* 归为 YOLOv8 组；按数据集 label_task 过滤
+const yolo11BaseModels = computed(() => {
+  const raw = baseCheckpointModels.value.filter((m) => /^yolo11|^yolov11/.test(m))
+  return filterCheckpointModelsByLabelTask(raw, selectedDatasetLabelTask.value, !!form.value.dataset_id)
+})
+const yolov8BaseModels = computed(() => {
+  const raw = baseCheckpointModels.value.filter((m) => /^yolov8/.test(m))
+  return filterCheckpointModelsByLabelTask(raw, selectedDatasetLabelTask.value, !!form.value.dataset_id)
+})
+
+/** 与后端 infer_ultralytics_task_from_model_name 一致，用于界面提示 */
+function inferModelTaskFromFilename(name) {
+  const m = (name || '').toLowerCase()
+  if (m.includes('-pose')) return 'pose'
+  if (m.includes('-obb')) return 'obb'
+  if (m.includes('-seg')) return 'segment'
+  return 'detect'
+}
+
+const modelTaskHint = computed(() => {
+  const t = inferModelTaskFromFilename(form.value.model_name)
+  const hints = {
+    detect: '检测模型：与本平台「水平框」标注一致。',
+    pose: '姿态模型：训练时会导出为带关键点的 pose 格式（由框/多边形生成，不等同于专业骨架标注）。',
+    obb: 'OBB 模型：水平框会导出为轴对齐四顶点；四点多边形按顶点顺序导出。',
+    segment: '分割模型需要掩码标注，本平台无法生成，创建训练任务时将被拒绝；请换用检测或 OBB。',
+  }
+  return hints[t] || ''
+})
 
 let refreshTimer = null
+
+function datasetOptionLabel(d) {
+  const tag = d.label_task && d.label_task !== 'detect' ? ` · ${d.label_task}` : ''
+  return `${d.name} (${d.image_count}张)${tag}`
+}
 
 const statusType = (s) => ({ pending: 'info', running: 'warning', completed: 'success', failed: 'danger', cancelled: '' })[s] || ''
 const statusText = (s) => ({ pending: '等待', running: '训练中', completed: '完成', failed: '失败', cancelled: '已取消' })[s] || s
@@ -665,6 +720,7 @@ onMounted(async () => {
     fetchJobs(),
     datasetStore.fetchDatasets(),
     fetchAvailableModels(),
+    fetchBaseCheckpointModels(),
   ])
   refreshTimer = setInterval(() => {
     if (jobs.value.some((j) => j.status === 'running' || j.status === 'pending')) {
@@ -734,6 +790,18 @@ watch(() => form.value.model_name, () => {
   updateJobName()
 })
 
+// 选择数据集后，基础模型列表会随 label_task 变化；当前模型若不在列表中则切换到第一个可用权重
+watch(
+    [yolo11BaseModels, yolov8BaseModels, () => form.value.dataset_id],
+    () => {
+      const merged = [...yolo11BaseModels.value, ...yolov8BaseModels.value]
+      if (!form.value.dataset_id || !merged.length) return
+      if (!merged.includes(form.value.model_name)) {
+        form.value.model_name = merged[0]
+      }
+    },
+)
+
 // 自动生成任务名称
 function updateJobName() {
   if (!form.value.dataset_id || !form.value.model_name) return
@@ -780,6 +848,27 @@ async function fetchAvailableModels() {
     availableModels.value = res.models || res.items || []
   } catch (error) {
     console.error('Failed to fetch models:', error)
+  }
+}
+
+/** 训练页「基础模型」下拉：与后端 AVAILABLE_MODELS 同步 */
+async function fetchBaseCheckpointModels() {
+  baseCheckpointLoading.value = true
+  try {
+    const res = await trainingApi.availableModels()
+    const list = res.models || []
+    baseCheckpointModels.value = Array.isArray(list) ? list : []
+  } catch (error) {
+    console.error('Failed to fetch base checkpoint models:', error)
+    baseCheckpointModels.value = [
+      'yolo11n.pt', 'yolo11s.pt', 'yolo11m.pt', 'yolo11l.pt', 'yolo11x.pt',
+      'yolo11n-obb.pt', 'yolo11n-pose.pt',
+      'yolov8n.pt', 'yolov8s.pt', 'yolov8m.pt', 'yolov8l.pt', 'yolov8x.pt',
+      'yolov8n-obb.pt', 'yolov8n-pose.pt',
+      'yolo11n-det.pt', 'yolo11s-det.pt',
+    ]
+  } finally {
+    baseCheckpointLoading.value = false
   }
 }
 
@@ -853,7 +942,14 @@ async function loadValidationDatasetInfo() {
 }
 
 function goToAnnotation() {
-  router.push('/annotation')
+  const query = {}
+  if (form.value.dataset_id) {
+    query.dataset = form.value.dataset_id
+  }
+  const m = (form.value.model_name || '').toLowerCase()
+  if (m.includes('-obb')) query.mode = 'obb'
+  else if (m.includes('-pose')) query.mode = 'pose'
+  router.push(Object.keys(query).length ? {path: '/annotation', query} : '/annotation')
 }
 
 async function onResumeTrainingChange(value) {
@@ -918,6 +1014,12 @@ async function stopJob(id) {
 </script>
 
 <style scoped>
+.model-task-hint {
+  margin-top: 8px;
+  font-size: 12px;
+  color: #606266;
+  line-height: 1.5;
+}
 .hint { margin-left: 8px; color: #909399; font-size: 12px; }
 
 .job-card {

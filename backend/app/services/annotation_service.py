@@ -1,17 +1,16 @@
 """
 Annotation service for manual and automatic annotation
 """
-from pathlib import Path
-from typing import Optional, List
-from loguru import logger
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, or_, and_, exists
-from sqlalchemy.orm import selectinload
-from PIL import Image as PILImage
 import numpy as np
-
+from PIL import Image as PILImage
 from app.models import Image, Annotation, Dataset, Model, AnnotationStatus
 from app.schemas.schemas import AnnotationCreate
+from loguru import logger
+from pathlib import Path
+from sqlalchemy import select, or_, and_, exists
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+from typing import Optional, List
 
 
 class AnnotationService:
@@ -46,6 +45,7 @@ class AnnotationService:
                 bbox_width=ann_data.bbox_width,
                 bbox_height=ann_data.bbox_height,
                 confidence=ann_data.confidence,
+                polygon_points=ann_data.polygon_points,
             )
             db.add(ann)
 

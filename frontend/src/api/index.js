@@ -28,12 +28,16 @@ export const datasetApi = {
       onUploadProgress: onProgress,
       timeout: 600000, // 10 minutes for large batch uploads
     }),
-  uploadImagesWithLabels: (datasetId, formData, onProgress) =>
-    http.post(`/datasets/${datasetId}/images/upload-with-labels`, formData, {
-      headers: { 'Content-Type': 'multipart/form-data' },
-      onUploadProgress: onProgress,
-      timeout: 600000, // 10 minutes for large batch uploads
-    }),
+    uploadImagesWithLabels: (datasetId, formData, onProgress, labelFormat = 'auto') =>
+        http.post(
+            `/datasets/${datasetId}/images/upload-with-labels?label_format=${encodeURIComponent(labelFormat)}`,
+            formData,
+            {
+                headers: {'Content-Type': 'multipart/form-data'},
+                onUploadProgress: onProgress,
+                timeout: 600000, // 10 minutes for large batch uploads
+            },
+        ),
   collectFromUrls: (datasetId, data) =>
     http.post(`/datasets/${datasetId}/images/collect-from-urls`, data),
   listImages: (datasetId, params) =>

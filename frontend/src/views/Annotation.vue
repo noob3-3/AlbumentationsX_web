@@ -81,6 +81,24 @@
 
       <!-- Annotation view -->
       <div v-if="selectedDatasetId && images.length > 0">
+        <el-alert
+            v-if="annotationMode === 'obb'"
+            type="info"
+            :closable="false"
+            show-icon
+            style="margin-bottom: 12px"
+        >
+          OBB 旋转框：请使用工具「多边形」并选择「四边形 (OBB)」，依次点击四个角点；也可用「绘制框」做轴对齐框（训练时会转为四角点）。
+        </el-alert>
+        <el-alert
+            v-else-if="annotationMode === 'pose'"
+            type="info"
+            :closable="false"
+            show-icon
+            style="margin-bottom: 12px"
+        >
+          姿态估计：可用多边形勾勒目标轮廓以生成关键点采样；请先选择类别再标注。
+        </el-alert>
         <AnnotationView
           :datasetId="selectedDatasetId"
           :projectId="currentDataset?.project_id || projectId"
@@ -88,6 +106,7 @@
           :classes="currentDataset?.classes || []"
           :datasets="datasets"
           :imageUrlFunc="imageUrl"
+          :annotation-mode="annotationMode"
           @annotationsSaved="onAnnotationsSaved"
           @imageDeleted="onImageDeleted"
           @imageMoved="onImageMoved"
@@ -158,19 +177,22 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, watch } from 'vue'
-import { ElMessage } from 'element-plus'
+import {computed, onMounted, ref, watch} from 'vue'
+import {useRoute} from 'vue-router'
+import {ElMessage} from 'element-plus'
 import AnnotationView from '@/components/annotation/AnnotationView.vue'
 import AutoAnnotationDialog from '@/components/annotation/AutoAnnotationDialog.vue'
 import BatchReplaceClassesDialog from '@/components/annotation/BatchReplaceClassesDialog.vue'
-import { datasetApi } from '@/api'
-import { useProjectStore } from '@/stores/project'
-import { storeToRefs } from 'pinia'
+import {datasetApi} from '@/api'
+import {useProjectStore} from '@/stores/project'
+import {storeToRefs} from 'pinia'
 
 const projectStore = useProjectStore()
 const { hasProject, projectId } = storeToRefs(projectStore)
+const route = useRoute()
 
 const selectedDatasetId = ref('')
+const annotationMode = ref('')
 const datasets = ref([])
 const currentDataset = ref(null)
 const images = ref([])
@@ -192,9 +214,34 @@ const augmentedImageCount = computed(() => {
   return currentDataset.value?.augmented_count || 0
 })
 
-onMounted(() => {
-  loadDatasets()
+onMounted(async () => {
+  await loadDatasets()
+  const ds = route.query.dataset
+  if (ds) {
+    selectedDatasetId.value = String(ds)
+    await loadDataset()
+  }
+  if (route.query.mode) {
+    annotationMode.value = String(route.query.mode)
+  }
 })
+
+watch(
+    () => route.query.dataset,
+    async (ds) => {
+      if (ds && String(ds) !== selectedDatasetId.value) {
+        selectedDatasetId.value = String(ds)
+        await loadDataset()
+      }
+    }
+)
+
+watch(
+    () => route.query.mode,
+    (m) => {
+      annotationMode.value = m ? String(m) : ''
+    }
+)
 
 // 监听项目变化，刷新数据集列表
 watch(projectId, () => {

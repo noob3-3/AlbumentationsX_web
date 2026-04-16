@@ -8,7 +8,7 @@ from app.core.database import get_db
 from app.models import JobStatus, Model, ModelValidation, Dataset, Image, Annotation, TrainingJob
 from app.models.models import gen_uuid
 from app.schemas.schemas import TrainingJobCreate, TrainingJobResponse, SuccessResponse, ModelResponse
-from app.services import TrainingService, AVAILABLE_MODELS
+from app.services import TrainingService, AVAILABLE_MODELS, infer_ultralytics_task_from_model_name
 from app.services.model_export_service import export_pt_to_onnx
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query, File, Form, UploadFile
 from fastapi.responses import FileResponse
@@ -45,6 +45,11 @@ async def create_training_job(
             raise HTTPException(status_code=404, detail="Validation dataset not found")
         if data.validation_dataset_id == data.dataset_id:
             raise HTTPException(status_code=400, detail="Validation dataset cannot be the same as training dataset")
+        if (getattr(val_ds, "label_task", None) or "detect") != (getattr(dataset, "label_task", None) or "detect"):
+            raise HTTPException(
+                status_code=400,
+                detail="训练集与独立验证集的 label_task（detect/obb/pose）必须一致。",
+            )
 
     # Check if dataset has images
     images_result = await db.execute(
@@ -78,6 +83,34 @@ async def create_training_job(
         logger.warning(
             f"Dataset {data.dataset_id}: Only {images_with_annotations_count}/{len(images)} images have annotations. "
             f"Training with partially labeled data may result in poor model performance."
+        )
+
+    # 模型任务 vs 平台标注能力（仅检测框/多边形，无分割掩码）
+    _mt = infer_ultralytics_task_from_model_name(data.model_name)
+    _ds_task = (getattr(dataset, "label_task", None) or "detect").lower()
+    if _ds_task == "obb" and _mt != "obb":
+        raise HTTPException(
+            status_code=400,
+            detail="该数据集的 label_task 为 OBB（旋转框），请选择 *-obb.pt 权重（如 yolo11n-obb.pt）。",
+        )
+    if _ds_task == "pose" and _mt != "pose":
+        raise HTTPException(
+            status_code=400,
+            detail="该数据集的 label_task 为姿态，请选择 *-pose.pt 权重。",
+        )
+    if _ds_task == "detect" and _mt in ("obb", "pose"):
+        raise HTTPException(
+            status_code=400,
+            detail="该数据集的 label_task 为水平框检测，请勿选择 -obb.pt / -pose.pt，请使用 yolo11n.pt、yolov8n.pt 等检测权重。",
+        )
+
+    if _mt == "segment":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "分割模型（文件名含 -seg）需要像素级掩码标注，本平台目前仅支持水平框与多边形标注，无法生成分割标签。"
+                "请改用检测类权重（如 yolo11n.pt、yolov8n.pt）或 OBB（*-obb.pt）/ 姿态（*-pose.pt）模型。"
+            ),
         )
 
     # 多卡 DDP：batch_size 会被平分到每张卡，必须 >= GPU 数量

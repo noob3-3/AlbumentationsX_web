@@ -72,6 +72,7 @@ COPY --from=frontend-builder /frontend/dist /app/static
 # Set permissions to 777 to allow both host and container to read/write
 RUN mkdir -p \
     data/uploads \
+    data/datasets \
     data/static-file \
     data/augmented \
     data/models \

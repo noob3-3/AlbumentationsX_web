@@ -2,10 +2,72 @@
 Pretrained model service for downloading and managing Ultralytics official models
 """
 import os
+import ssl
+import urllib.request
+import zipfile
+from loguru import logger
 from pathlib import Path
 from typing import List, Dict, Optional, Any
-from loguru import logger
 from ultralytics import YOLO
+
+# 过小多为下载中断；PyTorch 2 存盘多为 ZIP，损坏时常报 PytorchStreamReader / central directory
+_MIN_PT_BYTES = 16 * 1024
+
+
+def _mirrored_github_asset_url(canonical_github_url: str) -> str:
+    """
+    将 GitHub Release 直链转为镜像 URL。
+    环境变量 ULTRALYTICS_GITHUB_MIRROR：
+      未设置时默认 https://gh.felicity.ac.cn/（前缀 + 完整 GitHub URL）
+      设为空则直连 github.com
+    """
+    u = (canonical_github_url or "").strip()
+    if not u:
+        return u
+    mirror = os.getenv("ULTRALYTICS_GITHUB_MIRROR", "https://gh.felicity.ac.cn/").strip()
+    if not mirror:
+        return u
+    if not (u.startswith("https://github.com/") or u.startswith("http://github.com/")):
+        return u
+    if not mirror.endswith("/"):
+        mirror += "/"
+    return mirror + u
+
+
+def _download_http_to_file(url: str, dest: Path, timeout: int = 600) -> None:
+    """HTTP(S) 下载到 dest，先写 .part 再替换。"""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    part = dest.with_suffix(dest.suffix + ".part")
+    try:
+        ctx = ssl.create_default_context()
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "AlbumentationsX-Pretrained/1.0"},
+        )
+        total = 0
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+            with open(part, "wb") as f:
+                while True:
+                    chunk = resp.read(512 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    total += len(chunk)
+        if total < _MIN_PT_BYTES:
+            raise RuntimeError(f"response too small ({total} B)")
+        part.replace(dest)
+    except Exception:
+        if part.exists():
+            part.unlink(missing_ok=True)
+        raise
+
+
+# 曾误写为 yolov11n-*，Ultralytics 官方为 yolo11n-*
+_PRETRAINED_NAME_ALIASES = {
+    "yolov11n-obb.pt": "yolo11n-obb.pt",
+    "yolov11n-pose.pt": "yolo11n-pose.pt",
+}
+
 
 # Available Ultralytics pretrained models
 PRETRAINED_MODELS = {
@@ -67,11 +129,90 @@ PRETRAINED_MODELS = {
         "description": "YOLOv8中型模型",
         "url": "https://github.com/ultralytics/assets/releases/download/v8.2.0/yolov8m.pt"
     },
+    # YOLO11 OBB / Pose（Ultralytics 官方名称为 yolo11n-*，不是 yolov11n-*）
+    "yolo11n-obb.pt": {
+        "name": "YOLO11 Nano OBB",
+        "type": "obb",
+        "size": "~6 MB",
+        "description": "旋转框检测（Oriented Bounding Box）",
+        "url": "https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n-obb.pt",
+    },
+    "yolo11n-pose.pt": {
+        "name": "YOLO11 Nano Pose",
+        "type": "pose",
+        "size": "~6 MB",
+        "description": "人体关键点 / 姿态估计",
+        "url": "https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n-pose.pt",
+    },
+    # YOLOv8 OBB / Pose
+    "yolov8n-obb.pt": {
+        "name": "YOLOv8 Nano OBB",
+        "type": "obb",
+        "size": "~6 MB",
+        "description": "旋转框检测（Oriented Bounding Box）",
+        "url": "https://github.com/ultralytics/assets/releases/download/v8.2.0/yolov8n-obb.pt",
+    },
+    "yolov8n-pose.pt": {
+        "name": "YOLOv8 Nano Pose",
+        "type": "pose",
+        "size": "~6 MB",
+        "description": "人体关键点 / 姿态估计",
+        "url": "https://github.com/ultralytics/assets/releases/download/v8.2.0/yolov8n-pose.pt",
+    },
 }
+
+
+def _unlink_silent(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as e:
+        logger.warning(f"Could not remove invalid checkpoint {path}: {e}")
+
+
+def checkpoint_file_is_valid(path: Path) -> bool:
+    """
+    粗校验权重文件是否可读，避免损坏/HTML 占位页触发
+    PytorchStreamReader failed reading zip archive: failed finding central directory
+    """
+    try:
+        if not path.is_file():
+            return False
+        size = path.stat().st_size
+        if size < _MIN_PT_BYTES:
+            logger.warning(f"Checkpoint too small ({size} B), likely incomplete: {path}")
+            return False
+        with open(path, "rb") as f:
+            head = f.read(256)
+        h = head.lstrip()
+        if h.startswith(b"<") or h.startswith(b"<!") or h.startswith(b"<?xml"):
+            logger.warning(f"Checkpoint looks like HTML/XML, not weights: {path}")
+            return False
+        # PyTorch 2.x 默认 torch.save 为 ZIP 包裹
+        if head[:2] == b"PK":
+            try:
+                with zipfile.ZipFile(path, "r") as zf:
+                    bad = zf.testzip()
+                    if bad is not None:
+                        logger.warning(f"ZIP member corrupt in checkpoint: {bad} ({path})")
+                        return False
+                return True
+            except zipfile.BadZipFile:
+                logger.warning(f"BadZipFile (truncated download?): {path}")
+                return False
+        # 旧版纯 pickle 的 .pt：只做体积与非文本启发式
+        return size >= 8192
+    except OSError as e:
+        logger.warning(f"Could not validate checkpoint {path}: {e}")
+        return False
 
 
 class PretrainedModelService:
     """管理Ultralytics预训练模型"""
+
+    @staticmethod
+    def resolve_model_filename(model_filename: str) -> str:
+        """将历史别名解析为 Ultralytics 官方权重文件名。"""
+        return _PRETRAINED_NAME_ALIASES.get(model_filename, model_filename)
 
     @staticmethod
     def _find_model_in_cache(model_filename: str) -> Optional[Path]:
@@ -129,13 +270,17 @@ class PretrainedModelService:
         """列出所有可用的预训练模型"""
         models = []
         for filename, info in PRETRAINED_MODELS.items():
-            models.append({
+            src = (info.get("url") or "").strip()
+            row = {
                 "filename": filename,
                 "name": info["name"],
                 "type": info["type"],
                 "size": info["size"],
                 "description": info["description"],
-            })
+                "url": src,
+                "download_url": _mirrored_github_asset_url(src) if src else "",
+            }
+            models.append(row)
         return models
 
     @staticmethod
@@ -184,6 +329,7 @@ class PretrainedModelService:
 
         Ultralytics会自动下载模型到缓存目录，我们将其复制到持久化的save_dir
         """
+        model_filename = PretrainedModelService.resolve_model_filename(model_filename)
         if model_filename not in PRETRAINED_MODELS:
             raise ValueError(f"Unknown pretrained model: {model_filename}")
 
@@ -191,12 +337,37 @@ class PretrainedModelService:
         model_path = save_dir / model_filename
 
         # 再次检查持久化目录（可能在并发下载时已经存在）
-        if model_path.exists():
+        if model_path.exists() and checkpoint_file_is_valid(model_path):
             logger.info(f"Pretrained model already exists in persistent storage: {model_path}")
             return model_path
+        if model_path.exists():
+            logger.warning(f"Removing corrupt checkpoint in persistent storage: {model_path}")
+            _unlink_silent(model_path)
 
         try:
             logger.info(f"Downloading pretrained model to persistent storage: {model_filename}")
+
+            # 避免 Ultralytics 复用已损坏的缓存导致 PytorchStreamReader 报错
+            bad_cache = PretrainedModelService._find_model_in_cache(model_filename)
+            if bad_cache and bad_cache.exists() and not checkpoint_file_is_valid(bad_cache):
+                logger.warning(f"Removing corrupt cache before YOLO download: {bad_cache}")
+                _unlink_silent(bad_cache)
+
+            info = PRETRAINED_MODELS[model_filename]
+            canonical = (info.get("url") or "").strip()
+            if canonical:
+                fetch_url = _mirrored_github_asset_url(canonical)
+                logger.info(f"Trying mirrored HTTP download ({fetch_url[:96]}...)")
+                try:
+                    _download_http_to_file(fetch_url, model_path)
+                    if checkpoint_file_is_valid(model_path):
+                        logger.info(f"HTTP download OK -> {model_path}")
+                        return model_path
+                    logger.warning("HTTP file failed ZIP/size check, removing; will try YOLO()")
+                    _unlink_silent(model_path)
+                except Exception as http_err:
+                    logger.warning(f"HTTP download failed: {http_err}; falling back to Ultralytics")
+                    _unlink_silent(model_path)
 
             # Ultralytics YOLO will auto-download to cache if not exists
             model = YOLO(model_filename)
@@ -208,25 +379,47 @@ class PretrainedModelService:
             # 方法1: 从ckpt_path获取
             if hasattr(model, 'ckpt_path') and model.ckpt_path:
                 source_path = Path(model.ckpt_path)
-                if source_path.exists():
+                if source_path.exists() and checkpoint_file_is_valid(source_path):
                     shutil.copy2(source_path, model_path)
                     logger.info(f"Model copied from {source_path} to persistent storage: {model_path}")
                     copied = True
+                elif source_path.exists():
+                    logger.warning(f"Source ckpt appears corrupt, not copying: {source_path}")
+                    _unlink_silent(source_path)
 
             # 方法2: 如果方法1失败，从缓存目录查找
             if not copied:
                 cached_path = PretrainedModelService._find_model_in_cache(model_filename)
-                if cached_path and cached_path.exists():
+                if cached_path and cached_path.exists() and checkpoint_file_is_valid(cached_path):
                     shutil.copy2(cached_path, model_path)
                     logger.info(f"Model copied from cache {cached_path} to persistent storage: {model_path}")
                     copied = True
+                elif cached_path and cached_path.exists():
+                    logger.warning(f"Removing corrupt cached weights: {cached_path}")
+                    _unlink_silent(cached_path)
 
-            # 方法3: 如果都失败了，返回模型文件名让Ultralytics自己处理
+            # 方法3: 再尝试从缓存取绝对路径（避免返回相对路径导致 open 失败）
             if not copied:
-                logger.warning(f"Could not locate downloaded model file, Ultralytics will use cache: {model_filename}")
-                # 虽然无法复制，但至少模型已经下载到缓存了
-                # 下次启动容器时需要重新下载，但这是fallback方案
+                cached_again = PretrainedModelService._find_model_in_cache(model_filename)
+                if cached_again and cached_again.exists() and checkpoint_file_is_valid(cached_again):
+                    logger.warning(
+                        f"Could not copy to {model_path}, using cache path: {cached_again}"
+                    )
+                    return cached_again
+                if cached_again and cached_again.exists():
+                    _unlink_silent(cached_again)
+                logger.warning(
+                    f"Could not locate downloaded model file on disk for: {model_filename}"
+                )
                 return Path(model_filename)
+
+            if not checkpoint_file_is_valid(model_path):
+                logger.error(f"Downloaded file failed validation, removing: {model_path}")
+                _unlink_silent(model_path)
+                raise RuntimeError(
+                    f"Downloaded weights failed integrity check: {model_filename}. "
+                    "Delete any partial .pt in MODEL_DIR and cache, then retry."
+                )
 
             return model_path
 
@@ -237,12 +430,14 @@ class PretrainedModelService:
     @staticmethod
     def get_model_info(model_filename: str) -> Optional[Dict]:
         """获取预训练模型信息"""
-        return PRETRAINED_MODELS.get(model_filename)
+        return PRETRAINED_MODELS.get(
+            PretrainedModelService.resolve_model_filename(model_filename)
+        )
 
     @staticmethod
     def is_pretrained_model(model_filename: str) -> bool:
         """检查是否为预训练模型"""
-        return model_filename in PRETRAINED_MODELS
+        return PretrainedModelService.resolve_model_filename(model_filename) in PRETRAINED_MODELS
 
     @staticmethod
     def ensure_model_available(model_filename: str, save_dir: Path) -> Path:
@@ -259,27 +454,39 @@ class PretrainedModelService:
         if not PretrainedModelService.is_pretrained_model(model_filename):
             raise ValueError(f"Not a pretrained model: {model_filename}")
 
+        model_filename = PretrainedModelService.resolve_model_filename(model_filename)
         save_dir.mkdir(parents=True, exist_ok=True)
         model_path = save_dir / model_filename
 
         # 1. 优先检查持久化目录（这是最重要的）
         if model_path.exists():
-            logger.info(f"✓ Using model from persistent storage: {model_path}")
-            return model_path
+            if checkpoint_file_is_valid(model_path):
+                logger.info(f"✓ Using model from persistent storage: {model_path}")
+                return model_path
+            logger.warning(f"✗ Corrupt checkpoint in persistent storage, will re-download: {model_path}")
+            _unlink_silent(model_path)
 
         # 2. 检查Ultralytics缓存目录
         cached_model = PretrainedModelService._find_model_in_cache(model_filename)
+        if cached_model and cached_model.exists():
+            if not checkpoint_file_is_valid(cached_model):
+                logger.warning(f"✗ Corrupt file in cache, removing: {cached_model}")
+                _unlink_silent(cached_model)
+                cached_model = None
         if cached_model:
             logger.info(f"✓ Found model in Ultralytics cache: {cached_model}")
             # 必须复制到持久化目录，这样容器重启后模型仍然可用
             try:
                 import shutil
                 shutil.copy2(cached_model, model_path)
-                logger.info(f"✓ Copied model to persistent storage: {model_path}")
-                return model_path
+                if checkpoint_file_is_valid(model_path):
+                    logger.info(f"✓ Copied model to persistent storage: {model_path}")
+                    return model_path
+                logger.warning(f"✗ Copy result invalid, removing: {model_path}")
+                _unlink_silent(model_path)
             except Exception as e:
                 logger.error(f"✗ Failed to copy model to persistent storage: {e}")
-                # 如果复制失败，仍然可以使用缓存路径，但会有警告
+            if cached_model.exists() and checkpoint_file_is_valid(cached_model):
                 logger.warning(f"⚠ Using cache path (not persistent): {cached_model}")
                 return cached_model
 

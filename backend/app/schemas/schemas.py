@@ -2,11 +2,11 @@
 Pydantic schemas for request/response validation
 """
 from __future__ import annotations
-from datetime import datetime
-from typing import Optional, List, Dict, Any
-from pydantic import BaseModel, Field, HttpUrl, ConfigDict
 
 from app.models.models import DatasetStatus, JobStatus, ImageSource, AnnotationStatus, DeploymentStatus, ProjectStatus
+from datetime import datetime
+from pydantic import BaseModel, Field, HttpUrl, ConfigDict
+from typing import Optional, List, Dict, Any
 
 
 # ─────────────────────────────────────────────
@@ -81,6 +81,8 @@ class AnnotationCreate(BaseModel):
     bbox_width: float = Field(..., ge=0.0, le=1.0)
     bbox_height: float = Field(..., ge=0.0, le=1.0)
     confidence: Optional[float] = Field(None, ge=0.0, le=1.0)
+    # 多边形顶点（归一化），至少 3 点；纯矩形标注可为 null
+    polygon_points: Optional[List[List[float]]] = None
 
 
 class AnnotationResponse(AnnotationCreate):
@@ -132,6 +134,8 @@ class DatasetCreate(BaseModel):
     description: Optional[str] = None
     project_id: Optional[str] = None
     classes: Optional[List[str]] = None
+    # detect=水平框 YOLO；obb=旋转框/多边形顶点；pose 预留
+    label_task: str = Field(default="detect", description="detect | obb | pose")
 
 
 class DatasetUpdate(BaseModel):
@@ -139,6 +143,7 @@ class DatasetUpdate(BaseModel):
     description: Optional[str] = None
     project_id: Optional[str] = None
     status: Optional[DatasetStatus] = None
+    label_task: Optional[str] = Field(None, description="detect | obb | pose")
 
 
 class DatasetResponse(BaseModel):
@@ -147,6 +152,7 @@ class DatasetResponse(BaseModel):
     description: Optional[str]
     project_id: Optional[str]
     status: DatasetStatus
+    label_task: str = "detect"
     classes: Optional[List[str]]  # 从标注中自动生成
     image_count: int
     annotation_count: int

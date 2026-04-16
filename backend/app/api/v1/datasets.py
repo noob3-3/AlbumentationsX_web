@@ -15,16 +15,37 @@ from app.schemas.schemas import (
     APICollectionRequest, PaginatedResponse, SuccessResponse,
 )
 from app.services import DatasetService, collect_from_urls
-from app.utils import allowed_image, write_yolo_annotation, build_yolo_dataset_yaml
+from app.utils import (
+    allowed_image,
+    write_yolo_annotation,
+    build_yolo_dataset_yaml,
+    YOLOV8_POSE_NUM_KEYPOINTS,
+)
+from app.utils.yolo_label_import import parse_yolo_label_text, merge_label_task_from_upload
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query, BackgroundTasks, Request
 from fastapi.responses import FileResponse, Response
 from loguru import logger
 from pathlib import Path
 from sqlalchemy import select, func, and_, exists
 from sqlalchemy.ext.asyncio import AsyncSession
-from typing import Optional
+from typing import List, Optional, Tuple, Any
 
 router = APIRouter(prefix="/datasets", tags=["datasets"])
+
+
+def _merge_resolved_class_names_into_dataset(dataset, resolved: List[str]) -> None:
+    """按索引合并本次导入解析出的类别名，并触发 JSON 字段更新。"""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    existing = dataset.classes or []
+    out = list(existing)
+    for i, name in enumerate(resolved):
+        if i < len(out):
+            out[i] = name
+        else:
+            out.append(name)
+    dataset.classes = out
+    flag_modified(dataset, "classes")
 
 
 # ─────────────────────────────────────────────
@@ -147,6 +168,8 @@ async def export_dataset(
         include_augmented: bool = Query(True, description="是否包含增强生成的图片；为 False 时仅导出原始图"),
         augmented_only: bool = Query(False,
                                      description="为 True 时仅导出增强图片（与 include_augmented 同时传时以此为准）"),
+        pose: bool = Query(False, description="为 True 时导出 YOLOv8 pose 标签（含 kpt_shape，用于 yolov8*-pose 等）"),
+        obb: bool = Query(False, description="为 True 时导出 YOLO OBB 四角点标签（用于 *-obb.pt 训练）"),
     db: AsyncSession = Depends(get_db),
 ):
     """导出数据集为 YOLO 格式 ZIP 包（含 images/、labels/、dataset.yaml、classes.txt）"""
@@ -184,6 +207,12 @@ async def export_dataset(
         images = [img for img in images if not getattr(img, "is_augmented", False)]
         if not images:
             raise HTTPException(status_code=400, detail="没有可导出的原始图片")
+
+    if pose and obb:
+        raise HTTPException(
+            status_code=400,
+            detail="导出参数 pose 与 obb 不能同时为 True，请只选一种标签格式。",
+        )
 
     classes = dataset.classes or []
     if not classes:
@@ -227,17 +256,32 @@ async def export_dataset(
                     "y_center": a.y_center,
                     "bbox_width": a.bbox_width,
                     "bbox_height": a.bbox_height,
+                    **({"polygon_points": a.polygon_points} if getattr(a, "polygon_points", None) else {}),
                 }
                 for a in anns
             ]
             label_path = labels_dir / (Path(img.filename).stem + ".txt")
-            write_yolo_annotation(str(label_path), ann_list)
+            write_yolo_annotation(
+                str(label_path),
+                ann_list,
+                pose=pose,
+                obb=obb and not pose,
+                num_keypoints=YOLOV8_POSE_NUM_KEYPOINTS,
+            )
+
+        _export_task = None
+        if pose:
+            _export_task = "pose"
+        elif obb:
+            _export_task = "obb"
 
         build_yolo_dataset_yaml(
             dataset_dir=str(temp_dir),
             classes=classes,
             train_path="images",
             val_path="images",
+            kpt_shape=[YOLOV8_POSE_NUM_KEYPOINTS, 3] if pose else None,
+            task=_export_task,
         )
 
         # classes.txt
@@ -323,20 +367,30 @@ async def upload_images_with_labels(
     image_files: list[UploadFile] = File(..., description="Image files"),
     label_files: list[UploadFile] = File(None, description="Label files (.txt) in YOLO format"),
     classes_file: UploadFile = File(None, description="classes.txt file with one class name per line"),
+        label_format: str = Query(
+            "auto",
+            description="标签解析：detect=水平框；obb=旋转框(OBB)，支持四角(8数)或至少三顶点(6数)；auto=按行推断",
+        ),
     db: AsyncSession = Depends(get_db),
 ):
     """
     Upload images with corresponding YOLO format label files.
     Label files should have the same filename as images (except extension).
-    YOLO format: class_id x_center y_center width height (one line per object)
-    Optionally include a classes.txt file (one class name per line) to map class_id to class_name.
+
+    - **detect**：`class_id x_center y_center width height`（可选第 6 个数 confidence）
+    - **obb**：`class_id` 后为 **8 个数（四角）**，或 **至少 6 个数（≥3 个顶点，如三角形）**；多顶点时用 minAreaRect 得到四角
+    - **auto**：每行独立判断（5 个数→detect，8 个数→obb，≥6 且偶数→多边形/OBB，≥3 顶点）
     """
     dataset = await DatasetService.get_dataset(db, dataset_id)
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
 
+    fmt = (label_format or "auto").lower().strip()
+    if fmt not in ("detect", "obb", "auto"):
+        raise HTTPException(status_code=422, detail="label_format 必须是 detect、obb 或 auto")
+
     # Parse classes.txt if provided
-    classes_list = []
+    classes_list: List[str] = []
     if classes_file:
         try:
             content = await classes_file.read()
@@ -351,55 +405,61 @@ async def upload_images_with_labels(
         for label_file in label_files:
             if not label_file.filename.endswith('.txt'):
                 continue
-            # Get base name without extension
             base_name = Path(label_file.filename).stem
             content = await label_file.read()
             labels_map[base_name] = content.decode('utf-8')
 
-    # Collect all encountered class_ids to auto-generate classes if no classes.txt provided
-    all_class_ids = set()
+    # ── 先只解析标签（不读图片流），汇总类别 ID，再合并 dataset.classes，最后保存图片并写入 class_name ──
+    all_class_ids: set = set()
+    all_stats: list = []
+    pending: List[Tuple[Any, Optional[list]]] = []
 
-    results = []
     for image_file in image_files:
         if not allowed_image(image_file.filename):
             logger.warning(f"Skipped non-image file: {image_file.filename}")
             continue
 
-        # Parse annotations from corresponding label file
         base_name = Path(image_file.filename).stem
         anns = None
         if base_name in labels_map:
             try:
-                anns = []
                 label_content = labels_map[base_name]
-                for line in label_content.strip().split('\n'):
-                    if not line.strip():
-                        continue
-                    parts = line.strip().split()
-                    if len(parts) >= 5:
-                        class_id = int(parts[0])
-                        x_center = float(parts[1])
-                        y_center = float(parts[2])
-                        bbox_width = float(parts[3])
-                        bbox_height = float(parts[4])
-                        all_class_ids.add(class_id)
-                        # Map class_id to class_name if classes list is available
-                        class_name = None
-                        if classes_list and class_id < len(classes_list):
-                            class_name = classes_list[class_id]
-                        anns.append({
-                            'class_id': class_id,
-                            'class_name': class_name,
-                            'x_center': x_center,
-                            'y_center': y_center,
-                            'bbox_width': bbox_width,
-                            'bbox_height': bbox_height,
-                        })
+                anns, stats = parse_yolo_label_text(label_content, fmt)
+                all_stats.append(stats)
+                for ann in anns:
+                    all_class_ids.add(ann["class_id"])
             except Exception as e:
                 logger.error(f"Failed to parse label for {image_file.filename}: {e}")
                 anns = None
 
-        # 使用流式上传避免内存溢出
+        pending.append((image_file, anns))
+
+    max_id = max(all_class_ids) if all_class_ids else -1
+    resolved: Optional[List[str]] = None
+    if max_id >= 0:
+        if classes_list:
+            resolved = list(classes_list)
+            while len(resolved) <= max_id:
+                resolved.append(f"class_{len(resolved)}")
+        else:
+            resolved = [f"class_{i}" for i in range(max_id + 1)]
+
+    if resolved:
+        _merge_resolved_class_names_into_dataset(dataset, resolved)
+        logger.info(f"导入合并类别后 dataset {dataset_id} classes: {dataset.classes}")
+
+    class_names = dataset.classes or []
+
+    results = []
+    for image_file, anns in pending:
+        if anns:
+            for ann in anns:
+                cid = int(ann["class_id"])
+                if cid < len(class_names):
+                    ann["class_name"] = class_names[cid]
+                else:
+                    ann["class_name"] = f"class_{cid}"
+
         image = await DatasetService.save_uploaded_image_stream(
             db=db,
             dataset_id=dataset_id,
@@ -415,29 +475,8 @@ async def upload_images_with_labels(
                 'annotations_count': len(anns) if anns else 0,
             })
 
-    # Update dataset classes
-    if classes_list:
-        # Use the provided classes.txt
-        new_classes = classes_list
-    elif all_class_ids:
-        # Auto-generate class names from class_ids (e.g., "class_0", "class_1")
-        max_id = max(all_class_ids)
-        new_classes = [f"class_{i}" for i in range(max_id + 1)]
-    else:
-        new_classes = None
-
-    if new_classes:
-        # Merge with existing classes
-        existing = dataset.classes or []
-        if len(new_classes) > len(existing):
-            # Extend: keep existing names, fill in new ones
-            merged = list(existing)
-            for i in range(len(existing), len(new_classes)):
-                merged.append(new_classes[i])
-            dataset.classes = merged
-        elif not existing:
-            dataset.classes = new_classes
-        logger.info(f"Updated dataset {dataset_id} classes: {dataset.classes}")
+    if all_stats:
+        dataset.label_task = merge_label_task_from_upload(fmt, all_stats, dataset.label_task)
 
     await db.commit()
     return {
@@ -445,6 +484,9 @@ async def upload_images_with_labels(
         "uploaded": len(results),
         "total_annotations": sum(r['annotations_count'] for r in results),
         "classes": dataset.classes or [],
+        "label_format": fmt,
+        "label_task": dataset.label_task,
+        "parse_stats": all_stats,
         "details": results,
     }
 
@@ -613,11 +655,30 @@ async def serve_image(
 ):
     # Generate ETag based on image_id
     etag = f'"{image_id}"'
-
-    # Check If-None-Match header for cache validation
     if_none_match = request.headers.get("if-none-match")
-    if if_none_match == etag:
-        # Client has cached version, return 304 Not Modified
+
+    image = await DatasetService.get_image(db, image_id)
+    if not image:
+        raise HTTPException(status_code=404, detail="Image not found")
+
+    file_path_str = image.thumbnail_path if thumbnail and image.thumbnail_path else image.file_path
+    if not file_path_str:
+        logger.warning(
+            "serve_image: DB 中无可用路径 image_id={} dataset_id={} thumbnail={} file_path={} thumbnail_path={}",
+            image_id,
+            image.dataset_id,
+            thumbnail,
+            image.file_path,
+            image.thumbnail_path,
+        )
+        raise HTTPException(status_code=404, detail="File not found on disk")
+
+    file_path = Path(str(file_path_str).replace("\\", "/"))
+    on_disk = file_path.is_file()
+
+    # 仅当磁盘上仍存在文件时才返回 304；旧逻辑不校验磁盘会导致浏览器长期显示已删除/迁移前的缓存图，
+    # 与训练导出「找不到源文件」表现不一致。
+    if if_none_match == etag and on_disk:
         return Response(
             status_code=304,
             headers={
@@ -626,22 +687,24 @@ async def serve_image(
             }
         )
 
-    # Cache miss or first request - fetch from database
-    image = await DatasetService.get_image(db, image_id)
-    if not image:
-        raise HTTPException(status_code=404, detail="Image not found")
-
-    file_path = image.thumbnail_path if thumbnail and image.thumbnail_path else image.file_path
-    if not file_path or not Path(file_path).exists():
+    if not on_disk:
+        logger.warning(
+            "serve_image: 磁盘文件不存在（标注页与训练导出均无法读到此图） image_id={} dataset_id={} thumbnail={} "
+            "resolved={} db.file_path={} db.thumbnail_path={}",
+            image_id,
+            image.dataset_id,
+            thumbnail,
+            file_path,
+            image.file_path,
+            image.thumbnail_path,
+        )
         raise HTTPException(status_code=404, detail="File not found on disk")
 
-    # Return FileResponse with aggressive caching headers
-    # Images don't change once uploaded, so cache for 1 year
     return FileResponse(
-        file_path,
+        str(file_path),
         media_type="image/jpeg",
         headers={
-            "Cache-Control": "public, max-age=31536000, immutable",  # 1 year cache
-            "ETag": etag,  # Use image_id as ETag for cache validation
+            "Cache-Control": "public, max-age=31536000, immutable",
+            "ETag": etag,
         }
     )

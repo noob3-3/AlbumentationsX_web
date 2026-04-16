@@ -318,6 +318,7 @@ import {nextTick, onMounted, ref, watch} from 'vue'
 import {ElMessage} from 'element-plus'
 import {FolderOpened, UploadFilled, View} from '@element-plus/icons-vue'
 import axios from 'axios'
+import {drawDetectionOverlay} from '@/utils/drawDetectionsCanvas'
 import {useProjectStore} from '@/stores/project'
 import {storeToRefs} from 'pinia'
 
@@ -345,27 +346,7 @@ function drawDetections(canvas, imageSrc, detections) {
     canvas.height = img.height * scale
     ctx.drawImage(img, 0, 0, canvas.width, canvas.height)
 
-    if (!detections || detections.length === 0) return
-
-    detections.forEach((det, idx) => {
-      const color = getColor(idx)
-      const [x1, y1, x2, y2] = det.bbox.map((v) => v * scale)
-      const w = x2 - x1
-      const h = y2 - y1
-
-      ctx.strokeStyle = color
-      ctx.lineWidth = 2
-      ctx.strokeRect(x1, y1, w, h)
-
-      const label = `${det.class_name} ${(det.confidence * 100).toFixed(0)}%`
-      ctx.font = 'bold 13px sans-serif'
-      const textW = ctx.measureText(label).width
-      const textH = 18
-      ctx.fillStyle = color
-      ctx.fillRect(x1, y1 - textH, textW + 8, textH)
-      ctx.fillStyle = '#fff'
-      ctx.fillText(label, x1 + 4, y1 - 4)
-    })
+    drawDetectionOverlay(ctx, scale, detections, getColor)
   }
   img.src = imageSrc
 }

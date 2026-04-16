@@ -183,8 +183,11 @@
         </el-form-item>
         <el-form-item label="基础模型">
           <el-select v-model="trainForm.model_name" style="width:100%">
-            <el-option v-for="m in availableModels" :key="m" :label="m" :value="m" />
+            <el-option v-for="m in trainDialogModels" :key="m" :label="m" :value="m"/>
           </el-select>
+          <div v-if="dataset?.label_task === 'obb'" style="margin-top:6px;font-size:12px;color:#909399">
+            当前数据集为 OBB，仅显示 *-obb.pt 权重
+          </div>
         </el-form-item>
         <el-form-item label="训练轮数">
           <el-input-number v-model="trainForm.epochs" :min="1" :max="1000" />
@@ -202,7 +205,7 @@
 </template>
 
 <script setup>
-import {onMounted, ref} from 'vue'
+import {computed, onMounted, ref, watch} from 'vue'
 import {useRoute, useRouter} from 'vue-router'
 import {Cpu, Delete, Download, Edit, MagicStick, Operation, Picture, Upload} from '@element-plus/icons-vue'
 import {ElMessage} from 'element-plus'
@@ -235,6 +238,26 @@ const exportForm = ref({
 })
 const availableModels = ref([])
 const otherDatasets = ref([])
+
+const trainDialogModels = computed(() => {
+  const list = availableModels.value || []
+  const t = dataset.value?.label_task || 'detect'
+  return list.filter((m) => {
+    const low = (m || '').toLowerCase()
+    const isObb = low.includes('-obb')
+    const isPose = low.includes('-pose')
+    if (t === 'obb') return isObb
+    if (t === 'pose') return isPose
+    return !isObb && !isPose
+  })
+})
+
+watch(trainDialogModels, (list) => {
+  if (!list.length) return
+  if (!list.includes(trainForm.value.model_name)) {
+    trainForm.value.model_name = list[0]
+  }
+})
 
 const trainForm = ref({
   name: `训练_${new Date().toLocaleDateString('zh-CN')}`,
