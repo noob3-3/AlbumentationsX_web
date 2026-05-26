@@ -161,6 +161,26 @@ def annotation_to_obb_corners(
     return (x1, y1, x2, y2, x3, y3, x4, y4)
 
 
+def annotation_polygon_normalized_for_segment(ann: dict) -> List[Tuple[float, float]]:
+    """
+    YOLO 实例分割标签：一行 class x1 y1 x2 y2 ...（归一化）。
+    优先 polygon_points（≥3 点）；否则用水平框四角。
+    """
+    poly = ann.get("polygon_points")
+    if poly and len(poly) >= 3:
+        return [(_clamp01(float(p[0])), _clamp01(float(p[1]))) for p in poly]
+    cx = float(ann["x_center"])
+    cy = float(ann["y_center"])
+    w = float(ann["bbox_width"])
+    h = float(ann["bbox_height"])
+    hw, hh = w / 2.0, h / 2.0
+    x1, y1 = _clamp01(cx - hw), _clamp01(cy - hh)
+    x2, y2 = _clamp01(cx + hw), _clamp01(cy - hh)
+    x3, y3 = _clamp01(cx + hw), _clamp01(cy + hh)
+    x4, y4 = _clamp01(cx - hw), _clamp01(cy + hh)
+    return [(x1, y1), (x2, y2), (x3, y3), (x4, y4)]
+
+
 def annotation_to_pose_keypoints(
         ann: dict,
         num_keypoints: int = YOLOV8_POSE_NUM_KEYPOINTS,
@@ -205,12 +225,21 @@ def write_yolo_annotation(
         *,
         pose: bool = False,
         obb: bool = False,
+        segment: bool = False,
         num_keypoints: int = YOLOV8_POSE_NUM_KEYPOINTS,
 ) -> bool:
-    """Write YOLO 标签：detect / pose / obb 三选一（pose 与 obb 互斥）。"""
-    if pose and obb:
-        logger.warning("write_yolo_annotation: pose and obb both True, using pose")
+    """Write YOLO 标签：detect / pose / obb / segment 四选一（按优先级 pose > obb > segment > detect）。"""
+    modes = sum([bool(pose), bool(obb), bool(segment)])
+    if modes > 1:
+        logger.warning(
+            "write_yolo_annotation: 多个导出模式同时为 True（pose/obb/segment），"
+            "使用优先级 pose > obb > segment > detect",
+        )
+    if pose:
         obb = False
+        segment = False
+    elif obb:
+        segment = False
     try:
         with open(label_path, "w") as f:
             for ann in annotations:
@@ -234,6 +263,14 @@ def write_yolo_annotation(
                         f"{ann['class_id']} {c[0]:.6f} {c[1]:.6f} {c[2]:.6f} {c[3]:.6f} "
                         f"{c[4]:.6f} {c[5]:.6f} {c[6]:.6f} {c[7]:.6f}\n"
                     )
+                elif segment:
+                    pts = annotation_polygon_normalized_for_segment(ann)
+                    parts = [str(ann["class_id"])] + [
+                        cx
+                        for xy in pts
+                        for cx in (f"{xy[0]:.6f}", f"{xy[1]:.6f}")
+                    ]
+                    f.write(" ".join(parts) + "\n")
                 else:
                     f.write(
                         f"{ann['class_id']} {ann['x_center']:.6f} "

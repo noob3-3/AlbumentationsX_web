@@ -6,33 +6,57 @@
         <div class="selector-label">
           选择要标注的图片
           <el-tag size="small" type="info" style="margin-left: 8px">
-            快捷键: A 上一张 | D 下一张 | W 切换绘制/选择 | 滚轮缩放 | Ctrl+S/Ctrl+P 保存并跳转
+            快捷键: A 上一张 | D 下一张 | Alt+←/→ 快速翻页 | W 绘制/选择 | Ctrl+S/Ctrl+P 保存并跳转
           </el-tag>
         </div>
         <el-select
-          v-model="selectedImageId"
+          :model-value="selectedImageId"
           placeholder="选择图片"
           filterable
-          @change="onImageSelected"
+          @update:model-value="goToImage"
           style="width: 100%"
         >
           <el-option
             v-for="(img, index) in images"
             :key="img.id"
-            :label="`${index + 1}. ${img.original_filename} (${img.annotations?.length || 0} 个标注)${img.is_augmented ? ' [增强]' : ''}`"
+            :label="`${index + 1}. ${img.original_filename}${img.is_augmented ? ' [增强]' : ''}`"
             :value="img.id"
           >
             <span style="float: left">#{{ index + 1 }}</span>
             <span style="margin-left: 8px">{{ img.original_filename }}</span>
             <span style="float: right; color: #8492a6; font-size: 12px">
-              {{ img.annotations?.length || 0 }} 个标注
+              <template v-if="annotationMode === 'semantic'">
+                {{ img.semantic_mask_path ? '有掩膜' : '无掩膜' }}
+              </template>
+              <template v-else>
+                {{ img.annotations?.length || 0 }} 个标注
+              </template>
               <el-tag v-if="img.is_augmented" size="small" type="warning" style="margin-left: 4px">增强</el-tag>
             </span>
           </el-option>
         </el-select>
       </el-col>
-      <el-col :span="12" style="display: flex; gap: 8px; align-items: flex-end">
-        <el-button type="primary" icon="MagicStick" @click="openAutoAnnotation" plain>
+      <el-col :span="12" style="display: flex; gap: 8px; align-items: flex-end; flex-wrap: wrap">
+        <el-tooltip
+          content="开启后，切换图片时把当前画布上的标注复制到下一张（归一化坐标），适合连续帧微调；关闭则加载各图已有标注。"
+          placement="top"
+        >
+          <el-switch
+            v-if="annotationMode !== 'semantic'"
+            v-model="carryAnnotationsOnSwitch"
+            inline-prompt
+            active-text="携带标注"
+            inactive-text="携带标注"
+            style="margin-right: 4px"
+          />
+        </el-tooltip>
+        <el-button
+          v-if="annotationMode !== 'semantic'"
+          type="primary"
+          icon="MagicStick"
+          @click="openAutoAnnotation"
+          plain
+        >
           自动标注
         </el-button>
         <el-button @click="previousImage" :disabled="!canGoPrevious">
@@ -80,7 +104,17 @@
 
     <!-- Editor -->
     <div v-if="currentImage" class="editor-wrapper">
+      <SemanticMaskEditor
+        v-if="annotationMode === 'semantic'"
+        ref="semanticEditorRef"
+        :dataset-id="datasetId"
+        :image-id="currentImage.id"
+        :image-url="imageUrl(currentImage.id)"
+        :classes="classes"
+        @saved="onSemanticMaskSaved"
+      />
       <AnnotationEditor
+        v-else
         ref="editorRef"
         :imageId="currentImage.id"
         :imageUrl="imageUrl(currentImage.id)"
@@ -113,14 +147,17 @@
           :key="img.id"
           class="image-card-small"
           :class="{ active: img.id === selectedImageId }"
-          @click="selectedImageId = img.id; showImageList = false; onImageSelected(img.id)"
+          @click="onDrawerPickImage(img.id)"
         >
           <el-image
             :src="imageUrl(img.id, true)"
             fit="cover"
             style="width: 100%; height: 100%"
           />
-          <div class="image-badge">{{ img.annotations?.length || 0 }}</div>
+          <div class="image-badge">
+            <template v-if="annotationMode === 'semantic'">{{ img.semantic_mask_path ? 'M' : '-' }}</template>
+            <template v-else>{{ img.annotations?.length || 0 }}</template>
+          </div>
         </div>
       </div>
     </el-drawer>
@@ -132,6 +169,7 @@ import {computed, nextTick, onMounted, reactive, ref, watch} from 'vue'
 import {ElMessage} from 'element-plus'
 import {ArrowDown, FolderOpened} from '@element-plus/icons-vue'
 import AnnotationEditor from './AnnotationEditor.vue'
+import SemanticMaskEditor from './SemanticMaskEditor.vue'
 import AutoAnnotationDialog from './AutoAnnotationDialog.vue'
 import {datasetApi} from '@/api'
 
@@ -164,8 +202,14 @@ const emit = defineEmits(['annotationsSaved', 'imageDeleted', 'imageMoved'])
 
 const selectedImageId = ref('')
 const editorRef = ref(null)
+const semanticEditorRef = ref(null)
 const autoAnnotationDialog = ref(null)
 const showImageList = ref(false)
+/** 切换图片时是否携带当前画布标注（归一化坐标），便于连续运动帧微调 */
+const carryAnnotationsOnSwitch = ref(false)
+/** 与 pendingCarryTargetImageId 配对：仅在该目标图生效一次 */
+const pendingCarryAnnotations = ref(null)
+const pendingCarryTargetImageId = ref(null)
 
 const preloadCache = reactive(new Map())
 
@@ -181,6 +225,13 @@ const currentImage = computed(() => {
 const EMPTY_ANNOTATIONS = Object.freeze([])
 
 const editorInitialAnnotations = computed(() => {
+  if (
+    carryAnnotationsOnSwitch.value &&
+    pendingCarryTargetImageId.value === selectedImageId.value &&
+    pendingCarryAnnotations.value !== null
+  ) {
+    return pendingCarryAnnotations.value
+  }
   const ann = currentImage.value?.annotations
   if (Array.isArray(ann)) return ann
   return EMPTY_ANNOTATIONS
@@ -216,6 +267,13 @@ watch(() => props.images, (newImages) => {
     nextTick(() => preloadAdjacentImages())
   }
 }, { immediate: false })
+
+watch(carryAnnotationsOnSwitch, (on) => {
+  if (!on) {
+    pendingCarryAnnotations.value = null
+    pendingCarryTargetImageId.value = null
+  }
+})
 
 watch([() => currentImage.value?.id, () => currentPreloadedImage.value], ([imgId, preloaded]) => {
   logLoad('editor props', { imageId: imgId, hasPreloaded: !!preloaded })
@@ -270,55 +328,98 @@ function imageUrl(imageId, thumbnail = false) {
   return `/api/v1/datasets/files/image/${imageId}${thumbnail ? '?thumbnail=true' : ''}`
 }
 
-function onImageSelected(imageId) {
+function stripAnnotationIdsForCarry(list) {
+  if (!Array.isArray(list)) return []
+  return list.map((a) => {
+    const c = { ...a }
+    delete c.id
+    delete c.image_id
+    delete c.created_at
+    return c
+  })
+}
+
+function cloneAnnotationsForCarry() {
+  const raw = editorRef.value?.getAnnotations?.()
+  if (!raw?.length) return []
+  return stripAnnotationIdsForCarry(JSON.parse(JSON.stringify(raw)))
+}
+
+function armCarryIfNeeded(targetImageId) {
+  if (carryAnnotationsOnSwitch.value) {
+    pendingCarryAnnotations.value = cloneAnnotationsForCarry()
+    pendingCarryTargetImageId.value = targetImageId
+  } else {
+    pendingCarryAnnotations.value = null
+    pendingCarryTargetImageId.value = null
+  }
+}
+
+async function beforeLeaveCurrentImage() {
+  if (props.annotationMode === 'semantic') {
+    const ed = semanticEditorRef.value
+    if (!ed || !ed.isDirty || !ed.isDirty()) return
+    try {
+      const ok = await ed.saveIfDirty({ silent: true })
+      if (!ok) throw new Error('semantic mask save failed')
+      await new Promise((resolve) => setTimeout(resolve, 120))
+    } catch (error) {
+      console.error('Failed to save semantic mask:', error)
+      ElMessage.error('自动保存掩膜失败，请点「保存掩膜 PNG」后再切换图片')
+      throw error
+    }
+    return
+  }
+  if (!editorRef.value?.isDirty()) return
+  try {
+    await editorRef.value.saveAnnotations()
+    await new Promise((resolve) => setTimeout(resolve, 200))
+  } catch (error) {
+    console.error('Failed to save annotations:', error)
+    ElMessage.error('保存标注失败')
+    throw error
+  }
+}
+
+async function goToImage(imageId) {
+  if (!imageId || imageId === selectedImageId.value) return
+  try {
+    await beforeLeaveCurrentImage()
+  } catch {
+    return
+  }
+  armCarryIfNeeded(imageId)
   selectedImageId.value = imageId
+}
+
+async function onDrawerPickImage(imageId) {
+  showImageList.value = false
+  await goToImage(imageId)
 }
 
 async function previousImage() {
   if (!canGoPrevious.value) return
-
-  if (editorRef.value?.isDirty()) {
-    try {
-      await editorRef.value.saveAnnotations()
-      await new Promise(resolve => setTimeout(resolve, 200))
-    } catch (error) {
-      console.error('Failed to save annotations:', error)
-      ElMessage.error('保存标注失败')
-      return
-    }
-  }
-
-  selectedImageId.value = props.images[currentImageIndex.value - 1].id
+  await goToImage(props.images[currentImageIndex.value - 1].id)
 }
 
 async function nextImage() {
   if (!canGoNext.value) return
-
-  if (editorRef.value?.isDirty()) {
-    try {
-      await editorRef.value.saveAnnotations()
-      await new Promise(resolve => setTimeout(resolve, 200))
-    } catch (error) {
-      console.error('Failed to save annotations:', error)
-      ElMessage.error('保存标注失败')
-      return
-    }
-  }
-
-  selectedImageId.value = props.images[currentImageIndex.value + 1].id
+  await goToImage(props.images[currentImageIndex.value + 1].id)
 }
 
 // Quick navigation without saving - used by Alt+Arrow shortcuts
 function quickPreviousImage() {
-  if (canGoPrevious.value) {
-    selectedImageId.value = props.images[currentImageIndex.value - 1].id
-  }
+  if (!canGoPrevious.value) return
+  const newId = props.images[currentImageIndex.value - 1].id
+  armCarryIfNeeded(newId)
+  selectedImageId.value = newId
 }
 
 function quickNextImage() {
-  if (canGoNext.value) {
-    selectedImageId.value = props.images[currentImageIndex.value + 1].id
-  }
+  if (!canGoNext.value) return
+  const newId = props.images[currentImageIndex.value + 1].id
+  armCarryIfNeeded(newId)
+  selectedImageId.value = newId
 }
 
 // Save current annotations and go to next image
@@ -358,22 +459,40 @@ function handleKeyDown(event) {
   // W: 切换绘制/选择状态
   if (event.key === 'w' || event.key === 'W') {
     event.preventDefault()
+    if (props.annotationMode === 'semantic') return
     editorRef.value?.toggleDrawSelect?.()
     return
   }
 
   if (isCtrl && event.key === 's') {
     event.preventDefault()
-    // Ctrl+S: 保存并跳转到下一张（最常用）
+    if (props.annotationMode === 'semantic') {
+      void (async () => {
+        await semanticEditorRef.value?.saveIfDirty?.({ silent: false })
+        await saveAndNext()
+      })()
+      return
+    }
     saveAndNext()
   } else if (isCtrl && event.key === 'Enter') {
     event.preventDefault()
+    if (props.annotationMode === 'semantic') {
+      void semanticEditorRef.value?.saveIfDirty?.({ silent: false })
+      return
+    }
     // Ctrl+Enter: 仅保存不跳转
     if (editorRef.value) {
       editorRef.value.saveAnnotations()
     }
   } else if (isCtrl && event.key === 'p') {
     event.preventDefault()
+    if (props.annotationMode === 'semantic') {
+      void (async () => {
+        await semanticEditorRef.value?.saveIfDirty?.({ silent: false })
+        await saveAndPrevious()
+      })()
+      return
+    }
     // Ctrl+P: 保存并跳转到上一张
     saveAndPrevious()
   } else if (event.key === 'ArrowRight' && event.altKey) {
@@ -393,6 +512,8 @@ async function moveCurrentImage(targetDatasetId) {
     await datasetApi.moveImage(props.datasetId, selectedImageId.value, targetDatasetId)
     const movedId = selectedImageId.value
     const idx = currentImageIndex.value
+    pendingCarryAnnotations.value = null
+    pendingCarryTargetImageId.value = null
     if (idx > 0) {
       selectedImageId.value = props.images[idx - 1].id
     } else if (idx < props.images.length - 1) {
@@ -413,6 +534,8 @@ async function deleteCurrentImage() {
     await datasetApi.deleteImage(props.datasetId, selectedImageId.value)
     const deletedId = selectedImageId.value
     const idx = currentImageIndex.value
+    pendingCarryAnnotations.value = null
+    pendingCarryTargetImageId.value = null
     // 切换到上一张或下一张
     if (idx > 0) {
       selectedImageId.value = props.images[idx - 1].id
@@ -458,6 +581,10 @@ async function saveAnnotations({ imageId, annotations }) {
   }
 }
 
+function onSemanticMaskSaved() {
+  emit('annotationsSaved')
+}
+
 function openAutoAnnotation() {
   autoAnnotationDialog.value?.open()
 }
@@ -497,6 +624,8 @@ defineExpose({
 
 .editor-wrapper {
   flex: 1;
+  min-width: 0;
+  width: 100%;
   background: white;
   border-radius: 4px;
   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);

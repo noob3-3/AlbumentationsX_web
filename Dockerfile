@@ -91,7 +91,8 @@ ENV PYTHONUNBUFFERED=1 \
     PORT=8000 \
     DEBUG=false \
     STATIC_DIR=/app/static \
-    DATABASE_URL=sqlite:///./data/app.db
+    DATABASE_URL=sqlite:///./data/app.db \
+    NO_ALBUMENTATIONS_UPDATE=1
 
 EXPOSE 8000
 

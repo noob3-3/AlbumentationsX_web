@@ -51,7 +51,7 @@ COPY backend/requirements-gpu.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 # 2) 升级 Ultralytics（其依赖 torch>=1.8、numpy>=1.23 无上限，可能拉高 numpy 或 torch）
-RUN pip install --no-cache-dir -U "ultralytics>=8.4.23"
+RUN pip install --no-cache-dir -U "ultralytics>=8.4.52"  -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
 
 # 3) 最后强制安装指定版本，覆盖任何被依赖解析改动的包
 #    - PyTorch 2.2.2 + CUDA 11.8（国内镜像）
@@ -85,7 +85,8 @@ RUN mkdir -p \
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     STATIC_DIR=/app/static \
-    TZ=Asia/Shanghai
+    TZ=Asia/Shanghai \
+    NO_ALBUMENTATIONS_UPDATE=1
 
 # Expose port
 EXPOSE 8000

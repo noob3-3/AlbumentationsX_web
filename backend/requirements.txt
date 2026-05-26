@@ -31,8 +31,8 @@ numpy>=1.26.0,<2
 # Augmentation
 albumentations>=1.4.0
 
-# Object Detection Training
-ultralytics>=8.4.23
+# Object Detection / 语义分割 yolo26n-sem 等需在 nn.tasks 中包含 SemanticSegmentationModel（Ultralytics >=8.4.52，见 GH#24518）
+ultralytics>=8.4.52
 
 # Utilities
 pyyaml>=6.0.1

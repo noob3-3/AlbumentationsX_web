@@ -31,6 +31,29 @@
         <el-card shadow="never">
           <div class="info-item"><span>图片总数</span><strong>{{ dataset?.image_count }}</strong></div>
           <div class="info-item"><span>标注总数</span><strong>{{ dataset?.annotation_count }}</strong></div>
+          <div class="info-item label-task-row">
+            <span>标注任务</span>
+            <div class="label-task-controls">
+              <el-select v-model="labelTaskDraft" size="small" style="width:100%">
+                <el-option label="水平框检测 (detect)" value="detect" />
+                <el-option label="旋转框 OBB" value="obb" />
+                <el-option label="实例分割 segment" value="segment" />
+                <el-option label="语义分割 semantic" value="semantic" />
+                <el-option label="姿态 pose" value="pose" />
+              </el-select>
+              <el-button
+                type="primary"
+                size="small"
+                :loading="labelTaskSaving"
+                :disabled="!dataset || labelTaskDraft === (dataset.label_task || 'detect')"
+                style="margin-top:8px;width:100%"
+                @click="saveLabelTask"
+              >
+                保存标注任务
+              </el-button>
+              <div class="label-task-hint">与训练可选权重（如 *-obb.pt）及标注工具默认模式一致</div>
+            </div>
+          </div>
           <div class="info-item"><span>状态</span>
             <el-tag :type="statusType(dataset?.status)" size="small">{{ dataset?.status }}</el-tag>
           </div>
@@ -71,6 +94,7 @@
                 :classes="dataset?.classes || []"
                 :datasets="otherDatasets"
                 :imageUrlFunc="imageUrl"
+                :annotation-mode="annotationViewMode"
                 @annotationsSaved="onAnnotationsSaved"
                 @imageDeleted="onImageDeleted"
                 @imageMoved="onImageMoved"
@@ -188,6 +212,9 @@
           <div v-if="dataset?.label_task === 'obb'" style="margin-top:6px;font-size:12px;color:#909399">
             当前数据集为 OBB，仅显示 *-obb.pt 权重
           </div>
+          <div v-else-if="dataset?.label_task === 'semantic'" style="margin-top:6px;font-size:12px;color:#909399">
+            当前数据集为语义分割，仅显示 *-sem.pt 权重（如 yolo26n-sem.pt），需已为各图上传 PNG 掩膜
+          </div>
         </el-form-item>
         <el-form-item label="训练轮数">
           <el-input-number v-model="trainForm.epochs" :min="1" :max="1000" />
@@ -239,6 +266,25 @@ const exportForm = ref({
 const availableModels = ref([])
 const otherDatasets = ref([])
 
+/** 与数据集 label_task 对齐，OBB 时标注页默认四边形工具 */
+const annotationViewMode = computed(() => {
+  const t = dataset.value?.label_task
+  if (t === 'obb' || t === 'pose' || t === 'segment' || t === 'semantic') return t
+  return ''
+})
+
+const labelTaskDraft = ref('detect')
+const labelTaskSaving = ref(false)
+
+watch(
+  () => dataset.value?.label_task,
+  (t) => {
+    const v = String(t || 'detect').toLowerCase()
+    labelTaskDraft.value = ['obb', 'pose', 'segment', 'semantic', 'detect'].includes(v) ? v : 'detect'
+  },
+  { immediate: true },
+)
+
 const trainDialogModels = computed(() => {
   const list = availableModels.value || []
   const t = dataset.value?.label_task || 'detect'
@@ -246,9 +292,13 @@ const trainDialogModels = computed(() => {
     const low = (m || '').toLowerCase()
     const isObb = low.includes('-obb')
     const isPose = low.includes('-pose')
+    const isSemantic = low.includes('-sem') && !low.includes('-seg')
+    const isSeg = low.includes('-seg') && !low.includes('-sem')
     if (t === 'obb') return isObb
     if (t === 'pose') return isPose
-    return !isObb && !isPose
+    if (t === 'segment') return isSeg
+    if (t === 'semantic') return isSemantic
+    return !isObb && !isPose && !isSeg && !isSemantic
   })
 })
 
@@ -272,6 +322,20 @@ const trainForm = ref({
 
 const imageUrl = (imageId, thumb = false) => datasetApi.imageUrl(imageId, thumb)
 const statusType = (s) => ({ active: 'success', ready: 'success', error: 'danger' })[s] || 'info'
+
+async function saveLabelTask() {
+  if (!dataset.value) return
+  labelTaskSaving.value = true
+  try {
+    await datasetApi.update(id, { label_task: labelTaskDraft.value })
+    ElMessage.success('标注任务已更新')
+    await store.fetchDataset(id)
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.detail || '保存失败')
+  } finally {
+    labelTaskSaving.value = false
+  }
+}
 
 onMounted(async () => {
   await store.fetchDataset(id)
@@ -377,6 +441,12 @@ function buildExportQueryParams() {
     params.include_augmented = true
     params.augmented_only = false
   }
+  if (dataset.value?.label_task === 'segment') {
+    params.segment = true
+  }
+  if (dataset.value?.label_task === 'semantic') {
+    params.semantic_masks = true
+  }
   return params
 }
 
@@ -432,6 +502,22 @@ async function startTraining() {
 }
 .info-item span { color: #909399; font-size: 13px; flex-shrink: 0; }
 .info-item strong { font-weight: 600; }
+
+.info-item.label-task-row {
+  flex-direction: column;
+  align-items: stretch;
+}
+
+.label-task-controls {
+  width: 100%;
+}
+
+.label-task-hint {
+  margin-top: 6px;
+  font-size: 12px;
+  color: #909399;
+  line-height: 1.4;
+}
 
 .image-grid {
   display: grid;

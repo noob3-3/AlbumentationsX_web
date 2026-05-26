@@ -111,6 +111,11 @@
                 </template>
               </el-table-column>
               <el-table-column prop="annotation_count" label="标注数" width="100" align="center" />
+              <el-table-column label="标注任务" width="120" align="center">
+                <template #default="{ row }">
+                  <el-tag size="small" type="info">{{ labelTaskLabel(row.label_task) }}</el-tag>
+                </template>
+              </el-table-column>
               <el-table-column label="类别" min-width="160">
                 <template #default="{ row }">
                   <el-tag
@@ -129,10 +134,13 @@
                   <el-tag :type="getStatusType(row.status)" size="small">{{ row.status }}</el-tag>
                 </template>
               </el-table-column>
-              <el-table-column label="操作" width="360" fixed="right">
+              <el-table-column label="操作" width="420" fixed="right">
                 <template #default="{ row }">
                   <el-button link type="primary" size="small" @click="$router.push(`/datasets/${row.id}`)">
                     查看
+                  </el-button>
+                  <el-button link type="success" size="small" @click="openClassesManager(row)">
+                    类别
                   </el-button>
                   <el-button link type="primary" size="small" @click="$router.push(`/collect?dataset=${row.id}`)">
                     采集
@@ -305,6 +313,18 @@
             style="width: 100%"
           />
         </el-form-item>
+        <el-form-item label="标注任务">
+          <el-radio-group v-model="datasetForm.label_task">
+            <el-radio value="detect">水平框检测</el-radio>
+            <el-radio value="obb">旋转框 / OBB</el-radio>
+            <el-radio value="segment">实例分割（多边形）</el-radio>
+            <el-radio value="semantic">语义分割（PNG 掩膜 / -sem）</el-radio>
+            <el-radio value="pose">姿态（*-pose.pt）</el-radio>
+          </el-radio-group>
+          <div style="margin-top:6px;color:#909399;font-size:12px;line-height:1.5">
+            与「带标签上传」中的标签格式一致；决定训练页可选的基础权重（如 OBB 需选 yolo11n-obb.pt）。自建数据集也可在此指定，无需依赖上传时的格式选择。
+          </div>
+        </el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="showCreateDatasetDialog = false">取消</el-button>
@@ -333,6 +353,12 @@
         <el-button type="primary" :loading="exportDatasetLoading" @click="confirmExportDataset">下载 ZIP</el-button>
       </template>
     </el-dialog>
+
+    <DatasetClassesManagerDialog
+      v-model="classesDialogVisible"
+      :dataset-id="classesDialogDatasetId"
+      @success="onDatasetClassesSaved"
+    />
   </div>
 </template>
 
@@ -353,6 +379,7 @@ import {
   Plus
 } from '@element-plus/icons-vue'
 import {datasetApi, projectApi} from '@/api'
+import DatasetClassesManagerDialog from '@/components/dataset/DatasetClassesManagerDialog.vue'
 import {confirmDatasetDelete, confirmPurgeAugmentedOnly} from '@/utils/datasetDeleteConfirm'
 import {useProjectStore} from '@/stores/project'
 
@@ -371,6 +398,8 @@ const showExportDatasetDialog = ref(false)
 const exportDatasetTarget = ref(null)
 const exportDatasetLoading = ref(false)
 const exportDatasetForm = ref({scope: 'all', annotatedOnly: false})
+const classesDialogVisible = ref(false)
+const classesDialogDatasetId = ref('')
 
 const project = ref(null)
 const datasets = ref([])
@@ -395,7 +424,14 @@ const datasetForm = ref({
   name: '',
   description: '',
   classes: [],
+  label_task: 'detect',
 })
+
+function labelTaskLabel(t) {
+  const map = { detect: '水平框', obb: 'OBB', pose: '姿态', segment: '分割', semantic: '语义' }
+  const k = (t || 'detect').toLowerCase()
+  return map[k] || k
+}
 
 const totalImages = computed(() => {
   return datasets.value.reduce((sum, ds) => sum + (ds.image_count || 0), 0)
@@ -496,7 +532,7 @@ async function createDataset() {
     await datasetApi.create(data)
     ElMessage.success('数据集已创建')
     showCreateDatasetDialog.value = false
-    datasetForm.value = { name: '', description: '', classes: [] }
+    datasetForm.value = { name: '', description: '', classes: [], label_task: 'detect' }
     loadDatasets()
     await projectApi.updateCounts(projectId.value)
     loadProject()
@@ -505,6 +541,17 @@ async function createDataset() {
   } finally {
     creatingDataset.value = false
   }
+}
+
+function openClassesManager(row) {
+  classesDialogDatasetId.value = row.id
+  classesDialogVisible.value = true
+}
+
+async function onDatasetClassesSaved() {
+  loadDatasets()
+  await projectApi.updateCounts(projectId.value)
+  loadProject()
 }
 
 async function purgeAugmentedOnly(datasetId) {
@@ -543,6 +590,7 @@ async function deleteDataset(datasetId) {
 
 function buildProjectExportParams() {
   const {scope, annotatedOnly} = exportDatasetForm.value
+  const ds = exportDatasetTarget.value
   const params = {annotated_only: annotatedOnly}
   if (scope === 'original') {
     params.include_augmented = false
@@ -552,6 +600,12 @@ function buildProjectExportParams() {
   } else {
     params.include_augmented = true
     params.augmented_only = false
+  }
+  if (ds?.label_task === 'segment') {
+    params.segment = true
+  }
+  if (ds?.label_task === 'semantic') {
+    params.semantic_masks = true
   }
   return params
 }

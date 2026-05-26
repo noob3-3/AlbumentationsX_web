@@ -14,17 +14,47 @@ from ultralytics import YOLO
 _MIN_PT_BYTES = 16 * 1024
 
 
+def _github_asset_download_urls(canonical_github_url: str) -> List[str]:
+    """
+    依次尝试的直链列表：镜像（可多个）→ 官方 GitHub。
+    离线/无 DNS 时不要走 Ultralytics 的 YOLO(name) 下载：其会请求 api.github.com。
+
+    未设置 ULTRALYTICS_GITHUB_MIRROR 时：自动使用 gh.llkk.cc，失败再试 gh.felicity.ac.cn，最后直连 github.com。
+    """
+    u = (canonical_github_url or "").strip()
+    out: List[str] = []
+    if not u:
+        return out
+    custom = os.getenv("ULTRALYTICS_GITHUB_MIRROR", "").strip()
+    if custom:
+        mirror = custom if custom.endswith("/") else custom + "/"
+        if u.startswith("https://github.com/") or u.startswith("http://github.com/"):
+            cand = mirror + u
+            if cand not in out:
+                out.append(cand)
+    else:
+        for prefix in ("https://gh.llkk.cc/", "https://gh.felicity.ac.cn/"):
+            if not (u.startswith("https://github.com/") or u.startswith("http://github.com/")):
+                break
+            cand = prefix + u
+            if cand not in out:
+                out.append(cand)
+    if u not in out:
+        out.append(u)
+    return out
+
+
 def _mirrored_github_asset_url(canonical_github_url: str) -> str:
     """
-    将 GitHub Release 直链转为镜像 URL。
+    将 GitHub Release 直链转为镜像 URL（用于列表展示的首选下载地址）。
     环境变量 ULTRALYTICS_GITHUB_MIRROR：
-      未设置时默认 https://gh.felicity.ac.cn/（前缀 + 完整 GitHub URL）
+      未设置时默认 https://gh.llkk.cc/（前缀 + 完整 GitHub URL）
       设为空则直连 github.com
     """
     u = (canonical_github_url or "").strip()
     if not u:
         return u
-    mirror = os.getenv("ULTRALYTICS_GITHUB_MIRROR", "https://gh.felicity.ac.cn/").strip()
+    mirror = os.getenv("ULTRALYTICS_GITHUB_MIRROR", "https://gh.llkk.cc/").strip()
     if not mirror:
         return u
     if not (u.startswith("https://github.com/") or u.startswith("http://github.com/")):
@@ -143,6 +173,20 @@ PRETRAINED_MODELS = {
         "size": "~6 MB",
         "description": "人体关键点 / 姿态估计",
         "url": "https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n-pose.pt",
+    },
+    "yolo26n-seg.pt": {
+        "name": "YOLO26 Nano Segment",
+        "type": "segment",
+        "size": "~7 MB",
+        "description": "YOLO26 实例分割（nano），需多边形标注",
+        "url": "https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo26n-seg.pt",
+    },
+    "yolo26n-sem.pt": {
+        "name": "YOLO26 Nano Semantic",
+        "type": "semantic",
+        "size": "~4 MB",
+        "description": "YOLO26 语义分割（nano），数据集需 PNG 掩膜与 masks_dir",
+        "url": "https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo26n-sem.pt",
     },
     # YOLOv8 OBB / Pose
     "yolov8n-obb.pt": {
@@ -356,20 +400,25 @@ class PretrainedModelService:
             info = PRETRAINED_MODELS[model_filename]
             canonical = (info.get("url") or "").strip()
             if canonical:
-                fetch_url = _mirrored_github_asset_url(canonical)
-                logger.info(f"Trying mirrored HTTP download ({fetch_url[:96]}...)")
-                try:
-                    _download_http_to_file(fetch_url, model_path)
-                    if checkpoint_file_is_valid(model_path):
-                        logger.info(f"HTTP download OK -> {model_path}")
-                        return model_path
-                    logger.warning("HTTP file failed ZIP/size check, removing; will try YOLO()")
-                    _unlink_silent(model_path)
-                except Exception as http_err:
-                    logger.warning(f"HTTP download failed: {http_err}; falling back to Ultralytics")
-                    _unlink_silent(model_path)
+                for fetch_url in _github_asset_download_urls(canonical):
+                    logger.info(f"Trying HTTP download ({fetch_url[:120]}...)")
+                    try:
+                        _download_http_to_file(fetch_url, model_path)
+                        if checkpoint_file_is_valid(model_path):
+                            logger.info(f"HTTP download OK -> {model_path}")
+                            return model_path
+                        logger.warning("Downloaded file failed integrity check, retrying next URL if any")
+                        _unlink_silent(model_path)
+                    except Exception as http_err:
+                        logger.warning(f"HTTP download failed: {http_err}")
+                        _unlink_silent(model_path)
+                raise RuntimeError(
+                    f"无法下载预训练权重「{model_filename}」。当前环境可能无法访问 GitHub。"
+                    f"请将权重文件手动放入 {save_dir}，或设置可访问的 ULTRALYTICS_GITHUB_MIRROR（将完整 GitHub Release 直链作为前缀拼接），"
+                    f"官方直链参考：{canonical}"
+                )
 
-            # Ultralytics YOLO will auto-download to cache if not exists
+            # 无配置直链的旧模型名：才交由 Ultralytics 拉取（可能访问 api.github.com）
             model = YOLO(model_filename)
 
             # 尝试获取Ultralytics下载的模型路径并复制到持久化目录

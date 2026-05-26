@@ -293,21 +293,37 @@ const originalBBox = ref(null)
 /** 拖动/缩放多边形标注开始时备份 */
 const originalPolygon = ref(null)
 
-function onPolygonHotkey(e) {
-  if (selectedTool.value !== 'polygon') return
-  if (e.key === 'Enter' && polygonPoints.value.length >= polygonMinPoints.value) {
-    e.preventDefault()
-    finishPolygon()
+function onWindowKeydown(e) {
+  const target = e.target
+  const isInput = target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable
+  const isInDropdown = target.closest?.('.el-select__popper') || target.closest?.('.el-popper')
+  if (isInput || isInDropdown) return
+
+  if (selectedTool.value === 'polygon') {
+    if (e.key === 'Enter' && polygonPoints.value.length >= polygonMinPoints.value) {
+      e.preventDefault()
+      finishPolygon()
+      return
+    }
+    if (e.key === 'Backspace' && polygonPoints.value.length > 0) {
+      e.preventDefault()
+      polygonPoints.value.pop()
+      redraw()
+      return
+    }
   }
-  if (e.key === 'Backspace' && polygonPoints.value.length > 0) {
+
+  if (
+    (e.key === 'Delete' || e.key === 'Backspace') &&
+    selectedAnnotationIndex.value >= 0
+  ) {
     e.preventDefault()
-    polygonPoints.value.pop()
-    redraw()
+    deleteAnnotation(selectedAnnotationIndex.value)
   }
 }
 
 onMounted(async () => {
-  window.addEventListener('keydown', onPolygonHotkey)
+  window.addEventListener('keydown', onWindowKeydown)
   await nextTick()
   if (canvas.value) {
     ctx.value = canvas.value.getContext('2d')
@@ -320,14 +336,17 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
-  window.removeEventListener('keydown', onPolygonHotkey)
+  window.removeEventListener('keydown', onWindowKeydown)
 })
 
 // Watch for image changes
 watch(() => props.imageId, (newImageId, oldImageId) => {
   if (newImageId && newImageId !== oldImageId) {
     logLoad('imageId changed', oldImageId, '->', newImageId)
+    selectedAnnotationIndex.value = -1
     isDrawing.value = false
+    isDragging.value = false
+    isResizing.value = false
     currentAnnotation.value = null
     polygonPoints.value = []
     annotationHistory.value = []
@@ -631,10 +650,11 @@ function drawAnnotationLabel(annotation, x, y, isSelected) {
   const labelWidth = textMetrics.width + labelPadding * 2
   const cw = canvasWidth.value
   const ch = canvasHeight.value
-  // 画在框内顶部，避免贴画布边缘时标签画到图片外看不见
-  let lx = x
-  let ly = y
-  lx = Math.max(0, Math.min(lx, cw - labelWidth))
+  // y 为框顶边：优先标签在框外（上方）；若超出画布上缘则改到框内顶部
+  const lx = Math.max(0, Math.min(x, cw - labelWidth))
+  const lyOutside = y - labelHeight
+  let ly =
+    lyOutside >= 0 ? lyOutside : Math.max(0, Math.min(y, ch - labelHeight))
   ly = Math.max(0, Math.min(ly, ch - labelHeight))
   ctx.value.fillRect(lx, ly, labelWidth, labelHeight)
   ctx.value.fillStyle = 'white'
@@ -692,7 +712,9 @@ function drawResizeHandles(x, y, width, height) {
 }
 
 function getCanvasCoordinates(e) {
-  const rect = canvas.value.getBoundingClientRect()
+  const el = canvas.value
+  if (!el) return null
+  const rect = el.getBoundingClientRect()
   return {
     x: (e.clientX - rect.left) / zoom.value,
     y: (e.clientY - rect.top) / zoom.value,
@@ -700,9 +722,10 @@ function getCanvasCoordinates(e) {
 }
 
 function onCanvasMouseDown(e) {
-  if (!imageLoaded.value) return
+  if (!imageLoaded.value || !canvas.value) return
 
   const coords = getCanvasCoordinates(e)
+  if (!coords) return
   startX.value = coords.x
   startY.value = coords.y
 
@@ -776,9 +799,10 @@ function onCanvasMouseDown(e) {
 }
 
 function onCanvasMouseMove(e) {
-  if (!imageLoaded.value) return
+  if (!imageLoaded.value || !canvas.value) return
 
   const coords = getCanvasCoordinates(e)
+  if (!coords) return
 
   if (selectedTool.value === 'polygon' && polygonPoints.value.length > 0) {
     polygonHover.value = {x: coords.x, y: coords.y}
@@ -1157,7 +1181,7 @@ function onCanvasMouseLeave() {
 }
 
 function onCanvasWheel(e) {
-  if (!imageLoaded.value) return
+  if (!imageLoaded.value || !canvas.value) return
   e.preventDefault()
   const rect = canvas.value.getBoundingClientRect()
   zoomOriginX.value = (e.clientX - rect.left) / zoom.value

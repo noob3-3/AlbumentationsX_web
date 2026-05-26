@@ -43,10 +43,18 @@
         <el-col :span="16">
           <el-space>
             <el-button
+              type="success"
+              plain
+              @click="classesDialogVisible = true"
+              :disabled="!selectedDatasetId"
+            >
+              类别管理
+            </el-button>
+            <el-button
               type="primary"
               icon="MagicStick"
               @click="openBatchAutoAnnotation"
-              :disabled="!selectedDatasetId || !images.length"
+              :disabled="!selectedDatasetId || !images.length || annotationMode === 'semantic'"
             >
               AI预标注
             </el-button>
@@ -99,6 +107,24 @@
         >
           姿态估计：可用多边形勾勒目标轮廓以生成关键点采样；请先选择类别再标注。
         </el-alert>
+        <el-alert
+            v-else-if="annotationMode === 'semantic'"
+            type="success"
+            :closable="false"
+            show-icon
+            style="margin-bottom: 12px"
+        >
+          语义分割：PNG 像素值为类别 id（0 为背景）；255 表示忽略区域。画布与像素一一对应，保存后写入数据集的 semantic_masks。
+        </el-alert>
+        <el-alert
+            v-else-if="annotationMode === 'segment'"
+            type="success"
+            :closable="false"
+            show-icon
+            style="margin-bottom: 12px"
+        >
+          实例分割：请用「多边形」沿目标轮廓打点（不少于 3 点）；也可用「绘制框」生成矩形范围（四角多边形）。
+        </el-alert>
         <AnnotationView
           :datasetId="selectedDatasetId"
           :projectId="currentDataset?.project_id || projectId"
@@ -126,6 +152,11 @@
       @success="onAutoAnnotationSuccess"
     />
     <!-- Batch replace classes dialog -->
+    <DatasetClassesManagerDialog
+      v-model="classesDialogVisible"
+      :dataset-id="selectedDatasetId"
+      @success="onClassesManagerSuccess"
+    />
     <BatchReplaceClassesDialog
       ref="batchReplaceClassesDialogRef"
       :datasetId="selectedDatasetId"
@@ -183,6 +214,7 @@ import {ElMessage} from 'element-plus'
 import AnnotationView from '@/components/annotation/AnnotationView.vue'
 import AutoAnnotationDialog from '@/components/annotation/AutoAnnotationDialog.vue'
 import BatchReplaceClassesDialog from '@/components/annotation/BatchReplaceClassesDialog.vue'
+import DatasetClassesManagerDialog from '@/components/dataset/DatasetClassesManagerDialog.vue'
 import {datasetApi} from '@/api'
 import {useProjectStore} from '@/stores/project'
 import {storeToRefs} from 'pinia'
@@ -192,7 +224,15 @@ const { hasProject, projectId } = storeToRefs(projectStore)
 const route = useRoute()
 
 const selectedDatasetId = ref('')
-const annotationMode = ref('')
+/** 路由 ?mode= 优先，否则沿用数据集的 label_task（OBB/姿态/分割时与训练、多边形工具一致） */
+const annotationMode = computed(() => {
+  const q = route.query.mode
+  if (q) return String(q)
+  const lt = currentDataset.value?.label_task
+  const s = lt ? String(lt).toLowerCase() : ''
+  if (s === 'obb' || s === 'pose' || s === 'segment' || s === 'semantic') return s
+  return ''
+})
 const datasets = ref([])
 const currentDataset = ref(null)
 const images = ref([])
@@ -204,6 +244,7 @@ const deleteClassDialogVisible = ref(false)
 const classToDelete = ref('')
 const deleteConfirmText = ref('')
 const deletingClass = ref(false)
+const classesDialogVisible = ref(false)
 
 const originalImageCount = computed(() => {
   if (!currentDataset.value) return 0
@@ -221,9 +262,6 @@ onMounted(async () => {
     selectedDatasetId.value = String(ds)
     await loadDataset()
   }
-  if (route.query.mode) {
-    annotationMode.value = String(route.query.mode)
-  }
 })
 
 watch(
@@ -233,13 +271,6 @@ watch(
         selectedDatasetId.value = String(ds)
         await loadDataset()
       }
-    }
-)
-
-watch(
-    () => route.query.mode,
-    (m) => {
-      annotationMode.value = m ? String(m) : ''
     }
 )
 
@@ -457,6 +488,11 @@ function onAnnotationsSaved() {
       currentDataset.value = ds
     })
   }
+}
+
+function onClassesManagerSuccess() {
+  loadDataset()
+  loadDatasets()
 }
 </script>
 

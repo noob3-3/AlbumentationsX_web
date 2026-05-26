@@ -123,7 +123,8 @@ services:
 
       # Paths
       - UPLOAD_DIR=/app/data/uploads
-      - DATASET_DIR=/app/data/static-file
+      # 必须与下方 volume ./data/datasets:/app/data/datasets 一致；若指向 static-file 且未挂载，图片写在容器层，重建即丢
+      - DATASET_DIR=/app/data/datasets
       - AUGMENTED_DIR=/app/data/augmented
       - MODEL_DIR=/app/data/models
       - EXPORT_DIR=/app/data/exports
@@ -135,6 +136,10 @@ services:
       - ULTRALYTICS_DATASETS_DIR=/app/data/ultralytics/datasets
       - ULTRALYTICS_WEIGHTS_DIR=/app/data/ultralytics/weights
       - ULTRALYTICS_RUNS_DIR=/app/data/ultralytics/runs
+      # 内网容器无法解析 api.github.com 时，避免 Ultralytics 请求 GitHub API 中断训练（需在线检查设为 false）
+      - YOLO_OFFLINE=true
+      # albumentations 导入时会联网检查版本；DNS 失败会刷 UserWarning，见 albumentations FAQ
+      - NO_ALBUMENTATIONS_UPDATE=1
 
 
       # Server
@@ -177,7 +182,7 @@ services:
       - YOLO_OFFLINE=1
       # 预训练权重走 GitHub Release 时使用的镜像（前缀拼接完整 https://github.com/... ）
       # 设为空字符串可改回直连 GitHub
-      - ULTRALYTICS_GITHUB_MIRROR=https://gh.felicity.ac.cn/
+      - ULTRALYTICS_GITHUB_MIRROR=https://gh.llkk.cc/
     deploy:
       resources:
         reservations:

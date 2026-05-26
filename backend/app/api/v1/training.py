@@ -35,6 +35,8 @@ async def create_training_job(
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
 
+    _ds_task = (getattr(dataset, "label_task", None) or "detect").lower()
+
     # Validate validation dataset if using separate validation set
     if getattr(data, 'use_validation_dataset', False) and getattr(data, 'validation_dataset_id', None):
         val_ds_result = await db.execute(
@@ -45,10 +47,11 @@ async def create_training_job(
             raise HTTPException(status_code=404, detail="Validation dataset not found")
         if data.validation_dataset_id == data.dataset_id:
             raise HTTPException(status_code=400, detail="Validation dataset cannot be the same as training dataset")
-        if (getattr(val_ds, "label_task", None) or "detect") != (getattr(dataset, "label_task", None) or "detect"):
+        vlt = (getattr(val_ds, "label_task", None) or "detect").lower()
+        if vlt != _ds_task:
             raise HTTPException(
                 status_code=400,
-                detail="训练集与独立验证集的 label_task（detect/obb/pose）必须一致。",
+                detail="训练集与独立验证集的 label_task（detect / obb / pose / segment / semantic）必须一致。",
             )
 
     # Check if dataset has images
@@ -62,56 +65,78 @@ async def create_training_job(
             detail="Dataset has no images. Please add images to the dataset before training."
         )
 
-    # Check if at least some images have annotations
-    # 使用 count 查询更高效
-    from sqlalchemy import func, exists
-
-    images_with_annotations_result = await db.execute(
-        select(func.count(func.distinct(Annotation.image_id)))
-        .where(Annotation.image_id.in_([img.id for img in images]))
-    )
-    images_with_annotations_count = images_with_annotations_result.scalar()
-
-    if images_with_annotations_count == 0:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Dataset has {len(images)} images but none have annotations. "
-                   f"Please add annotations to at least some images before training."
-        )
-
-    if images_with_annotations_count < len(images) * 0.5:
-        logger.warning(
-            f"Dataset {data.dataset_id}: Only {images_with_annotations_count}/{len(images)} images have annotations. "
-            f"Training with partially labeled data may result in poor model performance."
-        )
-
-    # 模型任务 vs 平台标注能力（仅检测框/多边形，无分割掩码）
     _mt = infer_ultralytics_task_from_model_name(data.model_name)
-    _ds_task = (getattr(dataset, "label_task", None) or "detect").lower()
-    if _ds_task == "obb" and _mt != "obb":
-        raise HTTPException(
-            status_code=400,
-            detail="该数据集的 label_task 为 OBB（旋转框），请选择 *-obb.pt 权重（如 yolo11n-obb.pt）。",
-        )
-    if _ds_task == "pose" and _mt != "pose":
-        raise HTTPException(
-            status_code=400,
-            detail="该数据集的 label_task 为姿态，请选择 *-pose.pt 权重。",
-        )
-    if _ds_task == "detect" and _mt in ("obb", "pose"):
-        raise HTTPException(
-            status_code=400,
-            detail="该数据集的 label_task 为水平框检测，请勿选择 -obb.pt / -pose.pt，请使用 yolo11n.pt、yolov8n.pt 等检测权重。",
-        )
 
-    if _mt == "segment":
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "分割模型（文件名含 -seg）需要像素级掩码标注，本平台目前仅支持水平框与多边形标注，无法生成分割标签。"
-                "请改用检测类权重（如 yolo11n.pt、yolov8n.pt）或 OBB（*-obb.pt）/ 姿态（*-pose.pt）模型。"
-            ),
+    # 语义分割：数据集 label_task 与权重 -sem 成对校验；标注条件为磁盘上可读掩膜
+    if _mt == "semantic" or _ds_task == "semantic":
+        if _mt != "semantic" or _ds_task != "semantic":
+            raise HTTPException(
+                status_code=400,
+                detail="语义分割需同时满足：数据集「标注任务」= semantic（语义分割），并选择文件名含 -sem 的权重（如 yolo26n-sem.pt）。",
+            )
+        n_mask = sum(
+            1 for img in images
+            if (getattr(img, "semantic_mask_path", None) or "")
+            and Path(str(img.semantic_mask_path)).is_file()
         )
+        if n_mask == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="语义分割数据集需要至少一张已保存语义 PNG 掩膜的图像，请在标注页或数据采集中写入掩膜后再训练。",
+            )
+        if n_mask < len(images) * 0.5:
+            logger.warning(
+                f"Dataset {data.dataset_id}: 仅 {n_mask}/{len(images)} 张图具备可读语义掩膜，其余将不会参与导出训练。"
+            )
+    else:
+        from sqlalchemy import func
+
+        images_with_annotations_result = await db.execute(
+            select(func.count(func.distinct(Annotation.image_id)))
+            .where(Annotation.image_id.in_([img.id for img in images]))
+        )
+        images_with_annotations_count = images_with_annotations_result.scalar()
+
+        if images_with_annotations_count == 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Dataset has {len(images)} images but none have annotations. "
+                       f"Please add annotations to at least some images before training."
+            )
+
+        if images_with_annotations_count < len(images) * 0.5:
+            logger.warning(
+                f"Dataset {data.dataset_id}: Only {images_with_annotations_count}/{len(images)} images have annotations. "
+                f"Training with partially labeled data may result in poor model performance."
+            )
+
+    # 模型任务 vs 数据集 label_task（semantic 已由上方成对校验）
+    if _mt != "semantic" and _ds_task != "semantic":
+        if _ds_task == "obb" and _mt != "obb":
+            raise HTTPException(
+                status_code=400,
+                detail="该数据集的 label_task 为 OBB（旋转框），请选择 *-obb.pt 权重（如 yolo11n-obb.pt）。",
+            )
+        if _ds_task == "pose" and _mt != "pose":
+            raise HTTPException(
+                status_code=400,
+                detail="该数据集的 label_task 为姿态，请选择 *-pose.pt 权重。",
+            )
+        if _ds_task == "segment" and _mt != "segment":
+            raise HTTPException(
+                status_code=400,
+                detail="该数据集为实例分割任务（label_task=segment），请选择 *-seg.pt 权重（如 yolo26n-seg.pt）。",
+            )
+        if _ds_task not in ("obb", "pose", "segment", "semantic") and _mt == "segment":
+            raise HTTPException(
+                status_code=400,
+                detail="实例分割模型（*-seg.pt）需将数据集的「标注任务」设为分割，并使用多边形标注；请先在数据集管理中切换为 segment。",
+            )
+        if _ds_task == "detect" and _mt in ("obb", "pose", "segment", "semantic"):
+            raise HTTPException(
+                status_code=400,
+                detail="该数据集的 label_task 为水平框检测，请勿选择 -obb.pt / -pose.pt / -seg.pt / -sem.pt，请使用 yolo11n.pt、yolov8n.pt 等检测权重。",
+            )
 
     # 多卡 DDP：batch_size 会被平分到每张卡，必须 >= GPU 数量
     is_multi_gpu = data.device and "," in str(data.device)

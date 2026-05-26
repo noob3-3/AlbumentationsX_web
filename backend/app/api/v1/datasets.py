@@ -321,6 +321,16 @@ async def export_dataset(
                                      description="为 True 时仅导出增强图片（与 include_augmented 同时传时以此为准）"),
         pose: bool = Query(False, description="为 True 时导出 YOLOv8 pose 标签（含 kpt_shape，用于 yolov8*-pose 等）"),
         obb: bool = Query(False, description="为 True 时导出 YOLO OBB 四角点标签（用于 *-obb.pt 训练）"),
+        segment: bool = Query(False, description="为 True 时导出实例分割多边形标签（用于 *-seg.pt 训练）"),
+        semantic_masks: bool = Query(
+            False,
+            description="为 True 时按 YOLO 语义分割布局导出 images/train|val + masks/train|val；"
+            "label_task=semantic 时默认启用该布局。",
+        ),
+        val_split: float = Query(
+            0.2, ge=0.01, le=0.9,
+            description="语义导出时验证集占比（剩余为训练集）；单张图时会自动复制到 train/val。",
+        ),
     db: AsyncSession = Depends(get_db),
 ):
     """导出数据集为 YOLO 格式 ZIP 包（含 images/、labels/、dataset.yaml、classes.txt）"""
@@ -336,18 +346,29 @@ async def export_dataset(
     if not images:
         raise HTTPException(status_code=400, detail="Dataset has no images")
 
-    # 筛选已标注图片（若需要）
+    # 筛选已标注图片（若需要）：矢量任务按 Annotation；语义或显式掩膜导出按掩膜文件
     if annotated_only:
+        lt0 = (getattr(dataset, "label_task", None) or "").lower()
+        use_mask_criteria = lt0 == "semantic" or semantic_masks
         images_with_anns = []
-        for img in images:
-            ann_result = await db.execute(
-                select(Annotation).where(Annotation.image_id == img.id)
-            )
-            if ann_result.scalars().all():
-                images_with_anns.append(img)
+        if use_mask_criteria:
+            for img in images:
+                mp = getattr(img, "semantic_mask_path", None) or ""
+                if mp and Path(mp).is_file():
+                    images_with_anns.append(img)
+        else:
+            for img in images:
+                ann_result = await db.execute(
+                    select(Annotation).where(Annotation.image_id == img.id)
+                )
+                if ann_result.scalars().all():
+                    images_with_anns.append(img)
         images = images_with_anns
         if not images:
-            raise HTTPException(status_code=400, detail="Dataset has no images with annotations")
+            raise HTTPException(
+                status_code=400,
+                detail="没有符合「仅已标注」条件的图片（语义任务需已保存 PNG 掩膜）。",
+            )
 
     # 按原始/增强筛选
     if augmented_only:
@@ -359,14 +380,28 @@ async def export_dataset(
         if not images:
             raise HTTPException(status_code=400, detail="没有可导出的原始图片")
 
-    if pose and obb:
+    is_semantic_ds = (getattr(dataset, "label_task", None) or "").lower() == "semantic"
+    use_semantic_zip = is_semantic_ds or semantic_masks
+
+    modes_on = sum([bool(pose), bool(obb), bool(segment)])
+    if modes_on > 1:
         raise HTTPException(
             status_code=400,
-            detail="导出参数 pose 与 obb 不能同时为 True，请只选一种标签格式。",
+            detail="导出参数 pose、obb、segment 只能任选其一（或全 False 导出水平框）。",
+        )
+    if use_semantic_zip and modes_on > 0:
+        raise HTTPException(
+            status_code=400,
+            detail="语义掩膜导出不能与 pose、obb、segment 同时使用，请关闭这些选项。",
         )
 
     classes = dataset.classes or []
     if not classes:
+        if use_semantic_zip:
+            raise HTTPException(
+                status_code=400,
+                detail="语义导出需要数据集预先配置类别列表（classes）。",
+            )
         # 从标注提取类别
         class_query = await db.execute(
             select(Annotation.class_id, Annotation.class_name)
@@ -384,56 +419,116 @@ async def export_dataset(
 
     temp_dir = Path(tempfile.mkdtemp())
     try:
-        images_dir = temp_dir / "images"
-        labels_dir = temp_dir / "labels"
-        images_dir.mkdir()
-        labels_dir.mkdir()
+        if use_semantic_zip:
+            import random
 
-        for img in images:
-            src = Path(img.file_path)
-            if not src.exists():
-                continue
-            dst_img = images_dir / img.filename
-            shutil.copy2(str(src), str(dst_img))
+            for split in ("train", "val"):
+                (temp_dir / "images" / split).mkdir(parents=True, exist_ok=True)
+                (temp_dir / "masks" / split).mkdir(parents=True, exist_ok=True)
 
-            ann_result = await db.execute(
-                select(Annotation).where(Annotation.image_id == img.id)
+            pool = list(images)
+            random.shuffle(pool)
+            n = len(pool)
+            vs = min(max(val_split, 0.01), 0.9)
+            train_count = max(1, int(n * (1 - vs)))
+            if train_count >= n and n > 1:
+                train_count = n - 1
+            train_imgs = pool[:train_count]
+            val_imgs = pool[train_count:]
+            if not val_imgs:
+                if n == 1:
+                    val_imgs = list(pool)
+                elif len(train_imgs) > 1:
+                    val_imgs = [train_imgs.pop()]
+                else:
+                    val_imgs = list(pool)
+
+            copied = 0
+            for split_name, split_list in (("train", train_imgs), ("val", val_imgs)):
+                for img in split_list:
+                    mp = getattr(img, "semantic_mask_path", None) or ""
+                    if not mp or not Path(mp).is_file():
+                        continue
+                    src_img = Path(img.file_path)
+                    if not src_img.is_file():
+                        continue
+                    dst_name = (img.filename or "").strip() or src_img.name
+                    shutil.copy2(str(src_img), str(temp_dir / "images" / split_name / dst_name))
+                    shutil.copy2(
+                        str(mp),
+                        str(temp_dir / "masks" / split_name / (Path(dst_name).stem + ".png")),
+                    )
+                    copied += 1
+
+            if copied == 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="没有可导出的语义样本：请确认图像文件存在且已保存可读 PNG 掩膜。",
+                )
+
+            build_yolo_dataset_yaml(
+                dataset_dir=str(temp_dir),
+                classes=classes,
+                train_path="images/train",
+                val_path="images/val",
+                kpt_shape=None,
+                task=None,
+                masks_dir="masks",
             )
-            anns = ann_result.scalars().all()
-            ann_list = [
-                {
-                    "class_id": a.class_id,
-                    "x_center": a.x_center,
-                    "y_center": a.y_center,
-                    "bbox_width": a.bbox_width,
-                    "bbox_height": a.bbox_height,
-                    **({"polygon_points": a.polygon_points} if getattr(a, "polygon_points", None) else {}),
-                }
-                for a in anns
-            ]
-            label_path = labels_dir / (Path(img.filename).stem + ".txt")
-            write_yolo_annotation(
-                str(label_path),
-                ann_list,
-                pose=pose,
-                obb=obb and not pose,
-                num_keypoints=YOLOV8_POSE_NUM_KEYPOINTS,
+        else:
+            images_dir = temp_dir / "images"
+            labels_dir = temp_dir / "labels"
+            images_dir.mkdir()
+            labels_dir.mkdir()
+
+            for img in images:
+                src = Path(img.file_path)
+                if not src.exists():
+                    continue
+                dst_img = images_dir / img.filename
+                shutil.copy2(str(src), str(dst_img))
+
+                ann_result = await db.execute(
+                    select(Annotation).where(Annotation.image_id == img.id)
+                )
+                anns = ann_result.scalars().all()
+                ann_list = [
+                    {
+                        "class_id": a.class_id,
+                        "x_center": a.x_center,
+                        "y_center": a.y_center,
+                        "bbox_width": a.bbox_width,
+                        "bbox_height": a.bbox_height,
+                        **({"polygon_points": a.polygon_points} if getattr(a, "polygon_points", None) else {}),
+                    }
+                    for a in anns
+                ]
+                label_path = labels_dir / (Path(img.filename).stem + ".txt")
+                write_yolo_annotation(
+                    str(label_path),
+                    ann_list,
+                    pose=pose,
+                    obb=obb and not pose,
+                    segment=segment and not pose,
+                    num_keypoints=YOLOV8_POSE_NUM_KEYPOINTS,
+                )
+
+            _export_task = None
+            if pose:
+                _export_task = "pose"
+            elif obb:
+                _export_task = "obb"
+            elif segment:
+                _export_task = "segment"
+
+            build_yolo_dataset_yaml(
+                dataset_dir=str(temp_dir),
+                classes=classes,
+                train_path="images",
+                val_path="images",
+                kpt_shape=[YOLOV8_POSE_NUM_KEYPOINTS, 3] if pose else None,
+                task=_export_task,
             )
-
-        _export_task = None
-        if pose:
-            _export_task = "pose"
-        elif obb:
-            _export_task = "obb"
-
-        build_yolo_dataset_yaml(
-            dataset_dir=str(temp_dir),
-            classes=classes,
-            train_path="images",
-            val_path="images",
-            kpt_shape=[YOLOV8_POSE_NUM_KEYPOINTS, 3] if pose else None,
-            task=_export_task,
-        )
 
         # classes.txt
         if classes:
@@ -520,7 +615,7 @@ async def upload_images_with_labels(
     classes_file: UploadFile = File(None, description="classes.txt file with one class name per line"),
         label_format: str = Query(
             "auto",
-            description="标签解析：detect=水平框；obb=旋转框(OBB)，支持四角(8数)或至少三顶点(6数)；auto=按行推断",
+            description="detect=水平框；obb=OBB四角/多顶点规范化；segment=实例分割多边形(保留顶点)；auto=按行推断",
         ),
     db: AsyncSession = Depends(get_db),
 ):
@@ -529,16 +624,17 @@ async def upload_images_with_labels(
     Label files should have the same filename as images (except extension).
 
     - **detect**：`class_id x_center y_center width height`（可选第 6 个数 confidence）
-    - **obb**：`class_id` 后为 **8 个数（四角）**，或 **至少 6 个数（≥3 个顶点，如三角形）**；多顶点时用 minAreaRect 得到四角
-    - **auto**：每行独立判断（5 个数→detect，8 个数→obb，≥6 且偶数→多边形/OBB，≥3 顶点）
+    - **obb**：`class_id` 后为 **8 个数（四角）**，或 **至少 6 个数（≥3 顶点）**；非四角时用 minAreaRect 得到四角
+    - **segment**：`class_id` 后 **≥6 个数偶数个顶点**，多边形顶点原样写入 polygon_points
+    - **auto**：5 个数→detect；8 个数→obb；超过 8 且偶数顶点→segment；6 数三角形→obb
     """
     dataset = await DatasetService.get_dataset(db, dataset_id)
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
 
     fmt = (label_format or "auto").lower().strip()
-    if fmt not in ("detect", "obb", "auto"):
-        raise HTTPException(status_code=422, detail="label_format 必须是 detect、obb 或 auto")
+    if fmt not in ("detect", "obb", "segment", "auto"):
+        raise HTTPException(status_code=422, detail="label_format 必须是 detect、obb、segment 或 auto")
 
     # Parse classes.txt if provided
     classes_list: List[str] = []
@@ -859,4 +955,83 @@ async def serve_image(
             "Cache-Control": "public, max-age=31536000, immutable",
             "ETag": etag,
         }
+    )
+
+
+@router.post(
+    "/{dataset_id}/images/{image_id}/semantic-mask",
+    response_model=ImageResponse,
+    summary="上传/保存语义分割 PNG 掩膜（label_task=semantic）",
+)
+async def upload_semantic_mask(
+    dataset_id: str,
+    image_id: str,
+    file: UploadFile = File(..., description="单通道 PNG，像素值为类别 id（255=忽略）"),
+    db: AsyncSession = Depends(get_db),
+):
+    if file.content_type and file.content_type not in ("image/png", "application/octet-stream"):
+        raise HTTPException(status_code=415, detail="请上传 PNG 文件")
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="文件为空")
+    try:
+        image = await DatasetService.save_semantic_mask_png(db, dataset_id, image_id, data)
+        await db.commit()
+        await db.refresh(image)
+        return image
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.delete(
+    "/{dataset_id}/images/{image_id}/semantic-mask",
+    response_model=SuccessResponse,
+    summary="删除语义分割掩膜文件及数据库路径",
+)
+async def delete_semantic_mask_route(dataset_id: str, image_id: str, db: AsyncSession = Depends(get_db)):
+    ok = await DatasetService.delete_semantic_mask(db, dataset_id, image_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Image not found")
+    await db.commit()
+    return {"success": True, "message": "Semantic mask cleared"}
+
+
+@router.get("/files/semantic-mask/{image_id}", summary="下发语义分割掩膜 PNG")
+async def serve_semantic_mask(
+    request: Request,
+    image_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    image = await DatasetService.get_image(db, image_id)
+    if not image:
+        raise HTTPException(status_code=404, detail="Image not found")
+    p = getattr(image, "semantic_mask_path", None) or ""
+    mask_path = Path(p) if p else None
+    if not mask_path or not mask_path.is_file():
+        raise HTTPException(status_code=404, detail="Semantic mask not found")
+
+    #  etag 必须随磁盘文件变化而变化，否则前端保存后用同一 URL 拉掩膜会持续 304 显示旧 PNG
+    try:
+        st = mask_path.stat()
+        etag = f'"sem-{image_id}-{st.st_mtime_ns}-{st.st_size}"'
+    except OSError:
+        etag = f'"sem-{image_id}"'
+
+    inm = request.headers.get("if-none-match") or ""
+    if inm == etag:
+        return Response(
+            status_code=304,
+            headers={
+                "ETag": etag,
+                "Cache-Control": "private, max-age=0, must-revalidate",
+            },
+        )
+
+    return FileResponse(
+        str(mask_path),
+        media_type="image/png",
+        headers={
+            "Cache-Control": "private, max-age=0, must-revalidate",
+            "ETag": etag,
+        },
     )

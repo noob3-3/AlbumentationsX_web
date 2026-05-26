@@ -111,6 +111,9 @@
                 <el-option-group label="YOLO11">
                   <el-option v-for="m in yolo11BaseModels" :key="m" :label="m" :value="m"/>
                 </el-option-group>
+                <el-option-group label="YOLO26">
+                  <el-option v-for="m in yolo26BaseModels" :key="m" :label="m" :value="m"/>
+                </el-option-group>
                 <el-option-group label="YOLOv8">
                   <el-option v-for="m in yolov8BaseModels" :key="m" :label="m" :value="m"/>
                 </el-option-group>
@@ -668,13 +671,17 @@ function filterCheckpointModelsByLabelTask(list, task, hasDataset) {
     const low = (m || '').toLowerCase()
     const isObb = low.includes('-obb')
     const isPose = low.includes('-pose')
+    const isSemantic = low.includes('-sem') && !low.includes('-seg')
+    const isSeg = low.includes('-seg') && !low.includes('-sem')
     if (t === 'obb') return isObb
     if (t === 'pose') return isPose
-    return !isObb && !isPose
+    if (t === 'segment') return isSeg
+    if (t === 'semantic') return isSemantic
+    return !isObb && !isPose && !isSeg && !isSemantic
   })
 }
 
-// yolo11*、yolov11*（含 obb/pose）归为 YOLO11 组；yolov8* 归为 YOLOv8 组；按数据集 label_task 过滤
+// YOLO11 / YOLOv8 / YOLO26（按数据集 label_task 过滤）
 const yolo11BaseModels = computed(() => {
   const raw = baseCheckpointModels.value.filter((m) => /^yolo11|^yolov11/.test(m))
   return filterCheckpointModelsByLabelTask(raw, selectedDatasetLabelTask.value, !!form.value.dataset_id)
@@ -683,10 +690,15 @@ const yolov8BaseModels = computed(() => {
   const raw = baseCheckpointModels.value.filter((m) => /^yolov8/.test(m))
   return filterCheckpointModelsByLabelTask(raw, selectedDatasetLabelTask.value, !!form.value.dataset_id)
 })
+const yolo26BaseModels = computed(() => {
+  const raw = baseCheckpointModels.value.filter((m) => /^yolo26/i.test(m))
+  return filterCheckpointModelsByLabelTask(raw, selectedDatasetLabelTask.value, !!form.value.dataset_id)
+})
 
 /** 与后端 infer_ultralytics_task_from_model_name 一致，用于界面提示 */
 function inferModelTaskFromFilename(name) {
   const m = (name || '').toLowerCase()
+  if (m.includes('-sem')) return 'semantic'
   if (m.includes('-pose')) return 'pose'
   if (m.includes('-obb')) return 'obb'
   if (m.includes('-seg')) return 'segment'
@@ -699,7 +711,9 @@ const modelTaskHint = computed(() => {
     detect: '检测模型：与本平台「水平框」标注一致。',
     pose: '姿态模型：训练时会导出为带关键点的 pose 格式（由框/多边形生成，不等同于专业骨架标注）。',
     obb: 'OBB 模型：水平框会导出为轴对齐四顶点；四点多边形按顶点顺序导出。',
-    segment: '分割模型需要掩码标注，本平台无法生成，创建训练任务时将被拒绝；请换用检测或 OBB。',
+    segment: '实例分割：数据集需设为「标注任务=分割」，用多边形标注；导出/训练为多边形标签（*-seg.pt）。',
+    semantic:
+      '语义分割：数据集需「标注任务=语义分割」，为每张原图保存 PNG 掩膜（像素=类别 id，255=忽略），基础权重选 *-sem.pt（如 yolo26n-sem.pt）。',
   }
   return hints[t] || ''
 })
@@ -792,9 +806,9 @@ watch(() => form.value.model_name, () => {
 
 // 选择数据集后，基础模型列表会随 label_task 变化；当前模型若不在列表中则切换到第一个可用权重
 watch(
-    [yolo11BaseModels, yolov8BaseModels, () => form.value.dataset_id],
+    [yolo11BaseModels, yolov8BaseModels, yolo26BaseModels, () => form.value.dataset_id],
     () => {
-      const merged = [...yolo11BaseModels.value, ...yolov8BaseModels.value]
+      const merged = [...yolo11BaseModels.value, ...yolov8BaseModels.value, ...yolo26BaseModels.value]
       if (!form.value.dataset_id || !merged.length) return
       if (!merged.includes(form.value.model_name)) {
         form.value.model_name = merged[0]
@@ -863,6 +877,8 @@ async function fetchBaseCheckpointModels() {
     baseCheckpointModels.value = [
       'yolo11n.pt', 'yolo11s.pt', 'yolo11m.pt', 'yolo11l.pt', 'yolo11x.pt',
       'yolo11n-obb.pt', 'yolo11n-pose.pt',
+      'yolo26n-seg.pt',
+      'yolo26n-sem.pt',
       'yolov8n.pt', 'yolov8s.pt', 'yolov8m.pt', 'yolov8l.pt', 'yolov8x.pt',
       'yolov8n-obb.pt', 'yolov8n-pose.pt',
       'yolo11n-det.pt', 'yolo11s-det.pt',
@@ -949,6 +965,8 @@ function goToAnnotation() {
   const m = (form.value.model_name || '').toLowerCase()
   if (m.includes('-obb')) query.mode = 'obb'
   else if (m.includes('-pose')) query.mode = 'pose'
+  else if (m.includes('-seg') && !m.includes('-sem')) query.mode = 'segment'
+  else if (m.includes('-sem')) query.mode = 'semantic'
   router.push(Object.keys(query).length ? {path: '/annotation', query} : '/annotation')
 }
 

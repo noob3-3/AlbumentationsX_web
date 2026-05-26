@@ -6,7 +6,7 @@ import time
 from PIL import Image as PILImage
 from app.models import Model, Deployment, DeploymentStatus
 from app.schemas.schemas import DeploymentCreate
-from app.utils.yolo_result_parse import detections_from_ultralytics_result
+from app.utils.yolo_result_parse import inference_output_from_ultralytics_result
 from loguru import logger
 from pathlib import Path
 from sqlalchemy import select
@@ -207,12 +207,13 @@ class DeploymentService:
         )
         inference_time = (time.time() - start_time) * 1000  # ms
 
-        # Parse results（OBB 模型使用 result.obb，boxes 可能为 None）
-        detections = []
+        # Parse results（检测 / OBB / 语义分割）
+        parsed = {"task": "detect", "detections": [], "detection_count": 0, "semantic": None}
         if results and len(results) > 0:
             result = results[0]
             w, h = image_size[0], image_size[1]
-            detections = detections_from_ultralytics_result(yolo_model, result, w, h)
+            parsed = inference_output_from_ultralytics_result(yolo_model, result, w, h)
+        detections = parsed["detections"]
 
         # Generate image with bounding boxes
         import cv2
@@ -228,7 +229,7 @@ class DeploymentService:
             elif image_np.shape[2] == 3:  # RGB
                 image_np = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
 
-        # Draw bounding boxes（OBB 优先画旋转四边形；标签画在框内顶部，避免贴图像边缘时溢出看不见）
+        # Draw bounding boxes（OBB 优先画旋转四边形；标签优先在框外上方，超出图像上缘时改框内顶）
         h_img, w_img = image_np.shape[:2]
         pad = 4
         for detection in detections:
@@ -241,14 +242,13 @@ class DeploymentService:
             (label_width, label_height), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
             box_h = label_height + baseline + pad * 2
 
-            if detection.get("task") == "obb" and detection.get("obb_xyxyxyxy"):
-                pts = np.array(detection["obb_xyxyxyxy"], dtype=np.float32).reshape(-1, 2).astype(np.int32)
-                cv2.polylines(image_np, [pts], True, (0, 255, 0), 2)
-                cx = float(np.mean(pts[:, 0]))
-                top_y = float(np.min(pts[:, 1]))
-                lx = int(cx - label_width / 2 - pad)
-                ty = int(top_y)
+            def draw_label_bar(lx: int, top_y: int) -> None:
                 lx = max(0, min(lx, w_img - label_width - pad * 2))
+                ty_out = int(top_y) - box_h
+                if ty_out >= 0:
+                    ty = ty_out
+                else:
+                    ty = max(0, min(int(top_y), h_img - box_h))
                 ty = max(0, min(ty, h_img - box_h))
                 cv2.rectangle(
                     image_np,
@@ -261,21 +261,17 @@ class DeploymentService:
                     image_np, label, (lx + pad, ty + label_height + pad),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1,
                 )
+
+            if detection.get("task") == "obb" and detection.get("obb_xyxyxyxy"):
+                pts = np.array(detection["obb_xyxyxyxy"], dtype=np.float32).reshape(-1, 2).astype(np.int32)
+                cv2.polylines(image_np, [pts], True, (0, 255, 0), 2)
+                cx = float(np.mean(pts[:, 0]))
+                top_y = float(np.min(pts[:, 1]))
+                lx = int(cx - label_width / 2 - pad)
+                draw_label_bar(lx, int(top_y))
             else:
                 cv2.rectangle(image_np, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                lx = max(0, min(x1, w_img - label_width - pad * 2))
-                ty = max(0, min(y1, h_img - box_h))
-                cv2.rectangle(
-                    image_np,
-                    (lx, ty),
-                    (lx + label_width + pad * 2, ty + box_h),
-                    (0, 255, 0),
-                    -1,
-                )
-                cv2.putText(
-                    image_np, label, (lx + pad, ty + label_height + pad),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1,
-                )
+                draw_label_bar(x1, y1)
 
         # Encode image to base64
         _, buffer = cv2.imencode('.jpg', image_np)
@@ -288,7 +284,10 @@ class DeploymentService:
         await db.commit()
 
         return {
+            "task": parsed.get("task", "detect"),
             "detections": detections,
+            "semantic": parsed.get("semantic"),
+            "detection_count": parsed.get("detection_count", len(detections)),
             "inference_time": round(inference_time / 1000, 3),  # Convert to seconds
             "inference_time_ms": round(inference_time, 2),
             "image_size": list(image_size),

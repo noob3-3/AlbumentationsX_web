@@ -38,8 +38,10 @@ services:
       - ULTRALYTICS_DATASETS_DIR=/app/data/ultralytics/datasets
       - ULTRALYTICS_WEIGHTS_DIR=/app/data/ultralytics/weights
       - ULTRALYTICS_RUNS_DIR=/app/data/ultralytics/runs
-      # GitHub Release 镜像（Ultralytics 官方 .pt）；默认可与 gh.felicity.ac.cn 联用
-      - ULTRALYTICS_GITHUB_MIRROR=https://gh.felicity.ac.cn/
+      # GitHub Release 镜像（前缀 + 完整 https://github.com/...）；不设则由后端依次试 gh.llkk.cc / felicity / 直连
+      - ULTRALYTICS_GITHUB_MIRROR=https://gh.llkk.cc/
+      # albumentations 导入时禁用联网版本检查（内网 DNS 失败时避免 UserWarning）
+      - NO_ALBUMENTATIONS_UPDATE=1
 
     volumes:
       - ./data/uploads:/app/data/uploads       # 用户上传的原始图片

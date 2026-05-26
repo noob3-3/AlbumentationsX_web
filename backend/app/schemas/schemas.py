@@ -103,6 +103,7 @@ class ImageResponse(BaseModel):
     original_filename: str
     file_path: str
     thumbnail_path: Optional[str]
+    semantic_mask_path: Optional[str] = None
     width: Optional[int]
     height: Optional[int]
     file_size: Optional[int]
@@ -134,8 +135,8 @@ class DatasetCreate(BaseModel):
     description: Optional[str] = None
     project_id: Optional[str] = None
     classes: Optional[List[str]] = None
-    # detect=水平框 YOLO；obb=旋转框/多边形顶点；pose 预留
-    label_task: str = Field(default="detect", description="detect | obb | pose")
+    # detect | obb | pose | segment（实例）| semantic（语义 PNG 掩膜）
+    label_task: str = Field(default="detect", description="detect | obb | pose | segment | semantic")
 
 
 class DatasetUpdate(BaseModel):
@@ -143,7 +144,8 @@ class DatasetUpdate(BaseModel):
     description: Optional[str] = None
     project_id: Optional[str] = None
     status: Optional[DatasetStatus] = None
-    label_task: Optional[str] = Field(None, description="detect | obb | pose")
+    label_task: Optional[str] = Field(None, description="detect | obb | pose | segment | semantic")
+    classes: Optional[List[str]] = Field(None, description="类别名列表，下标即 class_id；保存时会同步标注中的 class_name")
 
 
 class DatasetResponse(BaseModel):

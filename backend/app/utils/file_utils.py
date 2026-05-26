@@ -48,12 +48,13 @@ def read_yaml(path: str) -> dict:
 
 
 def build_yolo_dataset_yaml(
-    dataset_dir: str,
-    classes: List[str],
-    train_path: str = "images/train",
-    val_path: str = "images/val",
+        dataset_dir: str,
+        classes: List[str],
+        train_path: str = "images/train",
+        val_path: str = "images/val",
         kpt_shape: Optional[List[int]] = None,
         task: Optional[str] = None,
+        masks_dir: Optional[str] = None,
 ) -> str:
     """Create dataset.yaml for YOLO training and return the path
 
@@ -74,5 +75,7 @@ def build_yolo_dataset_yaml(
         data["kpt_shape"] = kpt_shape
     if task:
         data["task"] = task
+    if masks_dir:
+        data["masks_dir"] = masks_dir
     write_yaml(data, str(yaml_path))
     return str(yaml_path)

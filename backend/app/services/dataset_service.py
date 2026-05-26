@@ -16,11 +16,13 @@ from app.models import (
 )
 from app.schemas.schemas import DatasetCreate, DatasetUpdate
 from app.utils import generate_filename, get_image_info, create_thumbnail, allowed_image
+from app.utils.semantic_mask_utils import save_semantic_mask_png, validate_and_load_semantic_mask_png
 from loguru import logger
 from pathlib import Path
 from sqlalchemy import select, func, update, delete, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from sqlalchemy.orm.attributes import flag_modified
 from typing import List, Optional
 
 
@@ -46,6 +48,7 @@ class DatasetService:
         (storage_path / "images").mkdir(exist_ok=True)
         (storage_path / "labels").mkdir(exist_ok=True)
         (storage_path / "thumbnails").mkdir(exist_ok=True)
+        (storage_path / "semantic_masks").mkdir(exist_ok=True)
         dataset.storage_path = str(storage_path)
 
         db.add(dataset)
@@ -109,12 +112,41 @@ class DatasetService:
         return datasets, total
 
     @staticmethod
+    async def _sync_annotation_class_names_from_list(
+        db: AsyncSession,
+        dataset_id: str,
+        classes: List[str],
+    ) -> None:
+        """按 class_id 将标注的 class_name 与数据集类别表对齐（用于类别管理保存）。"""
+        from app.models import Annotation
+
+        img_result = await db.execute(select(Image.id).where(Image.dataset_id == dataset_id))
+        image_ids = [r[0] for r in img_result.all()]
+        if not image_ids:
+            return
+        ann_result = await db.execute(
+            select(Annotation).where(Annotation.image_id.in_(image_ids))
+        )
+        for ann in ann_result.scalars().all():
+            cid = ann.class_id
+            if cid is None or cid < 0:
+                continue
+            if cid < len(classes) and classes[cid]:
+                ann.class_name = classes[cid]
+
+    @staticmethod
     async def update_dataset(db: AsyncSession, dataset_id: str, data: DatasetUpdate) -> Optional[Dataset]:
         dataset = await DatasetService.get_dataset(db, dataset_id)
         if not dataset:
             return None
-        for field, value in data.model_dump(exclude_none=True).items():
+        dump = data.model_dump(exclude_none=True)
+        classes_val = dump.pop("classes", None)
+        for field, value in dump.items():
             setattr(dataset, field, value)
+        if classes_val is not None:
+            dataset.classes = list(classes_val)
+            flag_modified(dataset, "classes")
+            await DatasetService._sync_annotation_class_names_from_list(db, dataset_id, dataset.classes)
         await db.flush()
         await db.refresh(dataset)
         return dataset
@@ -414,7 +446,7 @@ class DatasetService:
         if not image:
             return False
         # Remove files
-        for path in [image.file_path, image.thumbnail_path]:
+        for path in [image.file_path, image.thumbnail_path, image.semantic_mask_path]:
             if path and Path(path).exists():
                 Path(path).unlink(missing_ok=True)
         # Update dataset
@@ -423,6 +455,68 @@ class DatasetService:
             dataset.image_count = max(0, dataset.image_count - 1)
             dataset.annotation_count = max(0, dataset.annotation_count - len(image.annotations))
         await db.delete(image)
+        return True
+
+    @staticmethod
+    async def save_semantic_mask_png(
+        db: AsyncSession,
+        dataset_id: str,
+        image_id: str,
+        png_bytes: bytes,
+    ) -> Image:
+        """保存语义分割掩膜（数据集须 label_task=semantic）。"""
+        dataset = await DatasetService.get_dataset(db, dataset_id)
+        if not dataset:
+            raise ValueError("数据集不存在")
+        if (getattr(dataset, "label_task", None) or "detect").lower() != "semantic":
+            raise ValueError("只有「标注任务=语义分割」的数据集可保存 PNG 掩膜")
+
+        image = await DatasetService.get_image(db, image_id)
+        if not image or image.dataset_id != dataset_id:
+            raise ValueError("图片不存在")
+        if not image.width or not image.height:
+            raise ValueError("图片缺少宽高信息")
+
+        classes = dataset.classes or []
+        arr, err = validate_and_load_semantic_mask_png(
+            png_bytes,
+            img_width=image.width,
+            img_height=image.height,
+            classes=classes,
+        )
+        if arr is None:
+            raise ValueError(err)
+
+        if not dataset.storage_path:
+            raise ValueError("数据集存储路径未配置")
+        masks_dir = Path(dataset.storage_path) / "semantic_masks"
+        masks_dir.mkdir(parents=True, exist_ok=True)
+        mask_name = Path(image.filename).stem + ".png"
+        dest = masks_dir / mask_name
+
+        save_semantic_mask_png(dest, arr)
+
+        if image.semantic_mask_path and image.semantic_mask_path != str(dest):
+            old = Path(image.semantic_mask_path)
+            if old.is_file():
+                old.unlink(missing_ok=True)
+
+        image.semantic_mask_path = str(dest)
+        image.annotation_status = AnnotationStatus.MANUALLY_ANNOTATED
+        await db.flush()
+        await db.refresh(image)
+        return image
+
+    @staticmethod
+    async def delete_semantic_mask(db: AsyncSession, dataset_id: str, image_id: str) -> bool:
+        image = await DatasetService.get_image(db, image_id)
+        if not image or image.dataset_id != dataset_id:
+            return False
+        p = getattr(image, "semantic_mask_path", None)
+        if p and Path(p).is_file():
+            Path(p).unlink(missing_ok=True)
+        image.semantic_mask_path = None
+        await db.flush()
         return True
 
     @staticmethod
@@ -455,8 +549,10 @@ class DatasetService:
         # 目标存储目录
         target_images_dir = Path(target_dataset.storage_path) / "images"
         target_thumbs_dir = Path(target_dataset.storage_path) / "thumbnails"
+        target_masks_dir = Path(target_dataset.storage_path) / "semantic_masks"
         target_images_dir.mkdir(parents=True, exist_ok=True)
         target_thumbs_dir.mkdir(parents=True, exist_ok=True)
+        target_masks_dir.mkdir(parents=True, exist_ok=True)
 
         # 复制图片文件到目标数据集（新文件名避免冲突）
         new_filename = generate_filename(image.original_filename)
@@ -479,6 +575,14 @@ class DatasetService:
 
         target_dataset.classes = target_classes
 
+        # 复制语义掩膜（若存在）
+        new_mask_path_str = None
+        if image.semantic_mask_path and Path(image.semantic_mask_path).is_file():
+            mask_name = Path(new_filename).stem + ".png"
+            dst_mask = target_masks_dir / mask_name
+            shutil.copy2(image.semantic_mask_path, str(dst_mask))
+            new_mask_path_str = str(dst_mask)
+
         # 创建新 Image 记录
         width, height, file_size = get_image_info(str(dst_img_path))
         new_image = Image(
@@ -487,6 +591,7 @@ class DatasetService:
             original_filename=image.original_filename,
             file_path=str(dst_img_path),
             thumbnail_path=str(dst_thumb_path),
+            semantic_mask_path=new_mask_path_str,
             width=width,
             height=height,
             file_size=file_size,
@@ -523,7 +628,7 @@ class DatasetService:
             target_dataset.augmented_count = (target_dataset.augmented_count or 0) + 1
 
         # 删除源图片
-        for path in [image.file_path, image.thumbnail_path]:
+        for path in [image.file_path, image.thumbnail_path, image.semantic_mask_path]:
             if path and Path(path).exists():
                 Path(path).unlink(missing_ok=True)
         source_dataset.image_count = max(0, source_dataset.image_count - 1)

@@ -66,6 +66,52 @@
         </div>
       </el-tab-pane>
 
+      <el-tab-pane label="🎭 语义掩膜 PNG" name="semantic-masks">
+        <el-alert type="info" :closable="false" show-icon style="margin-bottom: 16px">
+          <template #default>
+            将单通道 PNG（文件名与<strong>图片 stem 一致</strong>，如 <code>photo.png</code> 对应 <code>photo.jpg</code>）上传到已设为「语义分割」的数据集；
+            服务端会校验像素尺寸与类别取值，并写入 <code>semantic_masks/</code>。
+          </template>
+        </el-alert>
+        <el-form :model="semMaskForm" label-width="100px" style="max-width: 600px">
+          <el-form-item label="目标数据集" required>
+            <el-select v-model="semMaskForm.datasetId" placeholder="选择语义分割数据集" style="width:100%">
+              <el-option v-for="d in datasets" :key="d.id" :label="`${d.name} (${d.label_task || 'detect'})`" :value="d.id" />
+            </el-select>
+            <el-button link style="margin-left:8px" @click="goToCreateDataset">+ 新建数据集</el-button>
+          </el-form-item>
+        </el-form>
+        <el-upload
+          class="upload-area"
+          drag
+          multiple
+          :auto-upload="false"
+          accept=".png"
+          :on-change="handleSemanticMaskFileChange"
+          :file-list="semMaskFileList"
+          :limit="500"
+        >
+          <el-icon class="el-icon--upload" size="48"><UploadFilled /></el-icon>
+          <div class="el-upload__text">拖拽 PNG 掩膜到此处，或<em>点击选择</em></div>
+          <template #tip>
+            <div class="el-upload__tip">仅 PNG；像素值 = 类别 id（0..nc-1），255 = 忽略；需与对应原图同宽高</div>
+          </template>
+        </el-upload>
+        <div v-if="semMaskFileList.length" style="margin-top: 12px">
+          <el-tag type="success">已选择 {{ semMaskFileList.length }} 个掩膜文件</el-tag>
+          <el-button
+            type="primary"
+            style="margin-left: 12px"
+            :loading="semMaskUploading"
+            :disabled="!semMaskForm.datasetId"
+            @click="startSemanticMaskUpload"
+          >
+            上传到数据集
+          </el-button>
+          <el-button @click="semMaskFileList = []">清空</el-button>
+        </div>
+      </el-tab-pane>
+
       <!-- Upload with Labels Tab -->
       <el-tab-pane label="🏷️ 带标签上传" name="with-labels">
         <el-alert type="info" :closable="false" show-icon style="margin-bottom:16px">
@@ -87,10 +133,12 @@
               <el-radio label="auto">自动识别</el-radio>
               <el-radio label="detect">水平框 (cx,cy,w,h)</el-radio>
               <el-radio label="obb">旋转框 / OBB（至少 3 个顶点或标准四角）</el-radio>
+              <el-radio label="segment">实例分割（多边形顶点，class + x1 y1 x2 y2 …）</el-radio>
             </el-radio-group>
             <div style="margin-top:6px;color:#909399;font-size:12px;line-height:1.5">
-              OBB 与 Ultralytics 一致：常见为每行 <code>class + 8 个数</code>（四角）；
-              也支持 <strong>至少 3 个顶点</strong>（<code>class + 6 个数</code> 起，三角形及以上），将用最小外接矩形得到四角再导出训练。
+              <strong>OBB</strong>：<code>class + 8 个数</code>（四角）或 <code>class + ≥6 个数</code>（≥3 顶点）；非四角会规范为最小外接矩形四角。
+              <strong>实例分割</strong>：<code>class + 至少 6 个数</code>（≥3 顶点坐标对），将保留完整多边形导入。
+              <strong>自动识别</strong>：5 个数→水平框；8 个数→OBB；超过 8 个坐标且为偶数→多边形分割。
             </div>
           </el-form-item>
         </el-form>
@@ -323,6 +371,9 @@ const labelUploadResult = ref(null)
 const uploadForm = ref({ datasetId: route.query.dataset || '' })
 const urlForm = ref({ datasetId: route.query.dataset || '', urlText: '' })
 const labelUploadForm = ref({datasetId: route.query.dataset || '', labelFormat: 'auto'})
+const semMaskForm = ref({ datasetId: route.query.dataset || '' })
+const semMaskFileList = ref([])
+const semMaskUploading = ref(false)
 
 const urlList = computed(() =>
   urlForm.value.urlText
@@ -370,10 +421,70 @@ watch(projectId, () => {
   uploadForm.value.datasetId = ''
   urlForm.value.datasetId = ''
   labelUploadForm.value.datasetId = ''
+  semMaskForm.value.datasetId = ''
 })
 
 function handleFileChange(file, list) {
   fileList.value = list
+}
+
+function handleSemanticMaskFileChange(file, list) {
+  semMaskFileList.value = list
+}
+
+async function startSemanticMaskUpload() {
+  if (!semMaskForm.value.datasetId) {
+    ElMessage.warning('请先选择数据集')
+    return
+  }
+  if (!semMaskFileList.value.length) {
+    ElMessage.warning('请先选择 PNG 文件')
+    return
+  }
+  semMaskUploading.value = true
+  try {
+    const dsMeta = await datasetApi.get(semMaskForm.value.datasetId)
+    if (String(dsMeta.label_task || 'detect').toLowerCase() !== 'semantic') {
+      ElMessage.warning('请将数据集「标注任务」设为语义分割后再批量上传掩膜（可在类别管理中修改）。')
+      return
+    }
+    const res = await datasetApi.listImages(semMaskForm.value.datasetId, { page: 1, page_size: 10000 })
+    const items = res.items || []
+    const byStem = new Map()
+    for (const im of items) {
+      const name = im.original_filename || im.filename || ''
+      const stem = String(name).replace(/\.[^.]+$/, '').toLowerCase()
+      if (stem) byStem.set(stem, im)
+    }
+    let ok = 0
+    let skipped = 0
+    for (const row of semMaskFileList.value) {
+      const raw = row.raw
+      if (!raw?.name?.toLowerCase()?.endsWith?.('.png')) {
+        skipped += 1
+        continue
+      }
+      const stem = raw.name.replace(/\.png$/i, '').toLowerCase()
+      const im = byStem.get(stem)
+      if (!im) {
+        skipped += 1
+        continue
+      }
+      try {
+        await datasetApi.uploadSemanticMask(semMaskForm.value.datasetId, im.id, raw)
+        ok += 1
+      } catch (e) {
+        skipped += 1
+        console.warn(e)
+      }
+    }
+    ElMessage.success(`成功写入 ${ok} 张掩膜${skipped ? `，跳过 ${skipped} 个` : ''}`)
+    semMaskFileList.value = []
+  } catch (e) {
+    ElMessage.error(e.response?.data?.detail || e.message || '上传失败')
+  } finally {
+    semMaskUploading.value = false
+  }
 }
 
 async function startUpload() {

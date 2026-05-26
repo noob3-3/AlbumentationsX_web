@@ -56,7 +56,8 @@ ENV PYTHONUNBUFFERED=1 \
     PORT=8000 \
     DEBUG=false \
     STATIC_DIR=/app/static \
-    TZ=Asia/Shanghai
+    TZ=Asia/Shanghai \
+    NO_ALBUMENTATIONS_UPDATE=1
 
 EXPOSE 8000
 

@@ -33,7 +33,7 @@ numpy>=1.26.0,<2
 albumentations>=1.4.0
 
 # Object Detection Training
-# ultralytics>=8.2.0  # Already included in ultralytics/ultralytics base image
+# Dockerfile.gpu 中会 pip install -U ultralytics>=8.4.52（语义 -sem 需 nn.tasks.SemanticSegmentationModel）
 
 # Utilities
 pyyaml>=6.0.1

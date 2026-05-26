@@ -13,6 +13,8 @@ from app.schemas.schemas import TrainingJobCreate
 from app.services.pretrained_model_service import PretrainedModelService
 from app.services.webhook_service import webhook_service
 from app.utils import build_yolo_dataset_yaml, write_yolo_annotation, YOLOV8_POSE_NUM_KEYPOINTS
+
+from app.utils.metrics_pg_json import sanitize_metrics_for_pg_json, sanitize_metrics_history
 from datetime import datetime, timedelta
 from loguru import logger
 from pathlib import Path
@@ -26,6 +28,9 @@ AVAILABLE_MODELS = [
     "yolo11n.pt", "yolo11s.pt", "yolo11m.pt", "yolo11l.pt", "yolo11x.pt",
     # YOLO11 OBB / 姿态（官方文件名：yolo11n-obb / yolo11n-pose，勿写成 yolov11n-*）
     "yolo11n-obb.pt", "yolo11n-pose.pt",
+    # YOLO26 实例分割 / 语义分割（与 Ultralytics assets v8.4.0 一致）
+    "yolo26n-seg.pt",
+    "yolo26n-sem.pt",
     # YOLOv8 检测
     "yolov8n.pt", "yolov8s.pt", "yolov8m.pt", "yolov8l.pt", "yolov8x.pt",
     # YOLOv8 OBB / 姿态
@@ -261,13 +266,16 @@ def _resolve_training_image_path(img: Image, dataset: Dataset) -> Tuple[Optional
 def infer_ultralytics_task_from_model_name(model_name: str) -> str:
     """
     从权重文件名推断 Ultralytics 任务类型，用于与平台标注能力匹配校验。
-    返回: detect | pose | obb | segment
+    返回: detect | pose | obb | segment | semantic
     """
     m = (model_name or "").lower()
     if "-pose" in m:
         return "pose"
     if "-obb" in m:
         return "obb"
+    # 语义分割（-sem）勿与实例分割（-seg）混淆
+    if "-sem" in m:
+        return "semantic"
     if "-seg" in m:
         return "segment"
     return "detect"
@@ -513,8 +521,19 @@ class TrainingService:
         # Get images - filter by augmentation flag if needed
         query = select(Image).where(Image.dataset_id == job.dataset_id)
 
-        # Check if use_augmented_data is set
+        _ul_for_aug = infer_ultralytics_task_from_model_name(job.model_name or "")
+        _lab_ds = (getattr(dataset, "label_task", None) or "").lower()
+        semantic_aug_override = _ul_for_aug == "semantic" or _lab_ds == "semantic"
+
         use_augmented = job.use_augmented_data if hasattr(job, 'use_augmented_data') else True
+        if semantic_aug_override and use_augmented:
+            logger.warning(
+                "语义分割训练不使用增强生成的图片（无对应 PNG 掩膜），已改用仅原始图像。"
+            )
+            await ws_manager.send_message(job.id, {
+                "type": "warning",
+                "message": "语义分割需掩膜与原图像素对齐，已忽略增强生成的图片，仅使用原始图像参与训练。",
+            })
 
         all_images_result = await db.execute(query)
         all_dataset_images = all_images_result.scalars().all()
@@ -525,14 +544,18 @@ class TrainingService:
 
         logger.info(f"Dataset statistics: {len(original_images)} original, {len(augmented_images)} augmented images")
 
-        if not use_augmented:
+        effective_use_aug = use_augmented and not semantic_aug_override
+
+        if not effective_use_aug:
             # Only use non-augmented images
             images = original_images
             logger.info(f"Training with ORIGINAL data only: {len(images)} images")
-            await ws_manager.send_message(job.id, {
-                "type": "info",
-                "message": f"使用原始数据训练：{len(images)} 张图片（跳过 {len(augmented_images)} 张增强图片）",
-            })
+            msg = (
+                f"使用原始数据训练：{len(images)} 张图片（跳过 {len(augmented_images)} 张增强图片）"
+            )
+            if semantic_aug_override and augmented_images:
+                msg += "。「语义分割」任务仅使用与原图对齐的掩膜，增强图不参与训练。"
+            await ws_manager.send_message(job.id, {"type": "info", "message": msg})
         else:
             # Use all images
             images = all_dataset_images
@@ -545,40 +568,83 @@ class TrainingService:
         if not images:
             raise ValueError(f"Dataset has no images. Cannot start training.")
 
-        # Validate that images have annotations
-        images_with_annotations = []
-        images_without_annotations = []
-        augmented_without_annotations = []
+        _ul_task = infer_ultralytics_task_from_model_name(job.model_name or "")
+        is_semantic = _ul_task == "semantic"
 
-        for img in images:
-            anns_result = await db.execute(
-                select(Annotation).where(Annotation.image_id == img.id)
-            )
-            anns = anns_result.scalars().all()
-            if anns:
-                images_with_annotations.append(img)
-            else:
-                images_without_annotations.append(img)
-                if img.is_augmented:
-                    augmented_without_annotations.append(img)
+        if is_semantic:
+            images_with_annotations = []
+            images_without_annotations = []
+            augmented_without_annotations = []
+            for img in images:
+                mp = getattr(img, "semantic_mask_path", None) or ""
+                if mp and Path(mp).is_file():
+                    images_with_annotations.append(img)
+                else:
+                    images_without_annotations.append(img)
+                    if img.is_augmented:
+                        augmented_without_annotations.append(img)
+            if not images_with_annotations:
+                raise ValueError(
+                    "语义分割训练需要在磁盘上存在与图片同尺寸的 PNG 掩膜（datasets/.../semantic_masks）。"
+                    f"当前 {len(images)} 张样本中无一具备可读掩膜，无法开始训练。"
+                )
+        else:
+            # Validate that images have annotations (vector boxes / polygons etc.)
+            images_with_annotations = []
+            images_without_annotations = []
+            augmented_without_annotations = []
 
-        if not images_with_annotations:
-            raise ValueError(
-                f"Dataset has {len(images)} images but none have annotations. "
-                f"Cannot train without labeled data. Please add annotations to at least some images."
-            )
+            for img in images:
+                anns_result = await db.execute(
+                    select(Annotation).where(Annotation.image_id == img.id)
+                )
+                anns = anns_result.scalars().all()
+                if anns:
+                    images_with_annotations.append(img)
+                else:
+                    images_without_annotations.append(img)
+                    if img.is_augmented:
+                        augmented_without_annotations.append(img)
+
+            if not images_with_annotations:
+                raise ValueError(
+                    f"Dataset has {len(images)} images but none have annotations. "
+                    f"Cannot train without labeled data. Please add annotations to at least some images."
+                )
 
         is_pose = bool(job.model_name and "-pose" in job.model_name.lower())
         is_obb = bool(job.model_name and "-obb" in job.model_name.lower())
         if is_pose and is_obb:
             is_obb = False
 
-        # 警告：增强数据未标注
-        if use_augmented and len(augmented_without_annotations) > 0:
-            warning_msg = (
-                f"⚠️ 警告：{len(augmented_images)} 张增强图片中，"
-                f"{len(augmented_without_annotations)} 张未标注，将不参与训练"
-            )
+        if is_semantic:
+            is_pose = False
+            is_obb = False
+            is_segment = False
+        elif _ul_task == "segment":
+            is_segment = True
+            is_pose = False
+            is_obb = False
+        elif is_pose:
+            is_segment = False
+            is_obb = False
+        elif is_obb:
+            is_segment = False
+        else:
+            is_segment = False
+
+        # 警告：增强数据未标注 / 或未带掩膜
+        if effective_use_aug and len(augmented_without_annotations) > 0:
+            if is_semantic:
+                warning_msg = (
+                    f"⚠️ 警告：{len(augmented_images)} 张增强图片中，"
+                    f"{len(augmented_without_annotations)} 张缺少语义掩膜，将不参与训练"
+                )
+            else:
+                warning_msg = (
+                    f"⚠️ 警告：{len(augmented_images)} 张增强图片中，"
+                    f"{len(augmented_without_annotations)} 张未标注，将不参与训练"
+                )
             logger.warning(warning_msg)
             await ws_manager.send_message(job.id, {
                 "type": "warning",
@@ -586,12 +652,13 @@ class TrainingService:
             })
 
         if len(images_with_annotations) < len(images) * 0.5:
+            _label_hint = "带掩膜的图" if is_semantic else "已标注的图片"
             logger.warning(
-                f"Dataset: Only {len(images_with_annotations)}/{len(images)} images have annotations. "
+                f"Dataset: Only {len(images_with_annotations)}/{len(images)} images qualify ({_label_hint}). "
                 f"Training with partially labeled data may result in poor model performance."
             )
 
-        # Use only images with annotations for training
+        # 仅保留可训练样本
         all_images = images_with_annotations
         random.shuffle(all_images)
 
@@ -618,6 +685,11 @@ class TrainingService:
             val_all = val_images_result.scalars().all()
             val_images = []
             for img in val_all:
+                if is_semantic:
+                    mp = getattr(img, "semantic_mask_path", None) or ""
+                    if mp and Path(mp).is_file():
+                        val_images.append(img)
+                    continue
                 anns_result = await db.execute(
                     select(Annotation).where(Annotation.image_id == img.id)
                 )
@@ -625,6 +697,11 @@ class TrainingService:
                     val_images.append(img)
 
             if not val_images:
+                if is_semantic:
+                    raise ValueError(
+                        f"验证数据集「{val_dataset.name}」中没有带可读语义掩膜的图像，"
+                        f"请将验证集设为 label_task=semantic 并为图像保存 PNG 掩膜。"
+                    )
                 raise ValueError(
                     f"Validation dataset '{val_dataset.name}' has no images with annotations. "
                     f"Please add annotations to the validation dataset."
@@ -673,7 +750,10 @@ class TrainingService:
         output_dir = settings.EXPORT_DIR / f"train_{job.id}"
         for split in ["train", "val"]:
             (output_dir / "images" / split).mkdir(parents=True, exist_ok=True)
-            (output_dir / "labels" / split).mkdir(parents=True, exist_ok=True)
+            if is_semantic:
+                (output_dir / "masks" / split).mkdir(parents=True, exist_ok=True)
+            else:
+                (output_dir / "labels" / split).mkdir(parents=True, exist_ok=True)
 
         # 当使用独立验证集时，验证集可能有不同的类别顺序，需要建立 class_name -> train_class_id 的映射
         val_class_map = None  # {class_name: train_class_id}
@@ -705,14 +785,28 @@ class TrainingService:
         missing_src_count = 0
         for split_name, split_images in [("train", train_images), ("val", val_images)]:
             is_val_from_separate = split_name == "val" and use_validation_dataset
+            ds_for_path = val_dataset if is_val_from_separate else dataset
             for img in split_images:
-                src, tried_paths = _resolve_training_image_path(img, dataset)
+                src, tried_paths = _resolve_training_image_path(img, ds_for_path)
                 if src is None:
                     missing_src_count += 1
                     # 详情已在 _resolve_training_image_path 中打印 WARNING（含每路径 exists/parent）
                     continue
                 # 导出文件名与磁盘上一致（避免 DB 中 filename 为空或与实际大小写不一致导致 YOLO 不识别）
                 dst_name = (img.filename or "").strip() or src.name
+
+                if is_semantic:
+                    mp = getattr(img, "semantic_mask_path", None) or ""
+                    msrc = Path(mp)
+                    if not msrc.is_file():
+                        logger.warning(
+                            "语义训练导出: 跳过无掩膜的 image_id={} path={}",
+                            img.id,
+                            mp,
+                        )
+                        missing_src_count += 1
+                        continue
+
                 dst_img = output_dir / "images" / split_name / dst_name
                 shutil.copy2(str(src), str(dst_img))
                 logger.debug(
@@ -722,6 +816,11 @@ class TrainingService:
                     src,
                     dst_img,
                 )
+
+                if is_semantic:
+                    dst_mask = output_dir / "masks" / split_name / (Path(dst_name).stem + ".png")
+                    shutil.copy2(str(msrc), str(dst_mask))
+                    continue
 
                 # Write annotations
                 anns_result = await db.execute(
@@ -772,15 +871,20 @@ class TrainingService:
                     str(label_path),
                     ann_list,
                     pose=is_pose,
-                    obb=is_obb,
+                    obb=is_obb and not is_pose,
+                    segment=is_segment,
                     num_keypoints=YOLOV8_POSE_NUM_KEYPOINTS,
                 )
 
         # Build dataset.yaml
         classes = dataset.classes or []
 
-        # 如果数据集没有注册类别，从标注数据中自动提取
+        # 如果数据集没有注册类别，从标注数据中自动提取（语义分割须在数据集中手写 classes）
         if not classes:
+            if is_semantic:
+                raise ValueError(
+                    "语义分割训练需要数据集预先配置类别列表（classes），请在数据集管理中维护。"
+                )
             logger.warning("Dataset has no classes defined, extracting from annotations...")
             class_query = await db.execute(
                 select(Annotation.class_id, Annotation.class_name)
@@ -813,6 +917,7 @@ class TrainingService:
             val_path="images/val",
             kpt_shape=[YOLOV8_POSE_NUM_KEYPOINTS, 3] if is_pose else None,
             task=None,
+            masks_dir="masks" if is_semantic else None,
         )
 
         if missing_src_count:
@@ -835,6 +940,36 @@ class TrainingService:
             )
 
         _nt, _nv = _count_images(_train_img_dir), _count_images(_val_img_dir)
+        if is_semantic:
+            _mtrain = output_dir / "masks" / "train"
+            _mval = output_dir / "masks" / "val"
+
+            def _count_mask_png(split_dir: Path) -> int:
+                if not split_dir.is_dir():
+                    return 0
+                return sum(
+                    1 for p in split_dir.iterdir()
+                    if p.suffix.lower() == ".png" and p.is_file()
+                )
+
+            _mt, _mv = _count_mask_png(_mtrain), _count_mask_png(_mval)
+            logger.info(
+                "训练导出目录校验(语义): job_id={} masks/train={} masks/val={} missing_src={}",
+                job.id,
+                _mt,
+                _mv,
+                missing_src_count,
+            )
+            if _mt == 0:
+                raise ValueError(
+                    "语义分割导出后 masks/train 下没有 PNG 掩膜。"
+                    "请确认每张训练图在 semantic_masks 下存在同名 stem 的掩膜且文件可读。"
+                )
+            if _mv == 0:
+                raise ValueError(
+                    "语义分割验证集为空（masks/val 无 PNG）。请增加带掩膜的验证数据或调整划分比例。"
+                )
+
         logger.info(
             "训练导出目录校验: job_id={} output_dir={} images/train 有效图={} images/val 有效图={} "
             "missing_src={} YOLO后缀规则数量={}",
@@ -872,7 +1007,7 @@ class TrainingService:
             "total_images": len(all_images),
             "train_images": len(train_images),
             "val_images": len(val_images),
-            "use_augmented": use_augmented,
+            "use_augmented": effective_use_aug,
             "original_count": len(original_images),
             "augmented_count": len(augmented_images),
             "labeled_count": len(images_with_annotations),
@@ -981,6 +1116,8 @@ def _run_training_sync(job_id: str, main_loop, allocated_device: Optional[str] =
 
 async def _execute_training(db: AsyncSession, job_id: str, main_loop):
     """Execute YOLO training"""
+    # 无公网 DNS 时 Ultralytics 会访问 api.github.com 拉版本/资源导致训练失败；需要联网检查时设 YOLO_OFFLINE=false
+    os.environ.setdefault("YOLO_OFFLINE", "true")
     from ultralytics import YOLO
 
     job = await TrainingService.get_job(db, job_id)
@@ -1126,7 +1263,7 @@ async def _execute_training(db: AsyncSession, job_id: str, main_loop):
                 metrics["train/box_loss"] = float(trainer.loss_items[0])
                 metrics["train/cls_loss"] = float(trainer.loss_items[1])
 
-        metrics_history.append(metrics)
+        metrics_history.append(sanitize_metrics_for_pg_json(metrics))
 
         # 计算时间预估
         elapsed_time = (current_time - training_start_time).total_seconds()
@@ -1145,7 +1282,7 @@ async def _execute_training(db: AsyncSession, job_id: str, main_loop):
                     j = result.scalar_one_or_none()
                     if j:
                         j.current_epoch = epoch
-                        j.metrics_history = metrics_history.copy()
+                        j.metrics_history = sanitize_metrics_history(metrics_history)
                         await db2.commit()
                         if j.status == JobStatus.CANCELLED:
                             return True
@@ -1170,8 +1307,8 @@ async def _execute_training(db: AsyncSession, job_id: str, main_loop):
                 "job_id": job_id,
                 "epoch": epoch,
                 "total_epochs": job.epochs,
-                "metrics": metrics,
-                "metrics_history": metrics_history.copy(),  # 完整历史数据
+                "metrics": sanitize_metrics_for_pg_json(metrics),
+                "metrics_history": sanitize_metrics_history(metrics_history),
                 "percent": round(epoch / job.epochs * 100, 1),
 
                 # 时间信息
@@ -1191,10 +1328,11 @@ async def _execute_training(db: AsyncSession, job_id: str, main_loop):
 
             # 更新最后一个epoch的验证指标
             if metrics_history:
-                metrics_history[-1].update({
-                    "val/map50": map50,
-                    "val/map50_95": map50_95
-                })
+                metrics_history[-1].update(
+                    sanitize_metrics_for_pg_json(
+                        {"val/map50": map50, "val/map50_95": map50_95}
+                    )
+                )
 
                 # 通过WebSocket发送验证指标更新 (use sync publish to avoid loop error)
                 try:
@@ -1202,9 +1340,9 @@ async def _execute_training(db: AsyncSession, job_id: str, main_loop):
                         "type": "validation_metrics",
                         "job_id": job_id,
                         "epoch": metrics_history[-1].get("epoch"),
-                        "map50": map50,
-                        "map50_95": map50_95,
-                        "metrics_history": metrics_history.copy(),
+                        "map50": sanitize_metrics_for_pg_json(map50),
+                        "map50_95": sanitize_metrics_for_pg_json(map50_95),
+                        "metrics_history": sanitize_metrics_history(metrics_history),
                     })
                 except Exception as e:
                     logger.debug(f"Failed to send validation metrics: {e}")
@@ -1212,8 +1350,7 @@ async def _execute_training(db: AsyncSession, job_id: str, main_loop):
     model.add_callback("on_train_epoch_end", on_train_epoch_end)
     model.add_callback("on_val_end", on_val_end)
 
-    # 自动计算最优 data loading workers 数量
-    import os
+    # 自动计算最优 data loading workers 数量（勿在函数内再 import os：会与上方 os.environ 冲突导致 UnboundLocalError）
     cpu_count = os.cpu_count() or 4
 
     if job.batch_size <= 8:
@@ -1381,12 +1518,16 @@ async def _execute_training(db: AsyncSession, job_id: str, main_loop):
             if key not in skip_keys:
                 train_args[key] = value
 
-    # OBB / 姿态：显式 task；overlap_mask 仅分割有效，否则易在加载 OBB 数据时报错
+    # OBB / 姿态 / 分割：显式 task；overlap_mask 仅分割有效，否则易在加载 OBB 数据时报错
     _ul_task = infer_ultralytics_task_from_model_name(job.model_name)
     if _ul_task == "obb":
         train_args["task"] = "obb"
     elif _ul_task == "pose":
         train_args["task"] = "pose"
+    elif _ul_task == "segment":
+        train_args["task"] = "segment"
+    elif _ul_task == "semantic":
+        train_args["task"] = "semantic"
     if _ul_task != "segment":
         train_args["overlap_mask"] = False
 
@@ -1433,7 +1574,7 @@ async def _execute_training(db: AsyncSession, job_id: str, main_loop):
     map50 = None
     map50_95 = None
     try:
-        if hasattr(results, 'box'):
+        if hasattr(results, 'box') and results.box is not None:
             map50 = float(results.box.map50)
             map50_95 = float(results.box.map)
         elif metrics_history:
@@ -1442,15 +1583,27 @@ async def _execute_training(db: AsyncSession, job_id: str, main_loop):
             map50_95 = last.get("val/map50_95")
     except Exception:
         pass
+    if map50 is None:
+        try:
+            sg = getattr(results, "seg", None)
+            if sg is not None:
+                m50 = getattr(sg, "map50", None)
+                m95 = getattr(sg, "map", None)
+                if m50 is not None:
+                    map50 = float(m50)
+                if m95 is not None:
+                    map50_95 = float(m95)
+        except (TypeError, ValueError):
+            pass
 
     # Update job record
     job.status = JobStatus.COMPLETED
     job.completed_at = datetime.utcnow()
     job.model_path = final_model
     job.output_dir = str(output_dir)
-    job.best_map50 = map50
-    job.best_map50_95 = map50_95
-    job.metrics_history = metrics_history
+    job.best_map50 = sanitize_metrics_for_pg_json(map50)
+    job.best_map50_95 = sanitize_metrics_for_pg_json(map50_95)
+    job.metrics_history = sanitize_metrics_history(metrics_history)
     job.current_epoch = job.epochs
 
     # Register model artifact
@@ -1470,8 +1623,8 @@ async def _execute_training(db: AsyncSession, job_id: str, main_loop):
         model_path=final_model,
         model_type="yolo",
         classes=dataset.classes if dataset else [],
-        map50=map50,
-        map50_95=map50_95,
+        map50=sanitize_metrics_for_pg_json(map50),
+        map50_95=sanitize_metrics_for_pg_json(map50_95),
         file_size=file_size,
     )
     db.add(model_artifact)
@@ -1480,8 +1633,8 @@ async def _execute_training(db: AsyncSession, job_id: str, main_loop):
     await ws_manager.send_message(job_id, {
         "type": "training_complete",
         "job_id": job_id,
-        "map50": map50,
-        "map50_95": map50_95,
+        "map50": sanitize_metrics_for_pg_json(map50),
+        "map50_95": sanitize_metrics_for_pg_json(map50_95),
         "model_path": final_model,
         "model_id": model_artifact.id,
     })

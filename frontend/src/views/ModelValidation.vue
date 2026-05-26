@@ -168,6 +168,10 @@
                   :closable="false"
                   style="flex: 1; margin-bottom: 0"
                 />
+                <el-button type="success" size="small" @click="downloadResultsJson">
+                  <el-icon><Download /></el-icon>
+                  下载JSON
+                </el-button>
                 <el-button type="primary" size="small" @click="openSaveDialog">
                   <el-icon><FolderOpened /></el-icon>
                   保存到数据集
@@ -183,7 +187,7 @@
                   <template #title>
                     <span>{{ imgResult.image_name }}</span>
                     <el-tag size="small" type="info" style="margin-left: 8px">
-                      {{ imgResult.results?.reduce((s, r) => s + (r.detection_count || 0), 0) }} 检测 / {{ imgResult.total_time_ms?.toFixed(0) }}ms
+                      {{ imgResultSummary(imgResult) }}
                     </el-tag>
                   </template>
 
@@ -191,7 +195,7 @@
                     <el-tab-pane
                       v-for="result in (imgResult.results || [])"
                       :key="result.model_id"
-                      :label="`${result.model_name} (${result.detection_count})`"
+                      :label="`${result.model_name} (${validationResultCount(result)})`"
                       :name="result.model_id"
                     >
                       <div v-if="result.error" class="error-message">
@@ -200,7 +204,33 @@
 
                       <div v-else class="result-layout">
                         <div class="result-image-wrap">
+                          <div v-if="isSemanticValidationResult(result)" class="semantic-view-bar">
+                            <el-tag type="success" size="small">语义掩膜</el-tag>
+                            <el-radio-group
+                              v-model="semanticViewMode"
+                              size="small"
+                              @change="() => redrawSemanticResult(imgIdx, result.model_id)"
+                            >
+                              <el-radio-button value="overlay">原图+叠色</el-radio-button>
+                              <el-radio-button value="mask">仅掩膜</el-radio-button>
+                            </el-radio-group>
+                          </div>
                           <canvas :ref="(el) => setCanvasRef(imgIdx, result.model_id, el)" class="result-canvas" />
+                          <p
+                            v-if="isSemanticValidationResult(result) && !result.semantic?.mask_png_base64"
+                            class="semantic-hint warn"
+                          >
+                            后端未返回 mask_png_base64，请确认 Ultralytics ≥ 8.4.52 且为 -sem 模型。
+                          </p>
+                          <p
+                            v-else-if="isSemanticValidationResult(result) && validationResultItems(result).length === 0"
+                            class="semantic-hint warn"
+                          >
+                            掩膜已返回，但全为背景(0)或忽略(255)，画面上无彩色区域。
+                          </p>
+                          <p v-else-if="isSemanticValidationResult(result)" class="semantic-hint">
+                            彩色区域为模型预测的语义类别；背景(0)与忽略(255)不着色。
+                          </p>
                         </div>
 
                         <div class="result-info-panel">
@@ -209,27 +239,29 @@
                             <span class="stat-value" style="font-size: 14px">{{ result.model_name }}</span>
                           </div>
                           <div class="stat-item">
-                            <span class="stat-label">检测数量</span>
-                            <span class="stat-value">{{ result.detection_count }}</span>
+                            <span class="stat-label">{{ validationResultCountLabel(result) }}</span>
+                            <span class="stat-value">{{ validationResultCount(result) }}</span>
                           </div>
                           <div class="stat-item">
                             <span class="stat-label">推理耗时</span>
                             <span class="stat-value">{{ result.inference_time_ms.toFixed(1) }} ms</span>
                           </div>
 
-                          <div class="detection-list-title">检测结果</div>
-                          <div v-if="result.detections.length === 0" class="no-detection">
-                            未检测到任何物体
+                          <div class="detection-list-title">
+                            {{ isSemanticValidationResult(result) ? '语义类别占比' : '检测结果' }}
+                          </div>
+                          <div v-if="validationResultItems(result).length === 0" class="no-detection">
+                            {{ isSemanticValidationResult(result) ? '未解析到前景类别' : '未检测到任何物体' }}
                           </div>
                           <div v-else class="detection-list">
                             <div
-                              v-for="(det, idx) in result.detections"
+                              v-for="(item, idx) in validationResultItems(result)"
                               :key="idx"
                               class="detection-row"
                             >
                               <span class="det-color" :style="{ background: getColor(idx) }" />
-                              <span class="det-class">{{ det.class_name }}</span>
-                              <span class="det-conf">{{ (det.confidence * 100).toFixed(1) }}%</span>
+                              <span class="det-class">{{ item.class_name }}</span>
+                              <span class="det-conf">{{ formatValidationItemSecondary(item, result) }}</span>
                             </div>
                           </div>
                         </div>
@@ -237,9 +269,31 @@
                     </el-tab-pane>
 
                     <el-tab-pane label="对比分析" :name="'comparison_' + imgIdx">
-                      <el-table :data="(imgResult.results || []).map(r => ({ model_name: r.model_name, detection_count: r.detection_count, inference_time_ms: r.inference_time_ms, error: r.error }))" stripe size="small">
-                        <el-table-column prop="model_name" label="模型" width="200" />
-                        <el-table-column prop="detection_count" label="检测数量" width="100" align="center" />
+                      <el-table
+                        :data="(imgResult.results || []).map(r => ({
+                          model_name: r.model_name,
+                          task: r.task || (isSemanticValidationResult(r) ? 'semantic' : 'detect'),
+                          count: validationResultCount(r),
+                          count_label: validationResultCountLabel(r),
+                          inference_time_ms: r.inference_time_ms,
+                          error: r.error,
+                        }))"
+                        stripe
+                        size="small"
+                      >
+                        <el-table-column prop="model_name" label="模型" width="180" />
+                        <el-table-column prop="task" label="任务" width="90" align="center">
+                          <template #default="{ row }">
+                            <el-tag size="small" :type="row.task === 'semantic' ? 'success' : 'info'">
+                              {{ row.task === 'semantic' ? '语义' : row.task === 'obb' ? 'OBB' : '检测' }}
+                            </el-tag>
+                          </template>
+                        </el-table-column>
+                        <el-table-column label="数量" width="100" align="center">
+                          <template #default="{ row }">
+                            {{ row.count }} <span style="color:#909399;font-size:12px">{{ row.count_label }}</span>
+                          </template>
+                        </el-table-column>
                         <el-table-column prop="inference_time_ms" label="推理时间 (ms)" width="150" align="center">
                           <template #default="{ row }">
                             {{ row.inference_time_ms?.toFixed(2) }}
@@ -316,9 +370,17 @@
 <script setup>
 import {nextTick, onMounted, ref, watch} from 'vue'
 import {ElMessage} from 'element-plus'
-import {FolderOpened, UploadFilled, View} from '@element-plus/icons-vue'
+import {Download, FolderOpened, UploadFilled, View} from '@element-plus/icons-vue'
 import axios from 'axios'
-import {drawDetectionOverlay} from '@/utils/drawDetectionsCanvas'
+import {drawValidationResult} from '@/utils/drawValidationResult'
+import {drawSemanticMaskOnlyCanvas, drawSemanticValidationCanvas} from '@/utils/drawSemanticMaskOverlay'
+import {
+  formatValidationItemSecondary,
+  isSemanticValidationResult,
+  validationResultCount,
+  validationResultCountLabel,
+  validationResultItems,
+} from '@/utils/parseValidationResult'
 import {useProjectStore} from '@/stores/project'
 import {storeToRefs} from 'pinia'
 
@@ -332,23 +394,30 @@ function getColor(index) {
   return COLORS[index % COLORS.length]
 }
 
-function drawDetections(canvas, imageSrc, detections) {
-  if (!canvas) return
-  const ctx = canvas.getContext('2d')
-  const img = new Image()
-  img.onload = () => {
-    const parentW = canvas.parentElement?.clientWidth ?? 0
-    // 未展开的面板或尚未布局时 parent 宽度为 0，避免 scale=0 导致画布为 0、检测框不显示
-    const availW =
-        parentW > 32 ? parentW - 16 : Math.min(1200, Math.max(320, img.width))
-    const scale = Math.min(availW / img.width, 1)
-    canvas.width = img.width * scale
-    canvas.height = img.height * scale
-    ctx.drawImage(img, 0, 0, canvas.width, canvas.height)
+function imgResultSummary(imgResult) {
+  const results = imgResult.results || []
+  const detectTotal = results.reduce((s, r) => s + validationResultCount(r), 0)
+  const hasSemantic = results.some((r) => isSemanticValidationResult(r))
+  const unit = hasSemantic && !results.some((r) => !isSemanticValidationResult(r) && validationResultCount(r) > 0)
+    ? '类'
+    : '项'
+  return `${detectTotal} ${unit} / ${imgResult.total_time_ms?.toFixed(0) ?? 0}ms`
+}
 
-    drawDetectionOverlay(ctx, scale, detections, getColor)
+function drawDetections(canvas, imageSrc, result) {
+  return drawValidationResult(canvas, imageSrc, result, COLORS, getColor)
+}
+
+async function redrawSemanticResult(imgIdx, modelId) {
+  const imgResult = validationResults.value?.images?.[imgIdx]
+  const result = imgResult?.results?.find((r) => r.model_id === modelId)
+  const canvas = canvasRefs.value[imgIdx]?.[modelId]
+  if (!canvas || !result?.semantic?.mask_png_base64) return
+  if (semanticViewMode.value === 'mask') {
+    await drawSemanticMaskOnlyCanvas(canvas, result.semantic)
+    return
   }
-  img.src = imageSrc
+  await drawSemanticValidationCanvas(canvas, previewUrls.value[imgIdx], result.semantic)
 }
 
 const projectStore = useProjectStore()
@@ -366,6 +435,8 @@ const validationResults = ref(null)
 const activeImageIndex = ref(['0'])
 const activeTabByImage = ref({})
 const canvasRefs = ref({})
+/** 语义验证：overlay=原图叠色，mask=仅掩膜伪彩色 */
+const semanticViewMode = ref('overlay')
 
 // 保存到数据集
 const saveDialogVisible = ref(false)
@@ -490,9 +561,11 @@ async function runValidation() {
       (validationResults.value.images || []).map((img, i) => [i, img.results?.[0]?.model_id || ''])
     )
     await nextTick()
-    Object.entries(activeTabByImage.value).forEach(([i, modelId]) => {
-      drawResultForModel(Number(i), modelId)
-    })
+    await Promise.all(
+      Object.entries(activeTabByImage.value).map(([i, modelId]) =>
+        drawResultForModel(Number(i), modelId),
+      ),
+    )
 
     ElMessage.success('验证完成')
   } catch (error) {
@@ -520,29 +593,54 @@ function onResultsCollapseChange(activeNames) {
           ? [activeNames]
           : []
   nextTick(() => {
-    for (const name of names) {
-      const imgIdx = Number(name)
-      if (Number.isNaN(imgIdx) || !validationResults.value?.images?.[imgIdx]) continue
-      const modelId = activeTabByImage.value[imgIdx]
-      if (modelId && !String(modelId).startsWith('comparison_')) {
-        drawResultForModel(imgIdx, modelId)
+    void (async () => {
+      for (const name of names) {
+        const imgIdx = Number(name)
+        if (Number.isNaN(imgIdx) || !validationResults.value?.images?.[imgIdx]) continue
+        const modelId = activeTabByImage.value[imgIdx]
+        if (modelId && !String(modelId).startsWith('comparison_')) {
+          await drawResultForModel(imgIdx, modelId)
+        }
       }
-    }
+    })()
   })
 }
 
-function drawResultForModel(imgIdx, modelId) {
+async function drawResultForModel(imgIdx, modelId) {
   if (!validationResults.value?.images?.[imgIdx] || !previewUrls.value[imgIdx]) return
   const imgResult = validationResults.value.images[imgIdx]
   const result = imgResult.results?.find((r) => r.model_id === modelId)
   if (!result || result.error) return
   const canvas = canvasRefs.value[imgIdx]?.[modelId]
-  if (canvas) drawDetections(canvas, previewUrls.value[imgIdx], result.detections)
+  if (!canvas) return
+  if (isSemanticValidationResult(result)) {
+    await redrawSemanticResult(imgIdx, modelId)
+    return
+  }
+  await drawDetections(canvas, previewUrls.value[imgIdx], result)
 }
 
 function handleTabChange(tabName, imgIdx) {
   if (String(tabName).startsWith('comparison_')) return
-  nextTick(() => drawResultForModel(imgIdx, tabName))
+  nextTick(() => {
+    void drawResultForModel(imgIdx, tabName)
+  })
+}
+
+// 下载推理结果 JSON
+function downloadResultsJson() {
+  if (!validationResults.value) return
+  const data = JSON.stringify(validationResults.value, null, 2)
+  const blob = new Blob([data], { type: 'application/json' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+  a.download = `validation_results_${ts}.json`
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  URL.revokeObjectURL(url)
 }
 
 // 保存到数据集
@@ -703,14 +801,36 @@ async function submitSaveToDataset() {
   border-radius: 6px;
   padding: 8px;
   display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: flex-start;
+}
+
+.semantic-view-bar {
+  display: flex;
   align-items: center;
-  justify-content: center;
+  gap: 12px;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+
+.semantic-hint {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: #c0c4cc;
+  line-height: 1.5;
+}
+
+.semantic-hint.warn {
+  color: #f3d19e;
 }
 
 .result-canvas {
   max-width: 100%;
+  width: 100%;
   border-radius: 4px;
   display: block;
+  align-self: center;
 }
 
 .result-info-panel {

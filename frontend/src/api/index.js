@@ -62,6 +62,22 @@ export const datasetApi = {
   // Serve
   imageUrl: (imageId, thumbnail = false) =>
     `/api/v1/datasets/files/image/${imageId}${thumbnail ? '?thumbnail=true' : ''}`,
+
+  /** 语义分割：单通道 PNG 掩膜 */
+  semanticMaskUrl: (imageId) =>
+    `/api/v1/datasets/files/semantic-mask/${imageId}`,
+  uploadSemanticMask: (datasetId, imageId, file) => {
+    const fd = new FormData()
+    const blob = file?.raw ?? file
+    const name = file?.name || (blob && blob.name) || 'mask.png'
+    fd.append('file', blob, name)
+    return http.post(`/datasets/${datasetId}/images/${imageId}/semantic-mask`, fd, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 120000,
+    })
+  },
+  deleteSemanticMask: (datasetId, imageId) =>
+    http.delete(`/datasets/${datasetId}/images/${imageId}/semantic-mask`),
 }
 
 // Augmentation APIs

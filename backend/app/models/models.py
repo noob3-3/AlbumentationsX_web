@@ -97,7 +97,7 @@ class Dataset(Base):
         SAEnum(DatasetStatus, native_enum=False), default=DatasetStatus.PENDING
     )
     classes: Mapped[Optional[dict]] = mapped_column(JSON, default=list)  # 标注时自动生成的类别列表
-    # 标签任务类型：detect=水平框，obb=旋转框/OBB，pose=姿态（与训练可选模型联动）
+    # detect|obb|pose|segment(实例分割)|semantic(语义分割PNG掩膜)
     label_task: Mapped[str] = mapped_column(String(32), default="detect")
     image_count: Mapped[int] = mapped_column(Integer, default=0)
     annotation_count: Mapped[int] = mapped_column(Integer, default=0)
@@ -127,6 +127,7 @@ class Image(Base):
     original_filename: Mapped[str] = mapped_column(String(512), nullable=False)
     file_path: Mapped[str] = mapped_column(String(1024), nullable=False)
     thumbnail_path: Mapped[Optional[str]] = mapped_column(String(1024))
+    semantic_mask_path: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
     width: Mapped[Optional[int]] = mapped_column(Integer)
     height: Mapped[Optional[int]] = mapped_column(Integer)
     file_size: Mapped[Optional[int]] = mapped_column(Integer)

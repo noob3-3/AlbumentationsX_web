@@ -27,7 +27,7 @@ class ModelValidationService:
         """
         from ultralytics import YOLO
         from app.services.deployment_service import DeploymentService
-        from app.utils.yolo_result_parse import detections_from_ultralytics_result
+        from app.utils.yolo_result_parse import inference_output_from_ultralytics_result
         import cv2
 
         # Load image
@@ -76,7 +76,13 @@ class ModelValidationService:
                             iou=iou_threshold,
                         )
 
-                        detections = inference_result["detections"]
+                        parsed = {
+                            "task": inference_result.get("task", "detect"),
+                            "detections": inference_result.get("detections") or [],
+                            "detection_count": inference_result.get("detection_count", 0),
+                            "semantic": inference_result.get("semantic"),
+                        }
+                        detections = parsed["detections"]
                         inference_time = inference_result["inference_time_ms"]
 
                     except Exception as e:
@@ -101,12 +107,12 @@ class ModelValidationService:
                     )
                     inference_time = (time.time() - start_time) * 1000
 
-                    # Parse detections（OBB 模型无 boxes，需解析 obb）
-                    detections = []
+                    parsed = {"task": "detect", "detections": [], "detection_count": 0, "semantic": None}
                     if predictions and len(predictions) > 0:
-                        detections = detections_from_ultralytics_result(
+                        parsed = inference_output_from_ultralytics_result(
                             yolo_model, predictions[0], width, height
                         )
+                    detections = parsed["detections"]
 
                 # Save validation record
                 validation = ModelValidation(
@@ -117,16 +123,18 @@ class ModelValidationService:
                     inference_time_ms=inference_time,
                     confidence_threshold=confidence_threshold,
                     iou_threshold=iou_threshold,
-                    detection_count=len(detections),
+                    detection_count=parsed.get("detection_count", len(detections)),
                 )
                 db.add(validation)
 
                 results.append({
                     "model_id": model_obj.id,
                     "model_name": model_obj.name,
+                    "task": parsed.get("task", "detect"),
                     "detections": detections,
+                    "semantic": parsed.get("semantic"),
                     "inference_time_ms": inference_time,
-                    "detection_count": len(detections),
+                    "detection_count": parsed.get("detection_count", len(detections)),
                     "error": None,
                     "used_deployment": deployment is not None,
                     "deployment_id": deployment.id if deployment else None,
@@ -137,6 +145,8 @@ class ModelValidationService:
                 results.append({
                     "model_id": model_obj.id,
                     "model_name": model_obj.name,
+                    "task": "detect",
+                    "semantic": None,
                     "detections": [],
                     "inference_time_ms": 0,
                     "detection_count": 0,

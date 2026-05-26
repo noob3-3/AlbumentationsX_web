@@ -10,6 +10,7 @@ from pathlib import Path
 from sqlalchemy import select, or_, and_, exists
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from sqlalchemy.orm.attributes import flag_modified
 from typing import Optional, List
 
 
@@ -384,20 +385,50 @@ class AnnotationService:
 
     @staticmethod
     async def _update_dataset_classes(db: AsyncSession, dataset_id: str):
-        """从标注中更新数据集的类别列表"""
-        result = await db.execute(
-            select(Annotation.class_name)
-            .join(Image, Annotation.image_id == Image.id)
-            .where(Image.dataset_id == dataset_id)
-            .distinct()
-        )
-        class_names = [row[0] for row in result.all() if row[0]]
-
+        """
+        保存标注后，按 class_id 合并「已有 dataset.classes」与标注中的类别名。
+        不得用「当前出现过的类名集合」整体覆盖，否则只标了 class0 时会把 class1、2 从列表里冲掉。
+        """
         dataset_result = await db.execute(select(Dataset).where(Dataset.id == dataset_id))
         dataset = dataset_result.scalar_one_or_none()
-        if dataset:
-            dataset.classes = sorted(class_names)
-            await db.flush()
+        if not dataset:
+            return
+
+        existing = list(dataset.classes or [])
+
+        result = await db.execute(
+            select(Annotation.class_id, Annotation.class_name)
+            .join(Image, Annotation.image_id == Image.id)
+            .where(Image.dataset_id == dataset_id)
+        )
+        pairs = result.all()
+        if not pairs:
+            return
+
+        max_id = -1
+        for cid, _ in pairs:
+            if cid is not None and int(cid) > max_id:
+                max_id = int(cid)
+
+        need_len = max(len(existing), max_id + 1)
+        out: List[str] = []
+        for i in range(need_len):
+            out.append(existing[i] if i < len(existing) else "")
+
+        for cid, cname in pairs:
+            if cid is None:
+                continue
+            cid = int(cid)
+            if cid < 0:
+                continue
+            while len(out) <= cid:
+                out.append("")
+            if cname:
+                out[cid] = str(cname)
+
+        dataset.classes = out
+        flag_modified(dataset, "classes")
+        await db.flush()
 
     @staticmethod
     async def get_image_with_annotations(db: AsyncSession, image_id: str) -> Optional[Image]:
