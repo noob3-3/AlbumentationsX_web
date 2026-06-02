@@ -149,7 +149,7 @@ async def save_validation_to_dataset(
                 cx, cy, w, h = cx / img_w, cy / img_h, w / img_w, h / img_h
             else:
                 cx, cy, w, h = 0.5, 0.5, 0.1, 0.1
-        return {
+        ann = {
             "class_id": det.get("class_id", 0),
             "class_name": det.get("class_name") or "unknown",
             "x_center": max(0, min(1, cx)),
@@ -158,6 +158,12 @@ async def save_validation_to_dataset(
             "bbox_height": max(0.01, min(1, h)),
             "confidence": det.get("confidence"),
         }
+        poly = det.get("polygon_points")
+        if poly and len(poly) >= 3:
+            ann["polygon_points"] = [
+                [max(0, min(1, float(p[0]))), max(0, min(1, float(p[1])))] for p in poly
+            ]
+        return ann
 
     # 确定目标数据集
     if dataset_id:

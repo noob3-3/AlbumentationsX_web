@@ -1,7 +1,8 @@
 """
 将 Ultralytics predict 的单个 Results 解析为平台统一的 detections 列表。
 
-检测任务使用 result.boxes；OBB 任务使用 result.obb（boxes 常为 None，不可对 None 迭代）；
+检测任务使用 result.boxes；实例分割使用 result.masks（多边形顶点）+ boxes；
+OBB 任务使用 result.obb（boxes 常为 None，不可对 None 迭代）；
 语义分割使用 result.semantic_mask（单通道类别图）。
 """
 from __future__ import annotations
@@ -11,6 +12,93 @@ from typing import Any, Dict, List, Optional
 
 import cv2
 import numpy as np
+
+
+def _clamp01(v: float) -> float:
+    return max(0.0, min(1.0, float(v)))
+
+
+def _polygon_normalized_from_mask(
+    masks: Any,
+    index: int,
+    width: int,
+    height: int,
+) -> Optional[List[List[float]]]:
+    """从 masks.xyn（优先）或 masks.xy 得到归一化多边形顶点。"""
+    xyn = getattr(masks, "xyn", None)
+    if xyn is not None and index < len(xyn):
+        arr = xyn[index]
+        if hasattr(arr, "cpu"):
+            arr = arr.cpu().numpy()
+        else:
+            arr = np.asarray(arr)
+        if arr.size >= 6:
+            pts = arr.reshape(-1, 2)
+            return [[_clamp01(p[0]), _clamp01(p[1])] for p in pts]
+
+    xy = getattr(masks, "xy", None)
+    if xy is not None and index < len(xy):
+        arr = xy[index]
+        if hasattr(arr, "cpu"):
+            arr = arr.cpu().numpy()
+        else:
+            arr = np.asarray(arr)
+        if arr.size >= 6 and width > 0 and height > 0:
+            pts = arr.reshape(-1, 2)
+            return [
+                [_clamp01(float(p[0]) / width), _clamp01(float(p[1]) / height)]
+                for p in pts
+            ]
+    return None
+
+
+def segment_detections_from_ultralytics_result(
+    yolo_model: Any,
+    result: Any,
+    width: int,
+    height: int,
+) -> Optional[List[Dict[str, Any]]]:
+    """
+    实例分割（*-seg.pt）：boxes 提供类别/置信度/外接框，masks 提供多边形。
+    无 masks 时返回 None，由调用方回退到水平框检测。
+    """
+    masks = getattr(result, "masks", None)
+    boxes = getattr(result, "boxes", None)
+    if masks is None or len(masks) == 0:
+        return None
+    if boxes is None or len(boxes) == 0:
+        return None
+
+    detections: List[Dict[str, Any]] = []
+    n = min(len(boxes), len(masks))
+    for i in range(n):
+        polygon_points = _polygon_normalized_from_mask(masks, i, width, height)
+        if not polygon_points or len(polygon_points) < 3:
+            continue
+
+        box = boxes[i]
+        xyxy = box.xyxy[0].cpu().numpy()
+        x1, y1, x2, y2 = map(float, xyxy)
+        cx = (x1 + x2) / 2 / width
+        cy = (y1 + y2) / 2 / height
+        w = (x2 - x1) / width
+        h = (y2 - y1) / height
+        class_id = int(box.cls[0].cpu().numpy())
+        confidence = float(box.conf[0].cpu().numpy())
+        class_name = _class_name_from_model(yolo_model, class_id)
+        detections.append(
+            {
+                "class_id": class_id,
+                "class_name": class_name,
+                "confidence": confidence,
+                "bbox": [x1, y1, x2, y2],
+                "bbox_normalized": [float(cx), float(cy), float(w), float(h)],
+                "polygon_points": polygon_points,
+                "task": "segment",
+            }
+        )
+
+    return detections if detections else None
 
 
 def detections_from_ultralytics_result(
@@ -23,6 +111,12 @@ def detections_from_ultralytics_result(
     从单张图的 ``results[0]`` 解析检测框列表。
     ``width/height`` 用于归一化 bbox_normalized。
     """
+    segment = segment_detections_from_ultralytics_result(
+        yolo_model, result, width, height
+    )
+    if segment is not None:
+        return segment
+
     detections: List[Dict[str, Any]] = []
 
     boxes = getattr(result, "boxes", None)
@@ -194,7 +288,13 @@ def inference_output_from_ultralytics_result(
     detections = detections_from_ultralytics_result(yolo_model, result, width, height)
     task = "detect"
     if detections:
-        task = detections[0].get("task") or "detect"
+        tasks = {d.get("task") for d in detections if d.get("task")}
+        if "segment" in tasks:
+            task = "segment"
+        elif "obb" in tasks:
+            task = "obb"
+        else:
+            task = detections[0].get("task") or "detect"
     return {
         "task": task,
         "detections": detections,

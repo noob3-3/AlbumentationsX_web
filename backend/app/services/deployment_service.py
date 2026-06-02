@@ -11,7 +11,7 @@ from loguru import logger
 from pathlib import Path
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 # Global model cache
 _model_cache: Dict[str, Any] = {}
@@ -229,10 +229,16 @@ class DeploymentService:
             elif image_np.shape[2] == 3:  # RGB
                 image_np = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
 
-        # Draw bounding boxes（OBB 优先画旋转四边形；标签优先在框外上方，超出图像上缘时改框内顶）
+        # 绘制检测/OBB/实例分割（seg：半透明掩膜 + 轮廓 + 外接框，对齐 Ultralytics plot）
+        from app.utils.inference_render import (
+            color_for_index,
+            draw_segment_mask_and_box,
+            is_segment_detection,
+        )
+
         h_img, w_img = image_np.shape[:2]
         pad = 4
-        for detection in detections:
+        for det_idx, detection in enumerate(detections):
             class_name = detection["class_name"]
             confidence = detection["confidence"]
             bbox = detection["bbox"]
@@ -242,7 +248,7 @@ class DeploymentService:
             (label_width, label_height), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
             box_h = label_height + baseline + pad * 2
 
-            def draw_label_bar(lx: int, top_y: int) -> None:
+            def draw_label_bar(lx: int, top_y: int, bar_color: Tuple[int, int, int] = (0, 255, 0)) -> None:
                 lx = max(0, min(lx, w_img - label_width - pad * 2))
                 ty_out = int(top_y) - box_h
                 if ty_out >= 0:
@@ -254,7 +260,7 @@ class DeploymentService:
                     image_np,
                     (lx, ty),
                     (lx + label_width + pad * 2, ty + box_h),
-                    (0, 255, 0),
+                    bar_color,
                     -1,
                 )
                 cv2.putText(
@@ -262,16 +268,21 @@ class DeploymentService:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1,
                 )
 
-            if detection.get("task") == "obb" and detection.get("obb_xyxyxyxy"):
+            color = color_for_index(det_idx)
+
+            if is_segment_detection(detection):
+                lx, top_y = draw_segment_mask_and_box(image_np, detection, color)
+                draw_label_bar(lx, top_y, color)
+            elif detection.get("task") == "obb" and detection.get("obb_xyxyxyxy"):
                 pts = np.array(detection["obb_xyxyxyxy"], dtype=np.float32).reshape(-1, 2).astype(np.int32)
-                cv2.polylines(image_np, [pts], True, (0, 255, 0), 2)
+                cv2.polylines(image_np, [pts], True, color, 2)
                 cx = float(np.mean(pts[:, 0]))
                 top_y = float(np.min(pts[:, 1]))
                 lx = int(cx - label_width / 2 - pad)
-                draw_label_bar(lx, int(top_y))
+                draw_label_bar(lx, int(top_y), color)
             else:
-                cv2.rectangle(image_np, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                draw_label_bar(x1, y1)
+                cv2.rectangle(image_np, (x1, y1), (x2, y2), color, 2)
+                draw_label_bar(x1, y1, color)
 
         # Encode image to base64
         _, buffer = cv2.imencode('.jpg', image_np)

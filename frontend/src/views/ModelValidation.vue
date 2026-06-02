@@ -204,6 +204,10 @@
 
                       <div v-else class="result-layout">
                         <div class="result-image-wrap">
+                          <div v-if="isSegmentValidationResult(result)" class="semantic-view-bar">
+                            <el-tag type="warning" size="small">实例分割</el-tag>
+                            <span class="semantic-hint" style="margin: 0">半透明掩膜 + 外接框（同 Ultralytics plot）</span>
+                          </div>
                           <div v-if="isSemanticValidationResult(result)" class="semantic-view-bar">
                             <el-tag type="success" size="small">语义掩膜</el-tag>
                             <el-radio-group
@@ -248,10 +252,22 @@
                           </div>
 
                           <div class="detection-list-title">
-                            {{ isSemanticValidationResult(result) ? '语义类别占比' : '检测结果' }}
+                            {{
+                              isSemanticValidationResult(result)
+                                ? '语义类别占比'
+                                : isSegmentValidationResult(result)
+                                  ? '实例列表'
+                                  : '检测结果'
+                            }}
                           </div>
                           <div v-if="validationResultItems(result).length === 0" class="no-detection">
-                            {{ isSemanticValidationResult(result) ? '未解析到前景类别' : '未检测到任何物体' }}
+                            {{
+                              isSemanticValidationResult(result)
+                                ? '未解析到前景类别'
+                                : isSegmentValidationResult(result)
+                                  ? '未检测到任何实例'
+                                  : '未检测到任何物体'
+                            }}
                           </div>
                           <div v-else class="detection-list">
                             <div
@@ -284,8 +300,11 @@
                         <el-table-column prop="model_name" label="模型" width="180" />
                         <el-table-column prop="task" label="任务" width="90" align="center">
                           <template #default="{ row }">
-                            <el-tag size="small" :type="row.task === 'semantic' ? 'success' : 'info'">
-                              {{ row.task === 'semantic' ? '语义' : row.task === 'obb' ? 'OBB' : '检测' }}
+                            <el-tag
+                              size="small"
+                              :type="row.task === 'semantic' ? 'success' : row.task === 'segment' ? 'warning' : 'info'"
+                            >
+                              {{ validationTaskLabel(row.task) }}
                             </el-tag>
                           </template>
                         </el-table-column>
@@ -377,9 +396,11 @@ import {drawSemanticMaskOnlyCanvas, drawSemanticValidationCanvas} from '@/utils/
 import {
   formatValidationItemSecondary,
   isSemanticValidationResult,
+  isSegmentValidationResult,
   validationResultCount,
   validationResultCountLabel,
   validationResultItems,
+  validationTaskLabel,
 } from '@/utils/parseValidationResult'
 import {useProjectStore} from '@/stores/project'
 import {storeToRefs} from 'pinia'
@@ -681,6 +702,8 @@ function buildDetectionsForModel(modelId) {
       confidence: d.confidence ?? null,
       bbox_normalized: d.bbox_normalized ?? null,
       bbox: d.bbox ?? null,
+      polygon_points: d.polygon_points ?? null,
+      task: d.task ?? r.task ?? null,
     }))
   })
 }
