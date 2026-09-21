@@ -1,0 +1,39 @@
+.pages-url-panel {
+  max-width: 420px;
+  padding: 24px 28px;
+  border-radius: 16px;
+  background: var(--vp-c-bg-soft);
+  border: 1px solid var(--vp-c-divider);
+}
+
+.pages-url-kicker {
+  margin: 0 0 6px;
+  font-size: 13px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--vp-c-text-2);
+}
+
+.pages-url-title {
+  margin: 0 0 12px;
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--vp-c-text-1);
+}
+
+.pages-url-link {
+  display: inline-block;
+  word-break: break-all;
+  color: var(--vp-c-brand-1);
+  font-weight: 600;
+}
+
+.pages-url-hint {
+  margin: 12px 0 0;
+  font-size: 13px;
+  color: var(--vp-c-text-2);
+}
+
+.pages-url-hint code {
+  font-size: 12px;
+}

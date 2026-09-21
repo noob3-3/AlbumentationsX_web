@@ -1,0 +1,14 @@
+{
+  "name": "vst-platform-docs",
+  "private": true,
+  "type": "module",
+  "description": "VST 目标检测训练平台使用说明",
+  "scripts": {
+    "docs:dev": "vitepress dev docs --port 5174",
+    "docs:build": "vitepress build docs",
+    "docs:preview": "vitepress preview docs --port 4174"
+  },
+  "devDependencies": {
+    "vitepress": "^1.6.3"
+  }
+}

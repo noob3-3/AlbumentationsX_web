@@ -1,0 +1,44 @@
+# 构建 VitePress 并发布到 GitLab Pages
+
+stages:
+  - deploy
+
+variables:
+  GIT_SSL_NO_VERIFY: "true"
+  CI_PAGES_BASE: "/${CI_PROJECT_PATH}/"
+  HTTP_PROXY: "http://192.168.31.17:7890"
+  HTTPS_PROXY: "http://192.168.31.17:7890"
+  http_proxy: "http://192.168.31.17:7890"
+  https_proxy: "http://192.168.31.17:7890"
+  NO_PROXY: "git.visentech.com,pages.visentech.com,localhost,127.0.0.1"
+  no_proxy: "git.visentech.com,pages.visentech.com,localhost,127.0.0.1"
+
+pages:
+  stage: deploy
+  image: docker.m.daocloud.io/library/node:22
+  tags:
+    - docker_1
+  cache:
+    key:
+      files:
+        - package-lock.json
+    paths:
+      - node_modules/
+  before_script:
+    - npm config set proxy http://192.168.31.17:7890
+    - npm config set https-proxy http://192.168.31.17:7890
+    - npm ci
+  script:
+    - export CI_PAGES_BASE="/${CI_PROJECT_PATH}/"
+    - npm run docs:build
+  pages:
+    publish: docs/.vitepress/dist
+  artifacts:
+    paths:
+      - docs/.vitepress/dist
+    expire_in: 1 hour
+  environment:
+    name: pages
+    url: $CI_PAGES_URL
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH

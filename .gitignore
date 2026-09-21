@@ -46,6 +46,11 @@ logs/
 # Alembic versions (optional: track these)
 # backend/alembic/versions/
 
+# Docs (VitePress)
+node_modules/
+docs/.vitepress/dist/
+docs/.vitepress/cache/
+
 # Frontend
 frontend/node_modules/
 frontend/dist/
@@ -67,3 +72,12 @@ Thumbs.db
 
 # YOLO runs
 runs/
+
+# Offline license (do not commit activated keys)
+license.dat
+backend/license.dat
+
+# Desktop / PyInstaller output
+packaging/dist/
+packaging/build/
+packaging/*.pyc
