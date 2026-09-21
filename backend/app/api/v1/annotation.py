@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from loguru import logger
 
 from app.core.database import get_db, AsyncSessionLocal
+from app.core.license_guard import require_license
 from app.schemas.schemas import (
     AnnotationCreate, AnnotationUpdate, AutoAnnotationRequest,
     ImageResponse, SuccessResponse, BatchReplaceClassesRequest
@@ -44,6 +45,7 @@ async def update_image_annotations(
 async def auto_annotate_images(
     data: AutoAnnotationRequest,
     db: AsyncSession = Depends(get_db),
+    _license=Depends(require_license),
 ):
     """使用已训练的模型或预训练模型自动标注图片"""
     import asyncio

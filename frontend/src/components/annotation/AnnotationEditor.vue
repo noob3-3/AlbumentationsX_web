@@ -65,20 +65,22 @@
     <div
       ref="canvasContainerRef"
       class="canvas-container"
+      :style="canvasContainerStyle"
       @mousemove="onCanvasMouseMove"
       @mouseleave="onCanvasMouseLeave"
       @click="onCanvasClick"
       @wheel.prevent="onCanvasWheel"
     >
       <div
-        class="canvas-zoom-wrapper"
-        :style="zoomWrapperStyle"
+        class="canvas-viewport"
+        :style="canvasViewportStyle"
       >
         <canvas
           ref="canvas"
           :width="canvasWidth"
           :height="canvasHeight"
           class="annotation-canvas"
+          :style="canvasDisplayStyle"
           @mousedown="onCanvasMouseDown"
           @mouseup="onCanvasMouseUp"
         />
@@ -169,7 +171,6 @@
 import {computed, nextTick, onMounted, onUnmounted, ref, watch} from 'vue'
 import {ElMessage, ElMessageBox} from 'element-plus'
 import {Loading} from '@element-plus/icons-vue'
-import Pica from 'pica'
 
 const props = defineProps({
   imageId: String,
@@ -205,9 +206,6 @@ const canvas = ref(null)
 const ctx = ref(null)
 const imageLoaded = ref(false)
 const img = ref(null)
-const resizedImageCache = ref(null) // 大图缩放后的缓存，加速重绘
-const picaResizer = new Pica({ tile: 1024 })
-const PICA_THRESHOLD = 1200 // 超过此尺寸用 pica 缩放
 
 const selectedTool = ref('select')
 const selectedClass = ref('')
@@ -237,19 +235,54 @@ function markSaved() {
   savedSnapshot.value = annotationsSnapshot(annotations.value)
 }
 
+function markDirty() {
+  // 与当前快照错开，强制 isDirty() 为 true（携带标注落盘前）
+  savedSnapshot.value = `__dirty__${Date.now()}`
+}
+
 const canvasWidth = ref(800)
 const canvasHeight = ref(600)
 const canvasContainerRef = ref(null)
+/** 将原图尺寸缩放到容器内的基准比例；用户 zoom 在此基础上放大，最大可至 1:1 原图像素 */
+const fitScale = ref(1)
 const zoom = ref(1)
-const zoomOriginX = ref(0)
-const zoomOriginY = ref(0)
 const MIN_ZOOM = 0.25
-const MAX_ZOOM = 4
 
-const zoomWrapperStyle = computed(() => ({
-  transform: `scale(${zoom.value})`,
-  transformOrigin: `${zoomOriginX.value}px ${zoomOriginY.value}px`,
+const totalScale = computed(() => fitScale.value * zoom.value)
+
+/** 放大时容器高度随内容增高，避免固定视口裁切 */
+const canvasContainerStyle = computed(() => {
+  if (!imageLoaded.value || canvasHeight.value <= 0) return {}
+  const contentH = Math.ceil(canvasHeight.value * totalScale.value)
+  return {
+    minHeight: `${Math.max(contentH, 200)}px`,
+  }
+})
+
+const canvasViewportStyle = computed(() => {
+  const s = totalScale.value
+  return {
+    width: `${canvasWidth.value * s}px`,
+    height: `${canvasHeight.value * s}px`,
+  }
+})
+
+const canvasDisplayStyle = computed(() => ({
+  width: `${canvasWidth.value}px`,
+  height: `${canvasHeight.value}px`,
+  transform: `scale(${totalScale.value})`,
+  transformOrigin: '0 0',
 }))
+
+function uiScale() {
+  const base = Math.min(canvasWidth.value || 600, canvasHeight.value || 600)
+  return Math.max(1, base / 600)
+}
+
+function maxZoomLevel() {
+  if (fitScale.value <= 0) return 4
+  return Math.max(4, 1 / fitScale.value)
+}
 
 // Drawing state
 const isDrawing = ref(false)
@@ -259,6 +292,8 @@ const currentAnnotation = ref(null)
 const polygonPoints = ref([])
 /** 多边形绘制时鼠标位置（画布坐标），用于预览末边 */
 const polygonHover = ref(null)
+/** 绘制框/多边形时的十字辅助线位置（画布坐标） */
+const guidePoint = ref(null)
 /** 四边形(OBB) / 自由多边形，可与父组件 polygonStyle 同步 */
 const polygonStyleLocal = ref(props.polygonStyle)
 watch(() => props.polygonStyle, (v) => {
@@ -322,12 +357,22 @@ function onWindowKeydown(e) {
   }
 }
 
+let resizeObserver = null
+
 onMounted(async () => {
   window.addEventListener('keydown', onWindowKeydown)
   await nextTick()
   if (canvas.value) {
     ctx.value = canvas.value.getContext('2d')
     loadImage()
+  }
+  if (canvasContainerRef.value) {
+    resizeObserver = new ResizeObserver(() => {
+      if (imageLoaded.value && img.value) {
+        updateFitScale()
+      }
+    })
+    resizeObserver.observe(canvasContainerRef.value)
   }
   if (props.initialAnnotations?.length) {
     annotations.value = JSON.parse(JSON.stringify(props.initialAnnotations))
@@ -337,6 +382,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   window.removeEventListener('keydown', onWindowKeydown)
+  resizeObserver?.disconnect()
 })
 
 // Watch for image changes
@@ -351,11 +397,9 @@ watch(() => props.imageId, (newImageId, oldImageId) => {
     polygonPoints.value = []
     annotationHistory.value = []
     imageLoaded.value = false
+    fitScale.value = 1
     zoom.value = 1
-    zoomOriginX.value = 0
-    zoomOriginY.value = 0
     resizeRetryCount = 0
-    resizedImageCache.value = null
 
     annotations.value = props.initialAnnotations ? JSON.parse(JSON.stringify(props.initialAnnotations)) : []
     savedSnapshot.value = annotationsSnapshot(annotations.value)
@@ -365,20 +409,22 @@ watch(() => props.imageId, (newImageId, oldImageId) => {
 })
 
 // 父组件刷新同一图片的标注时（如批量替换类别、重新 loadImages），同步到画布
+// 有未保存修改时不覆盖，避免携带标注后继续画框被冲掉
 watch(
     () => JSON.stringify(props.initialAnnotations ?? []),
     (serialized, prevSerialized) => {
       if (serialized === prevSerialized) return
+      if (imageLoaded.value && isDirty()) return
       try {
         const parsed = JSON.parse(serialized)
         annotations.value = Array.isArray(parsed) ? parsed : []
       } catch {
         annotations.value = []
       }
-    savedSnapshot.value = annotationsSnapshot(annotations.value)
-    if (imageLoaded.value) {
-      nextTick(() => redraw())
-    }
+      savedSnapshot.value = annotationsSnapshot(annotations.value)
+      if (imageLoaded.value) {
+        nextTick(() => redraw())
+      }
     },
 )
 
@@ -406,28 +452,8 @@ function loadImage() {
 
   const doResizeAndShow = () => {
     logLoad('doResizeAndShow called')
-    nextTick(async () => {
+    nextTick(() => {
       resizeCanvas()
-      const t0 = performance.now()
-      const w = canvasWidth.value
-      const h = canvasHeight.value
-      const imgW = img.value.naturalWidth || img.value.width
-      const imgH = img.value.naturalHeight || img.value.height
-      if ((imgW > PICA_THRESHOLD || imgH > PICA_THRESHOLD) && w > 0 && h > 0) {
-        try {
-          const tmpCanvas = document.createElement('canvas')
-          tmpCanvas.width = w
-          tmpCanvas.height = h
-          await picaResizer.resize(img.value, tmpCanvas)
-          resizedImageCache.value = tmpCanvas
-          logLoad('pica resize done in', (performance.now() - t0).toFixed(0), 'ms')
-        } catch (e) {
-          logLoad('pica failed, fallback to drawImage', e)
-          resizedImageCache.value = null
-        }
-      }
-      redraw()
-      logLoad('redraw done in', (performance.now() - t0).toFixed(0), 'ms, canvas:', w, 'x', h)
       imageLoaded.value = true
       emit('imageReady')
     })
@@ -455,6 +481,41 @@ function loadImage() {
   img.value.src = props.imageUrl
 }
 
+function setupCanvasDimensions() {
+  if (!img.value || !canvas.value) return
+  const width = img.value.naturalWidth || img.value.width
+  const height = img.value.naturalHeight || img.value.height
+  canvasWidth.value = width
+  canvasHeight.value = height
+  canvas.value.width = width
+  canvas.value.height = height
+}
+
+/** 适配基准高度用视口预算，避免容器随放大增高后反向改变 fitScale */
+function getFitBudget() {
+  const container = canvasContainerRef.value
+  const cw = Math.max(200, container?.clientWidth || 800)
+  const ch = Math.max(320, window.innerHeight - 360)
+  return { cw, ch }
+}
+
+function updateFitScale() {
+  if (!img.value) return
+  const { cw, ch } = getFitBudget()
+  const imgW = canvasWidth.value || img.value.naturalWidth || img.value.width
+  const imgH = canvasHeight.value || img.value.naturalHeight || img.value.height
+  if (cw <= 0 || ch <= 0 || imgW <= 0 || imgH <= 0) return
+  fitScale.value = Math.min(cw / imgW, ch / imgH)
+}
+
+function centerCanvasView() {
+  const container = canvasContainerRef.value
+  if (!container) return
+  const s = totalScale.value
+  const contentW = canvasWidth.value * s
+  container.scrollLeft = Math.max(0, (contentW - container.clientWidth) / 2)
+}
+
 function resizeCanvas() {
   if (!img.value || !canvas.value) {
     logLoad('resizeCanvas early return: no img/canvas', !!img.value, !!canvas.value)
@@ -467,22 +528,25 @@ function resizeCanvas() {
     return
   }
   const cw = container.clientWidth
-  const ch = container.clientHeight
-  const maxWidth = Math.max(200, cw || 800)
-  const maxHeight = Math.max(200, (ch || 600) - 20)
 
-  logLoad('resizeCanvas container', { cw, ch, maxWidth, maxHeight })
+  logLoad('resizeCanvas container', { cw })
 
-  // 容器尺寸异常时延迟重试，避免连续切换时越缩越小
-  if (cw > 0 && ch > 0) {
+  // 容器宽度异常时延迟重试
+  if (cw > 0) {
     resizeRetryCount = 0
-    doResize(maxWidth, maxHeight)
+    setupCanvasDimensions()
+    updateFitScale()
+    redraw()
+    nextTick(() => centerCanvasView())
+    logLoad('canvas at original size', canvasWidth.value, 'x', canvasHeight.value, 'fitScale', fitScale.value)
   } else {
     resizeRetryCount++
     if (resizeRetryCount > 30) {
-      logLoad('resizeCanvas: container still 0 after 30 retries, using fallback 800x600')
+      logLoad('resizeCanvas: container still 0 after 30 retries, using fallback fit')
       resizeRetryCount = 0
-      doResize(800, 580)
+      setupCanvasDimensions()
+      fitScale.value = 1
+      redraw()
     } else {
       logLoad('resizeCanvas: container size 0, retry', resizeRetryCount)
       requestAnimationFrame(() => resizeCanvas())
@@ -491,34 +555,13 @@ function resizeCanvas() {
 }
 let resizeRetryCount = 0
 
-function doResize(maxWidth, maxHeight) {
-  if (!img.value || !canvas.value) return
-  let width = img.value.naturalWidth || img.value.width
-  let height = img.value.naturalHeight || img.value.height
-
-  if (width > maxWidth || height > maxHeight) {
-    const ratio = Math.min(maxWidth / width, maxHeight / height)
-    width = Math.round(width * ratio)
-    height = Math.round(height * ratio)
-  }
-
-  canvasWidth.value = width
-  canvasHeight.value = height
-  canvas.value.width = width
-  canvas.value.height = height
-}
-
 function redraw() {
   if (!ctx.value || !img.value) return
 
   ctx.value.clearRect(0, 0, canvasWidth.value, canvasHeight.value)
   const w = canvasWidth.value
   const h = canvasHeight.value
-  if (resizedImageCache.value) {
-    ctx.value.drawImage(resizedImageCache.value, 0, 0, w, h)
-  } else {
-    ctx.value.drawImage(img.value, 0, 0, w, h)
-  }
+  ctx.value.drawImage(img.value, 0, 0, w, h)
 
   // Draw annotations
   annotations.value.forEach((ann, index) => {
@@ -533,14 +576,14 @@ function redraw() {
     const width = Math.abs(currentAnnotation.value.x - startX.value)
     const height = Math.abs(currentAnnotation.value.y - startY.value)
     ctx.value.strokeStyle = '#FF6B6B'
-    ctx.value.lineWidth = 2
+    ctx.value.lineWidth = 2 * uiScale()
     ctx.value.strokeRect(x, y, width, height)
   }
 
   // Draw polygon in progress
   if (selectedTool.value === 'polygon' && polygonPoints.value.length > 0) {
     ctx.value.strokeStyle = '#FF6B6B'
-    ctx.value.lineWidth = 2
+    ctx.value.lineWidth = 2 * uiScale()
     ctx.value.beginPath()
     ctx.value.moveTo(polygonPoints.value[0].x, polygonPoints.value[0].y)
     for (let i = 1; i < polygonPoints.value.length; i++) {
@@ -551,12 +594,34 @@ function redraw() {
     }
     ctx.value.stroke()
 
+    const pointRadius = 4 * uiScale()
     polygonPoints.value.forEach((pt) => {
       ctx.value.fillStyle = '#FF6B6B'
       ctx.value.beginPath()
-      ctx.value.arc(pt.x, pt.y, 4, 0, Math.PI * 2)
+      ctx.value.arc(pt.x, pt.y, pointRadius, 0, Math.PI * 2)
       ctx.value.fill()
     })
+  }
+
+  // 绘制框/多边形模式下的十字辅助线
+  if (
+      guidePoint.value &&
+      (selectedTool.value === 'rect' || selectedTool.value === 'polygon')
+  ) {
+    const gx = guidePoint.value.x
+    const gy = guidePoint.value.y
+    const lineW = Math.max(1, uiScale())
+    ctx.value.save()
+    ctx.value.strokeStyle = 'rgba(64, 158, 255, 0.85)'
+    ctx.value.lineWidth = lineW
+    ctx.value.setLineDash([6 * uiScale(), 4 * uiScale()])
+    ctx.value.beginPath()
+    ctx.value.moveTo(0, gy)
+    ctx.value.lineTo(w, gy)
+    ctx.value.moveTo(gx, 0)
+    ctx.value.lineTo(gx, h)
+    ctx.value.stroke()
+    ctx.value.restore()
   }
 }
 
@@ -609,6 +674,7 @@ function pointInPolygonCanvas(x, y, poly) {
 }
 
 function drawOneAnnotation(annotation, isSelected = false, index = -1) {
+  const stroke = uiScale() * (isSelected ? 3 : 2)
   if (annotation.polygon_points?.length >= 3) {
     const pts = canvasPolygonPoints(annotation)
     ctx.value.beginPath()
@@ -622,7 +688,7 @@ function drawOneAnnotation(annotation, isSelected = false, index = -1) {
       ctx.value.fill()
     }
     ctx.value.strokeStyle = isSelected ? '#4CAF50' : '#2196F3'
-    ctx.value.lineWidth = isSelected ? 3 : 2
+    ctx.value.lineWidth = stroke
     ctx.value.stroke()
 
     const xs = pts.map(p => p.x)
@@ -641,11 +707,12 @@ function drawOneAnnotation(annotation, isSelected = false, index = -1) {
 }
 
 function drawAnnotationLabel(annotation, x, y, isSelected) {
+  const scale = uiScale()
   ctx.value.fillStyle = isSelected ? '#4CAF50' : '#2196F3'
-  ctx.value.font = 'bold 14px Arial'
+  ctx.value.font = `bold ${Math.round(14 * scale)}px Arial`
   const labelText = `${annotation.class_name} ${annotation.confidence ? `(${(annotation.confidence * 100).toFixed(0)}%)` : ''}`
-  const labelPadding = 4
-  const labelHeight = 20
+  const labelPadding = 4 * scale
+  const labelHeight = 20 * scale
   const textMetrics = ctx.value.measureText(labelText)
   const labelWidth = textMetrics.width + labelPadding * 2
   const cw = canvasWidth.value
@@ -658,7 +725,7 @@ function drawAnnotationLabel(annotation, x, y, isSelected) {
   ly = Math.max(0, Math.min(ly, ch - labelHeight))
   ctx.value.fillRect(lx, ly, labelWidth, labelHeight)
   ctx.value.fillStyle = 'white'
-  ctx.value.fillText(labelText, lx + labelPadding, ly + 15)
+  ctx.value.fillText(labelText, lx + labelPadding, ly + 15 * scale)
 }
 
 function drawBBox(annotation, isSelected = false, index = -1) {
@@ -675,7 +742,7 @@ function drawBBox(annotation, isSelected = false, index = -1) {
 
   // Draw border
   ctx.value.strokeStyle = isSelected ? '#4CAF50' : '#2196F3'
-  ctx.value.lineWidth = isSelected ? 3 : 2
+  ctx.value.lineWidth = uiScale() * (isSelected ? 3 : 2)
   ctx.value.strokeRect(x, y, width, height)
 
   drawAnnotationLabel(annotation, x, y, isSelected)
@@ -687,7 +754,7 @@ function drawBBox(annotation, isSelected = false, index = -1) {
 }
 
 function drawResizeHandles(x, y, width, height) {
-  const handleSize = 8
+  const handleSize = 8 * uiScale()
   const handles = [
     { x: x, y: y, name: 'tl' }, // top-left
     { x: x + width, y: y, name: 'tr' }, // top-right
@@ -701,7 +768,7 @@ function drawResizeHandles(x, y, width, height) {
 
   ctx.value.fillStyle = '#4CAF50'
   ctx.value.strokeStyle = 'white'
-  ctx.value.lineWidth = 2
+  ctx.value.lineWidth = 2 * uiScale()
 
   handles.forEach(handle => {
     ctx.value.beginPath()
@@ -715,9 +782,13 @@ function getCanvasCoordinates(e) {
   const el = canvas.value
   if (!el) return null
   const rect = el.getBoundingClientRect()
+  if (rect.width <= 0 || rect.height <= 0) return null
+  // 使用画布可视矩形换算，自动包含居中偏移与 CSS scale
+  const x = ((e.clientX - rect.left) / rect.width) * canvasWidth.value
+  const y = ((e.clientY - rect.top) / rect.height) * canvasHeight.value
   return {
-    x: (e.clientX - rect.left) / zoom.value,
-    y: (e.clientY - rect.top) / zoom.value,
+    x: Math.max(0, Math.min(canvasWidth.value, x)),
+    y: Math.max(0, Math.min(canvasHeight.value, y)),
   }
 }
 
@@ -804,9 +875,14 @@ function onCanvasMouseMove(e) {
   const coords = getCanvasCoordinates(e)
   if (!coords) return
 
+  if (selectedTool.value === 'rect' || selectedTool.value === 'polygon') {
+    guidePoint.value = { x: coords.x, y: coords.y }
+  } else {
+    guidePoint.value = null
+  }
+
   if (selectedTool.value === 'polygon' && polygonPoints.value.length > 0) {
     polygonHover.value = {x: coords.x, y: coords.y}
-    redraw()
   }
 
   // Update cursor based on context
@@ -833,6 +909,11 @@ function onCanvasMouseMove(e) {
   // Handle drawing new rect
   if (isDrawing.value && selectedTool.value === 'rect') {
     currentAnnotation.value = { x: coords.x, y: coords.y }
+    redraw()
+    return
+  }
+
+  if (selectedTool.value === 'rect' || selectedTool.value === 'polygon') {
     redraw()
   }
 }
@@ -943,7 +1024,7 @@ function getResizeHandle(x, y) {
     bh = ann.bbox_height * canvasHeight.value
   }
 
-  const handleSize = 8
+  const handleSize = 8 * uiScale()
   const threshold = handleSize
 
   const handles = [
@@ -1171,6 +1252,7 @@ function finishPolygon() {
 }
 
 function onCanvasMouseLeave() {
+  guidePoint.value = null
   if (selectedTool.value === 'rect' && isDrawing.value) {
     isDrawing.value = false
   }
@@ -1181,13 +1263,33 @@ function onCanvasMouseLeave() {
 }
 
 function onCanvasWheel(e) {
-  if (!imageLoaded.value || !canvas.value) return
+  if (!imageLoaded.value || !canvasContainerRef.value) return
   e.preventDefault()
-  const rect = canvas.value.getBoundingClientRect()
-  zoomOriginX.value = (e.clientX - rect.left) / zoom.value
-  zoomOriginY.value = (e.clientY - rect.top) / zoom.value
+
+  const container = canvasContainerRef.value
+  const oldScale = totalScale.value
+  if (oldScale <= 0) return
+
+  const rect = container.getBoundingClientRect()
+  const offsetX = e.clientX - rect.left + container.scrollLeft
+  const offsetY = e.clientY - rect.top + container.scrollTop
+  const canvasX = offsetX / oldScale
+  const canvasY = offsetY / oldScale
+
   const delta = e.deltaY > 0 ? -0.1 : 0.1
-  zoom.value = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoom.value + delta))
+  zoom.value = Math.max(MIN_ZOOM, Math.min(maxZoomLevel(), zoom.value + delta))
+  const newScale = totalScale.value
+  if (Math.abs(newScale - oldScale) < 1e-6) return
+
+  nextTick(() => {
+    // 容器高度随内容增高后，垂直方向主要靠页面滚动；水平仍用容器滚动
+    const newTop = container.getBoundingClientRect().top + window.scrollY
+    const targetScrollY = newTop + canvasY * newScale - e.clientY
+    window.scrollTo({ top: Math.max(0, targetScrollY), left: window.scrollX, behavior: 'auto' })
+    if (container.scrollWidth > container.clientWidth + 1) {
+      container.scrollLeft = Math.max(0, canvasX * newScale - (e.clientX - container.getBoundingClientRect().left))
+    }
+  })
 }
 
 
@@ -1249,6 +1351,7 @@ function toolChanged() {
   polygonStyleLocal.value = props.polygonStyle
   polygonPoints.value = []
   polygonHover.value = null
+  guidePoint.value = null
   currentAnnotation.value = null
   selectedAnnotationIndex.value = -1
   isDragging.value = false
@@ -1269,6 +1372,7 @@ defineExpose({
   saveAnnotations,
   isDirty,
   markSaved,
+  markDirty,
   getAnnotations: () => annotations.value,
   toggleDrawSelect,
   selectedTool,
@@ -1279,10 +1383,10 @@ defineExpose({
 .annotation-editor {
   display: flex;
   flex-direction: column;
-  height: 100%;
+  min-height: 100%;
   background: #f5f7fa;
   border-radius: 4px;
-  overflow: hidden;
+  overflow: visible;
 }
 
 .class-first-banner {
@@ -1320,21 +1424,24 @@ defineExpose({
 }
 
 .canvas-container {
-  flex: 1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  flex: 1 0 auto;
+  min-height: 320px;
   background: #fafafa;
   position: relative;
-  overflow: auto;
-  min-height: 400px;
+  overflow-x: auto;
+  overflow-y: visible;
 }
 
-.canvas-zoom-wrapper {
-  display: inline-block;
+.canvas-viewport {
+  position: relative;
+  flex-shrink: 0;
+  margin: 0 auto;
 }
 
 .annotation-canvas {
+  position: absolute;
+  top: 0;
+  left: 0;
   cursor: crosshair;
   background: white;
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);

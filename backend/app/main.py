@@ -3,6 +3,7 @@ FastAPI Application Entry Point
 AlbumentationsX + Ultralytics Training Platform
 """
 import asyncio
+import mimetypes
 from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import FastAPI, Request
@@ -10,6 +11,57 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
+from starlette.types import Scope
+
+
+def _ensure_static_mimetypes() -> None:
+    """Windows 注册表常把 .js 标成 text/plain，ES module 会被浏览器拒绝。"""
+    for ext, mime in (
+        (".js", "application/javascript"),
+        (".mjs", "application/javascript"),
+        (".css", "text/css"),
+        (".wasm", "application/wasm"),
+        (".json", "application/json"),
+        (".svg", "image/svg+xml"),
+        (".map", "application/json"),
+        (".woff", "font/woff"),
+        (".woff2", "font/woff2"),
+    ):
+        mimetypes.add_type(mime, ext)
+
+
+_ensure_static_mimetypes()
+
+
+_ASSET_MIME = {
+    ".js": "application/javascript",
+    ".mjs": "application/javascript",
+    ".css": "text/css",
+    ".wasm": "application/wasm",
+    ".json": "application/json",
+    ".svg": "image/svg+xml",
+    ".html": "text/html",
+    ".map": "application/json",
+    ".woff": "font/woff",
+    ".woff2": "font/woff2",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".ico": "image/x-icon",
+}
+
+
+def _media_type(path: Path) -> str:
+    return _ASSET_MIME.get(path.suffix.lower()) or mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+
+
+class AssetStaticFiles(StaticFiles):
+    async def get_response(self, path: str, scope: Scope):
+        response = await super().get_response(path, scope)
+        guessed = _ASSET_MIME.get(Path(path).suffix.lower())
+        if guessed:
+            response.headers["content-type"] = guessed
+        return response
 
 from app.core.config import settings
 from app.core.database import init_db
@@ -102,19 +154,30 @@ if settings.STATIC_DIR and Path(settings.STATIC_DIR).exists():
     static_path = Path(settings.STATIC_DIR)
 
     # Serve static assets (js/css/images) at root
-    app.mount("/assets", StaticFiles(directory=str(static_path / "assets")), name="assets")
+    assets_dir = static_path / "assets"
+    if assets_dir.is_dir():
+        app.mount("/assets", AssetStaticFiles(directory=str(assets_dir)), name="assets")
 
     @app.get("/", include_in_schema=False)
     @app.get("/{full_path:path}", include_in_schema=False)
     async def serve_spa(request: Request, full_path: str = ""):
-        """Catch-all: serve index.html for Vue Router (SPA fallback)"""
-        # Skip API and WebSocket routes
+        """Catch-all: serve real files with correct MIME, else index.html (SPA)."""
         if full_path.startswith(("api/", "ws/", "docs", "redoc", "openapi")):
             from fastapi import HTTPException
             raise HTTPException(status_code=404)
+        root = static_path.resolve()
+        if full_path:
+            candidate = (static_path / full_path).resolve()
+            try:
+                candidate.relative_to(root)
+            except ValueError:
+                from fastapi import HTTPException
+                raise HTTPException(status_code=404)
+            if candidate.is_file():
+                return FileResponse(str(candidate), media_type=_media_type(candidate))
         index = static_path / "index.html"
         if index.exists():
-            return FileResponse(str(index))
+            return FileResponse(str(index), media_type="text/html")
         return {"message": settings.APP_NAME, "docs": "/docs"}
 
 else:

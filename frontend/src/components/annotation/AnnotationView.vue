@@ -38,7 +38,7 @@
       </el-col>
       <el-col :span="12" style="display: flex; gap: 8px; align-items: flex-end; flex-wrap: wrap">
         <el-tooltip
-          content="开启后，切换图片时把当前画布上的标注复制到下一张（归一化坐标），适合连续帧微调；关闭则加载各图已有标注。"
+          content="开启后，切换到「无标注」的图片时携带当前画布标注；若下一张已有标注，则自动取消携带并显示该图自己的标注。"
           placement="top"
         >
           <el-switch
@@ -158,16 +158,31 @@
             <template v-if="annotationMode === 'semantic'">{{ img.semantic_mask_path ? 'M' : '-' }}</template>
             <template v-else>{{ img.annotations?.length || 0 }}</template>
           </div>
+          <button
+            type="button"
+            class="preview-btn"
+            title="查看原图"
+            @click.stop="openImagePreview(img.id)"
+          >
+            <el-icon><ZoomIn /></el-icon>
+          </button>
         </div>
       </div>
     </el-drawer>
+
+    <el-image-viewer
+      v-if="previewImageUrl"
+      :url-list="[previewImageUrl]"
+      teleported
+      @close="previewImageUrl = ''"
+    />
   </div>
 </template>
 
 <script setup>
 import {computed, nextTick, onMounted, reactive, ref, watch} from 'vue'
 import {ElMessage} from 'element-plus'
-import {ArrowDown, FolderOpened} from '@element-plus/icons-vue'
+import {ArrowDown, FolderOpened, ZoomIn} from '@element-plus/icons-vue'
 import AnnotationEditor from './AnnotationEditor.vue'
 import SemanticMaskEditor from './SemanticMaskEditor.vue'
 import AutoAnnotationDialog from './AutoAnnotationDialog.vue'
@@ -205,6 +220,7 @@ const editorRef = ref(null)
 const semanticEditorRef = ref(null)
 const autoAnnotationDialog = ref(null)
 const showImageList = ref(false)
+const previewImageUrl = ref('')
 /** 切换图片时是否携带当前画布标注（归一化坐标），便于连续运动帧微调 */
 const carryAnnotationsOnSwitch = ref(false)
 /** 与 pendingCarryTargetImageId 配对：仅在该目标图生效一次 */
@@ -308,6 +324,22 @@ function preloadAdjacentImages() {
 }
 
 function onImageReady() {
+  // 携带标注写入画布后：同步到本地 images，并标记未保存；再清 pending，
+  // 避免继续标注时 props 回写把新画的框冲掉
+  if (
+    carryAnnotationsOnSwitch.value &&
+    pendingCarryTargetImageId.value === selectedImageId.value &&
+    pendingCarryAnnotations.value !== null
+  ) {
+    const anns = editorRef.value?.getAnnotations?.() ?? pendingCarryAnnotations.value
+    const image = props.images.find((img) => img.id === selectedImageId.value)
+    if (image) {
+      image.annotations = JSON.parse(JSON.stringify(anns || []))
+    }
+    editorRef.value?.markDirty?.()
+    pendingCarryAnnotations.value = null
+    pendingCarryTargetImageId.value = null
+  }
   nextTick(() => {
     preloadAdjacentImages()
   })
@@ -328,6 +360,10 @@ function imageUrl(imageId, thumbnail = false) {
   return `/api/v1/datasets/files/image/${imageId}${thumbnail ? '?thumbnail=true' : ''}`
 }
 
+function openImagePreview(imageId) {
+  previewImageUrl.value = imageUrl(imageId)
+}
+
 function stripAnnotationIdsForCarry(list) {
   if (!Array.isArray(list)) return []
   return list.map((a) => {
@@ -339,20 +375,33 @@ function stripAnnotationIdsForCarry(list) {
   })
 }
 
+function imageHasAnnotations(imageId) {
+  const img = props.images.find((i) => i.id === imageId)
+  return Array.isArray(img?.annotations) && img.annotations.length > 0
+}
+
 function cloneAnnotationsForCarry() {
   const raw = editorRef.value?.getAnnotations?.()
-  if (!raw?.length) return []
+  // 空数组也要携带，才能把「无标注」同步到下一张
+  if (!Array.isArray(raw)) return []
   return stripAnnotationIdsForCarry(JSON.parse(JSON.stringify(raw)))
 }
 
 function armCarryIfNeeded(targetImageId) {
-  if (carryAnnotationsOnSwitch.value) {
-    pendingCarryAnnotations.value = cloneAnnotationsForCarry()
-    pendingCarryTargetImageId.value = targetImageId
-  } else {
+  if (!carryAnnotationsOnSwitch.value) {
     pendingCarryAnnotations.value = null
     pendingCarryTargetImageId.value = null
+    return
   }
+  // 目标图已有标注：不再携带，取消勾选，显示该图自己的标注
+  if (imageHasAnnotations(targetImageId)) {
+    carryAnnotationsOnSwitch.value = false
+    pendingCarryAnnotations.value = null
+    pendingCarryTargetImageId.value = null
+    return
+  }
+  pendingCarryAnnotations.value = cloneAnnotationsForCarry()
+  pendingCarryTargetImageId.value = targetImageId
 }
 
 async function beforeLeaveCurrentImage() {
@@ -370,15 +419,25 @@ async function beforeLeaveCurrentImage() {
     }
     return
   }
-  if (!editorRef.value?.isDirty()) return
+  const ed = editorRef.value
+  if (!ed) return
+  // 携带进来的标注需落盘；空标注也要保存，才能同步「无框」到当前图
+  const carryPendingOnCurrent =
+    carryAnnotationsOnSwitch.value &&
+    pendingCarryTargetImageId.value === selectedImageId.value &&
+    pendingCarryAnnotations.value !== null
+  const shouldSave = ed.isDirty?.() || carryPendingOnCurrent
+  if (!shouldSave) return
   try {
-    await editorRef.value.saveAnnotations()
+    await ed.saveAnnotations()
     await new Promise((resolve) => setTimeout(resolve, 200))
   } catch (error) {
     console.error('Failed to save annotations:', error)
     ElMessage.error('保存标注失败')
     throw error
   }
+  // 注意：不要在这里清空 pending。清空会导致 initialAnnotations 回落到旧的
+  // image.annotations，画布被冲掉，随后 armCarry 克隆到的就是错误内容。
 }
 
 async function goToImage(imageId) {
@@ -388,6 +447,7 @@ async function goToImage(imageId) {
   } catch {
     return
   }
+  // 先从当前画布克隆携带内容，再切图（armCarry 会覆盖 pending 到新目标）
   armCarryIfNeeded(imageId)
   selectedImageId.value = imageId
 }
@@ -552,8 +612,13 @@ async function deleteCurrentImage() {
 }
 
 async function saveAnnotations({ imageId, annotations }) {
+  // 先写本地，避免异步请求返回前切图/清 pending 时读到旧标注
+  const image = props.images.find((img) => img.id === imageId)
+  if (image) {
+    image.annotations = annotations
+  }
+
   try {
-    // Call API to save annotations
     const response = await fetch(`/api/v1/annotation/images/${imageId}`, {
       method: 'PUT',
       headers: {
@@ -568,16 +633,11 @@ async function saveAnnotations({ imageId, annotations }) {
       throw new Error('保存失败')
     }
 
-    // Update local image annotations
-    const image = props.images.find((img) => img.id === imageId)
-    if (image) {
-      image.annotations = annotations
-    }
-
     ElMessage.success('标注已保存')
     emit('annotationsSaved', { imageId, annotations })
   } catch (error) {
     ElMessage.error('保存标注失败：' + error.message)
+    throw error
   }
 }
 
@@ -605,7 +665,7 @@ defineExpose({
   display: flex;
   flex-direction: column;
   gap: 16px;
-  height: 100%;
+  min-height: 100%;
 }
 
 .image-selector {
@@ -623,13 +683,14 @@ defineExpose({
 }
 
 .editor-wrapper {
-  flex: 1;
+  flex: 1 0 auto;
   min-width: 0;
+  min-height: 0;
   width: 100%;
   background: white;
   border-radius: 4px;
   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
-  overflow: hidden;
+  overflow: visible;
 }
 
 .image-grid-small {
@@ -672,6 +733,28 @@ defineExpose({
   justify-content: center;
   font-size: 12px;
   font-weight: bold;
+}
+
+.preview-btn {
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  width: 24px;
+  height: 24px;
+  border: none;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: zoom-in;
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+
+.image-card-small:hover .preview-btn {
+  opacity: 1;
 }
 </style>
 

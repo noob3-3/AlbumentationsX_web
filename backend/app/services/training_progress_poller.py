@@ -2,6 +2,8 @@
 DDP 训练进度轮询：Ultralytics 双卡 DDP 模式下自定义 callback 不执行，
 通过轮询 results.csv 更新 DB 和 WebSocket，让前端能正确显示训练进度。
 """
+from __future__ import annotations
+
 import csv
 import asyncio
 from pathlib import Path

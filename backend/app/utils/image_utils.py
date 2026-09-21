@@ -70,6 +70,25 @@ def save_image(image: np.ndarray, path: str) -> bool:
         return False
 
 
+PNG_COMPRESSIBLE_EXTS = frozenset({".bmp", ".tif", ".tiff", ".png"})
+
+
+def save_optimized_png(src_path: str, dst_path: str) -> Optional[int]:
+    """将图片另存为 optimize PNG，返回新文件字节数；失败返回 None。"""
+    try:
+        with Image.open(src_path) as im:
+            im.load()
+            if im.mode == "P":
+                im = im.convert("RGBA" if "transparency" in im.info else "RGB")
+            elif im.mode not in ("RGB", "RGBA", "L"):
+                im = im.convert("RGB")
+            im.save(dst_path, format="PNG", optimize=True, compress_level=9)
+        return os.path.getsize(dst_path)
+    except Exception as e:
+        logger.warning("save_optimized_png failed {} -> {}: {}", src_path, dst_path, e)
+        return None
+
+
 # YOLOv8 pose 预训练（如 yolov8n-pose.pt）默认 COCO 17 关键点
 YOLOV8_POSE_NUM_KEYPOINTS = 17
 

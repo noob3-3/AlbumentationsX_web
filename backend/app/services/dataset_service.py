@@ -16,6 +16,7 @@ from app.models import (
 )
 from app.schemas.schemas import DatasetCreate, DatasetUpdate
 from app.utils import generate_filename, get_image_info, create_thumbnail, allowed_image
+from app.utils.image_utils import PNG_COMPRESSIBLE_EXTS, save_optimized_png
 from app.utils.semantic_mask_utils import save_semantic_mask_png, validate_and_load_semantic_mask_png
 from loguru import logger
 from pathlib import Path
@@ -640,3 +641,126 @@ class DatasetService:
         await db.flush()
         await db.refresh(new_image)
         return new_image
+
+    @staticmethod
+    def _resolve_image_file(image: Image, dataset: Dataset) -> Optional[Path]:
+        name = (image.filename or "").strip()
+        candidates = []
+        if image.file_path:
+            candidates.append(Path(str(image.file_path).replace("\\", "/")))
+        if dataset.storage_path and name:
+            sp = Path(str(dataset.storage_path).replace("\\", "/"))
+            candidates.append(sp / "images" / name)
+        if name:
+            candidates.append(settings.DATASET_DIR / dataset.id / "images" / name)
+            candidates.append(settings.DATA_DIR / "datasets" / dataset.id / "images" / name)
+        seen = set()
+        for p in candidates:
+            key = str(p)
+            if key in seen:
+                continue
+            seen.add(key)
+            if p.is_file():
+                return p
+        return None
+
+    @staticmethod
+    async def compress_original_images_to_png(
+        db: AsyncSession,
+        dataset_id: str,
+        include_augmented: bool = False,
+    ) -> Optional[dict]:
+        """
+        将数据集原图中的 BMP/TIFF 转为 optimize PNG（仅当体积更小才替换）。
+        已是 PNG 的会再压缩一次，不变小则保留。JPEG/WebP 不转（通常会变大）。
+        """
+        dataset = await DatasetService.get_dataset(db, dataset_id)
+        if not dataset:
+            return None
+
+        query = select(Image).where(Image.dataset_id == dataset_id)
+        if not include_augmented:
+            query = query.where(Image.is_augmented == False)
+        result = await db.execute(query)
+        images = result.scalars().all()
+
+        converted = 0
+        skipped = 0
+        failed = 0
+        bytes_before = 0
+        bytes_after = 0
+
+        for i, image in enumerate(images, start=1):
+            src = DatasetService._resolve_image_file(image, dataset)
+            if src is None:
+                failed += 1
+                continue
+            ext = src.suffix.lower()
+            if ext not in PNG_COMPRESSIBLE_EXTS:
+                skipped += 1
+                continue
+
+            old_size = src.stat().st_size
+            bytes_before += old_size
+            tmp = src.with_name(f"{src.stem}.png.tmp.{image.id[:8]}")
+            new_size = save_optimized_png(str(src), str(tmp))
+            if new_size is None:
+                tmp.unlink(missing_ok=True)
+                failed += 1
+                bytes_after += old_size
+                continue
+            if new_size >= old_size:
+                tmp.unlink(missing_ok=True)
+                skipped += 1
+                bytes_after += old_size
+                continue
+
+            dest = src.with_suffix(".png")
+            if dest.exists() and dest.resolve() != src.resolve():
+                dest = src.with_name(f"{src.stem}_{image.id[:8]}.png")
+            try:
+                tmp.replace(dest)
+                if src.resolve() != dest.resolve() and src.exists():
+                    src.unlink(missing_ok=True)
+            except OSError as e:
+                logger.warning("替换 PNG 失败 image_id={}: {}", image.id, e)
+                tmp.unlink(missing_ok=True)
+                failed += 1
+                bytes_after += old_size
+                continue
+
+            image.filename = dest.name
+            image.file_path = str(dest)
+            image.file_size = new_size
+            bytes_after += new_size
+            converted += 1
+
+            if dataset.storage_path:
+                thumbs_dir = Path(dataset.storage_path) / "thumbnails"
+                thumbs_dir.mkdir(parents=True, exist_ok=True)
+                new_thumb = thumbs_dir / f"{dest.stem}.jpg"
+                old_thumb = Path(image.thumbnail_path) if image.thumbnail_path else None
+                create_thumbnail(str(dest), str(new_thumb))
+                image.thumbnail_path = str(new_thumb)
+                if (
+                    old_thumb
+                    and old_thumb.exists()
+                    and old_thumb.resolve() != new_thumb.resolve()
+                ):
+                    old_thumb.unlink(missing_ok=True)
+
+            if i % 20 == 0:
+                await db.flush()
+
+        await db.flush()
+        saved = max(0, bytes_before - bytes_after)
+        return {
+            "converted": converted,
+            "skipped": skipped,
+            "failed": failed,
+            "total": len(images),
+            "bytes_before": bytes_before,
+            "bytes_after": bytes_after,
+            "saved_bytes": saved,
+            "saved_mb": round(saved / (1024 * 1024), 2),
+        }

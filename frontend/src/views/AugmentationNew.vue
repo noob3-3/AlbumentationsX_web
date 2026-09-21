@@ -174,7 +174,7 @@
                 <el-button
                   type="primary"
                   :loading="creating"
-                  :disabled="!form.dataset_id || (configMode === 'custom' && selectedTransforms.length === 0)"
+                  :disabled="!licenseStore.licensed || !form.dataset_id || (configMode === 'custom' && selectedTransforms.length === 0)"
                   @click="createJob"
                 >
                   <el-icon><Promotion /></el-icon>
@@ -324,10 +324,12 @@ import { ElMessage } from 'element-plus'
 import { augmentationApi } from '@/api'
 import { useDatasetStore } from '@/stores/dataset'
 import { useProjectStore } from '@/stores/project'
+import { useLicenseStore } from '@/stores/license'
 import { storeToRefs } from 'pinia'
 
 const store = useDatasetStore()
 const projectStore = useProjectStore()
+const licenseStore = useLicenseStore()
 const { datasets } = storeToRefs(store)
 const { hasProject, projectId } = storeToRefs(projectStore)
 
@@ -492,6 +494,10 @@ async function fetchPresets() {
 }
 
 async function createJob() {
+  if (!licenseStore.licensed) {
+    licenseStore.openDialog()
+    return
+  }
   if (!form.value.dataset_id) {
     ElMessage.warning('请选择数据集')
     return

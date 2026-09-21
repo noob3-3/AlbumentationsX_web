@@ -136,7 +136,7 @@
 
     <template #footer>
       <el-button @click="visible = false">取消</el-button>
-      <el-button type="primary" :loading="submitting" @click="submitForm">
+      <el-button type="primary" :loading="submitting" :disabled="!licenseStore.licensed" @click="submitForm">
         开始自动标注
       </el-button>
     </template>
@@ -235,6 +235,9 @@ import { ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { MagicStick, Trophy, CircleCheck, CircleClose, Loading } from '@element-plus/icons-vue'
 import { trainingApi, annotationApi } from '@/api'
+import { useLicenseStore } from '@/stores/license'
+
+const licenseStore = useLicenseStore()
 
 const props = defineProps({
   datasetId: String,
@@ -425,6 +428,10 @@ const onModelTypeChange = () => {
 }
 
 const submitForm = async () => {
+  if (!licenseStore.licensed) {
+    licenseStore.openDialog()
+    return
+  }
   if (!formRef.value) return
   await formRef.value.validate()
 

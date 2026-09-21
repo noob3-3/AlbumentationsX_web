@@ -1,6 +1,8 @@
 """
 Dataset API endpoints
 """
+from __future__ import annotations
+
 import json
 import re
 import shutil
@@ -48,7 +50,7 @@ def _merge_resolved_class_names_into_dataset(dataset, resolved: List[str]) -> No
     flag_modified(dataset, "classes")
 
 
-def _resolve_image_disk_path(raw: Optional[str]) -> tuple[Optional[Path], List[str]]:
+def _resolve_image_disk_path(raw: Optional[str]) -> Tuple[Optional[Path], List[str]]:
     """
     DB 中 file_path 可能仍为 static-file，实际文件在 datasets（或相反）。依次尝试互转路径。
     返回 (首个存在的文件 Path, 所有尝试过的路径字符串)。
@@ -97,7 +99,7 @@ def _resolve_serve_image_path(
         image: Image,
         dataset: Optional[Dataset],
         thumbnail: bool,
-) -> tuple[Optional[Path], List[str]]:
+) -> Tuple[Optional[Path], List[str]]:
     """
     解析标注/缩略图可读路径：DB 路径互换 + dataset.storage_path + 标准 DATA_DIR 布局 + 文件名大小写。
     缩略图文件不存在时回退为原图（避免列表首屏全 404）。
@@ -310,6 +312,29 @@ async def delete_dataset(
         raise HTTPException(status_code=404, detail="Dataset not found")
     await db.commit()
     return {"success": True, "message": "Dataset deleted"}
+
+
+@router.post("/{dataset_id}/compress-png", summary="将原图 BMP/TIFF 压缩为 PNG")
+async def compress_dataset_png(
+    dataset_id: str,
+    include_augmented: bool = Query(False, description="是否同时处理增强图片"),
+    db: AsyncSession = Depends(get_db),
+):
+    """把未压缩原图（BMP/TIFF）转为 optimize PNG，仅当体积更小时替换；JPEG 不转换。"""
+    stats = await DatasetService.compress_original_images_to_png(
+        db, dataset_id, include_augmented=include_augmented
+    )
+    if stats is None:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    await db.commit()
+    return {
+        "success": True,
+        "message": (
+            f"已转换 {stats['converted']} 张，跳过 {stats['skipped']} 张，失败 {stats['failed']} 张，"
+            f"节省 {stats['saved_mb']} MB"
+        ),
+        **stats,
+    }
 
 
 @router.get("/{dataset_id}/export", summary="Export dataset as YOLO format ZIP")
@@ -554,10 +579,10 @@ async def export_dataset(
 # ─────────────────────────────────────────────
 # Image management
 # ─────────────────────────────────────────────
-@router.post("/{dataset_id}/images/upload", response_model=list[ImageUploadResponse], summary="Upload images")
+@router.post("/{dataset_id}/images/upload", response_model=List[ImageUploadResponse], summary="Upload images")
 async def upload_images(
     dataset_id: str,
-    files: list[UploadFile] = File(...),
+    files: List[UploadFile] = File(...),
     annotations_json: Optional[str] = Form(None),  # JSON: list of list of annotations
     db: AsyncSession = Depends(get_db),
 ):
@@ -610,8 +635,8 @@ async def upload_images(
 @router.post("/{dataset_id}/images/upload-with-labels", response_model=dict, summary="Upload images with YOLO format labels")
 async def upload_images_with_labels(
     dataset_id: str,
-    image_files: list[UploadFile] = File(..., description="Image files"),
-    label_files: list[UploadFile] = File(None, description="Label files (.txt) in YOLO format"),
+    image_files: List[UploadFile] = File(..., description="Image files"),
+    label_files: List[UploadFile] = File(None, description="Label files (.txt) in YOLO format"),
     classes_file: UploadFile = File(None, description="classes.txt file with one class name per line"),
         label_format: str = Query(
             "auto",

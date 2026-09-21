@@ -3,8 +3,12 @@ Training service using Ultralytics YOLO
 """
 import asyncio
 import os
+import re
 import shutil
 import socket
+import subprocess
+import sys
+from contextlib import contextmanager
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal, create_background_session_maker
 from app.core.websocket import ws_manager
@@ -21,7 +25,7 @@ from pathlib import Path
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple, Iterable
 
 AVAILABLE_MODELS = [
     # YOLO11 检测
@@ -116,9 +120,286 @@ def _find_image_in_dir_case_insensitive(images_dir: Path, filename: str) -> Opti
     return None
 
 
+def _training_export_dir(job_id: str) -> Path:
+    """训练前导出的 YOLO 数据集临时目录（图片用软链接指向源文件，标签为小 txt，训练后删除）。"""
+    return settings.EXPORT_DIR / f"train_{job_id}"
+
+
+def _dir_size_bytes(path: Path) -> int:
+    """目录占用（不跟随软链接，避免把源图体积算进来）。"""
+    total = 0
+    try:
+        for f in path.rglob("*"):
+            try:
+                if f.is_symlink() or not f.is_file():
+                    continue
+                total += f.stat().st_size
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return total
+
+
+def cleanup_stale_training_exports(keep_job_ids: Optional[Iterable[str]] = None) -> Dict[str, Any]:
+    """删除 EXPORT_DIR 下遗留的 train_* 目录（跳过仍在跑的任务）。"""
+    keep = {f"train_{jid}" for jid in (keep_job_ids or []) if jid}
+    export_root = settings.EXPORT_DIR
+    removed_dirs: List[str] = []
+    freed = 0
+    if not export_root.is_dir():
+        return {"removed_count": 0, "freed_bytes": 0, "removed_dirs": []}
+    for p in list(export_root.iterdir()):
+        if not p.is_dir() or not p.name.startswith("train_"):
+            continue
+        if p.name in keep:
+            continue
+        size = _dir_size_bytes(p)
+        try:
+            shutil.rmtree(p)
+            removed_dirs.append(p.name)
+            freed += size
+            logger.info("已清理遗留训练导出目录: {} ({:.1f} MB)", p, size / (1024 * 1024))
+        except OSError as e:
+            logger.warning("清理训练导出目录失败 {}: {}", p, e)
+    return {
+        "removed_count": len(removed_dirs),
+        "freed_bytes": freed,
+        "removed_dirs": removed_dirs,
+    }
+
+
+def _cleanup_training_export_dir(job_id: str) -> None:
+    export_dir = _training_export_dir(job_id)
+    if not export_dir.exists():
+        return
+    try:
+        shutil.rmtree(export_dir)
+        logger.info("已清理训练临时导出目录: {}", export_dir)
+    except OSError as e:
+        logger.warning("清理训练导出目录失败 {}: {}", export_dir, e)
+
+
+def _link_or_copy(src: Path, dst: Path) -> str:
+    """Docker 同容器内优先软链接源图；失败（权限/跨平台）再复制。"""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.is_symlink() or dst.exists():
+        dst.unlink()
+    src_abs = src.resolve()
+    try:
+        os.symlink(src_abs, dst)
+        return "symlink"
+    except OSError as e:
+        shutil.copy2(str(src_abs), str(dst))
+        logger.warning("软链接失败，已回退为复制: {} -> {}: {}", src_abs, dst, e)
+        return "copy"
+
+
+_ERROR_LOG_MARKERS = (
+    "Traceback (most recent call last)",
+    "ChildFailedError",
+    "CalledProcessError",
+    "RuntimeError",
+    "AssertionError",
+    "CUDA out of memory",
+    "OutOfMemoryError",
+    "NCCL",
+    "DistBackendError",
+    "ERROR:",
+    "[rank",
+)
+
+
+def _normalize_device_for_cuda_visible(device: str) -> str:
+    """CUDA_VISIBLE_DEVICES 限制可见卡后，Ultralytics 应使用 0,1,...,n-1。"""
+    if not device or str(device).strip().lower() == "cpu":
+        return device
+    visible_raw = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if not visible_raw or not str(visible_raw).strip():
+        return device
+    try:
+        visible_ids = [int(x.strip()) for x in visible_raw.split(",") if x.strip() != ""]
+        device_ids = [int(x.strip()) for x in str(device).split(",") if x.strip() != ""]
+    except ValueError:
+        return device
+    if not visible_ids or not device_ids:
+        return device
+    if len(device_ids) == len(visible_ids) and set(device_ids) == set(visible_ids):
+        return ",".join(str(i) for i in range(len(visible_ids)))
+    return device
+
+
+@contextmanager
+def _capture_training_output(log_path: Path):
+    """将 stdout/stderr 同步写入文件，便于 DDP 失败时提取 rank 子进程日志。"""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_file = open(log_path, "a", encoding="utf-8")
+
+    class _Tee:
+        def __init__(self, stream):
+            self._stream = stream
+
+        def write(self, data):
+            if not data:
+                return 0
+            self._stream.write(data)
+            log_file.write(data)
+            log_file.flush()
+            return len(data)
+
+        def flush(self):
+            self._stream.flush()
+            log_file.flush()
+
+        def __getattr__(self, name):
+            return getattr(self._stream, name)
+
+    old_out, old_err = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = _Tee(old_out), _Tee(old_err)
+    try:
+        yield
+    finally:
+        sys.stdout, sys.stderr = old_out, old_err
+        log_file.close()
+
+
+def _extract_error_lines_from_log(text: str, max_lines: int = 40) -> List[str]:
+    lines = text.splitlines()
+    picked: List[str] = []
+    for i, line in enumerate(lines):
+        if any(marker in line for marker in _ERROR_LOG_MARKERS):
+            start = max(0, i - 2)
+            end = min(len(lines), i + 10)
+            picked.extend(lines[start:end])
+            picked.append("---")
+    seen = set()
+    result: List[str] = []
+    for line in picked:
+        if line in seen:
+            continue
+        seen.add(line)
+        result.append(line)
+    return result[-max_lines:]
+
+
+def _iter_exception_messages(exc: BaseException) -> Iterable[str]:
+    seen = set()
+    current: Optional[BaseException] = exc
+    while current and id(current) not in seen:
+        seen.add(id(current))
+        msg = str(current).strip()
+        if msg:
+            yield msg
+        if isinstance(current, subprocess.CalledProcessError):
+            if current.stderr:
+                stderr_text = (
+                    current.stderr.decode("utf-8", errors="replace")
+                    if isinstance(current.stderr, (bytes, bytearray))
+                    else str(current.stderr)
+                ).strip()
+                if stderr_text:
+                    yield f"stderr:\n{stderr_text}"
+            if current.stdout:
+                stdout_text = (
+                    current.stdout.decode("utf-8", errors="replace")
+                    if isinstance(current.stdout, (bytes, bytearray))
+                    else str(current.stdout)
+                ).strip()
+                if stdout_text:
+                    yield f"stdout:\n{stdout_text}"
+        current = current.__cause__ or current.__context__
+
+
+def _read_ddp_error_artifacts(exc: BaseException) -> List[str]:
+    parts: List[str] = []
+    ddp_dirs: List[Path] = []
+    for msg in _iter_exception_messages(exc):
+        match = re.search(r"(/[^\s'\"]+Ultralytics/DDP/_temp_[^\s'\"]+\.py)", msg)
+        if match:
+            ddp_dirs.append(Path(match.group(1)).parent)
+    default_ddp = settings.MODEL_DIR / "Ultralytics" / "DDP"
+    if default_ddp.is_dir():
+        ddp_dirs.append(default_ddp)
+
+    seen_paths = set()
+    for ddp_dir in ddp_dirs:
+        if not ddp_dir.is_dir():
+            continue
+        for pattern in ("error*.json", "error*.txt", "error*.pkl", "*.log"):
+            for path in sorted(ddp_dir.rglob(pattern), key=lambda p: p.stat().st_mtime, reverse=True):
+                if path in seen_paths:
+                    continue
+                seen_paths.add(path)
+                try:
+                    text = path.read_text(encoding="utf-8", errors="replace").strip()
+                except OSError:
+                    continue
+                if text:
+                    parts.append(f"[{path.name}]\n{text[:3000]}")
+                if len(parts) >= 3:
+                    return parts
+    return parts
+
+
+def _format_training_error_message(exc: BaseException, job_id: str) -> str:
+    chain = list(_iter_exception_messages(exc))
+    summary = chain[0] if chain else "训练失败"
+    sections: List[str] = [summary]
+    hints: List[str] = []
+
+    train_log_path = settings.MODEL_DIR / job_id / "train" / "training.log"
+    if train_log_path.exists():
+        try:
+            log_excerpt = _extract_error_lines_from_log(
+                train_log_path.read_text(encoding="utf-8", errors="replace")
+            )
+            if log_excerpt:
+                sections.append("--- 训练日志摘要 ---")
+                sections.extend(log_excerpt)
+            else:
+                tail = train_log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-20:]
+                if tail:
+                    sections.append("--- 训练日志末尾 ---")
+                    sections.extend(tail)
+        except OSError as e:
+            logger.warning("读取训练日志失败 {}: {}", train_log_path, e)
+
+    ddp_artifacts = _read_ddp_error_artifacts(exc)
+    if ddp_artifacts:
+        sections.append("--- DDP 子进程错误 ---")
+        sections.extend(ddp_artifacts)
+
+    combined = "\n".join(chain + sections)
+    if "CUDA out of memory" in combined or "OutOfMemoryError" in combined:
+        return (
+            "GPU 显存不足 (OOM)。建议：1) 图片尺寸改为 640×640 或 1280×1280；"
+            "2) batch_size 降至 2-4（双卡时 batch 为每卡 batch，总 batch 需 ≥ GPU 数）；"
+            "3) 等待其他训练任务释放显存。\n\n"
+            + "\n".join(sections[-25:])
+        )[:8000]
+
+    if "torch.distributed.run" in combined or "Ultralytics/DDP" in combined:
+        hints.extend([
+            "双卡 DDP 子进程崩溃时，外层只会显示 exit status 1，真实原因见上方日志摘要",
+            "常见原因：显存不足、batch_size 小于 GPU 数、NCCL 通信失败、数据集路径不可读",
+            f"完整日志文件: {train_log_path}",
+            "容器内排查: docker logs axweb-backend-gpu | tail -200",
+        ])
+    if "NCCL" in combined or "DistBackendError" in combined:
+        hints.append("NCCL 错误：确认 Docker 使用 ipc:host 与 pid:host，必要时设置 NCCL_DEBUG=INFO")
+    if "nothing to resume" in combined.lower():
+        hints.append("继续训练请使用「从已有模型权重开始新训练」，不要传 resume=True")
+
+    if hints:
+        sections.append("--- 排查建议 ---")
+        sections.extend(f"• {hint}" for hint in hints)
+
+    return "\n".join(sections)[:8000]
+
+
 def _resolve_training_image_path(img: Image, dataset: Dataset) -> Tuple[Optional[Path], List[str]]:
     """
-    解析训练导出时要复制的源图片路径。
+    解析训练导出时要链接的源图片路径。
     DB 中的 file_path 在 Docker / 跨机迁移 / Windows→Linux 后常失效；按多种规则回退。
     """
     name = (img.filename or "").strip()
@@ -518,6 +799,15 @@ class TrainingService:
         if not dataset:
             raise ValueError(f"Dataset {job.dataset_id} not found")
 
+        running_ids = await db.execute(
+            select(TrainingJob.id).where(
+                TrainingJob.status.in_([JobStatus.PENDING, JobStatus.RUNNING]),
+                TrainingJob.id != job.id,
+            )
+        )
+        cleanup_stale_training_exports(running_ids.scalars().all())
+        _cleanup_training_export_dir(job.id)
+
         # Get images - filter by augmentation flag if needed
         query = select(Image).where(Image.dataset_id == job.dataset_id)
 
@@ -746,8 +1036,8 @@ class TrainingService:
                 f"(split ratio: {1-val_split:.1%} train, {val_split:.1%} val)"
             )
 
-        # Output structure
-        output_dir = settings.EXPORT_DIR / f"train_{job.id}"
+        # Output structure（训练结束后由 _cleanup_training_export_dir 删除）
+        output_dir = _training_export_dir(job.id)
         for split in ["train", "val"]:
             (output_dir / "images" / split).mkdir(parents=True, exist_ok=True)
             if is_semantic:
@@ -783,6 +1073,8 @@ class TrainingService:
         )
 
         missing_src_count = 0
+        link_ok = 0
+        copy_fallback = 0
         for split_name, split_images in [("train", train_images), ("val", val_images)]:
             is_val_from_separate = split_name == "val" and use_validation_dataset
             ds_for_path = val_dataset if is_val_from_separate else dataset
@@ -808,9 +1100,14 @@ class TrainingService:
                         continue
 
                 dst_img = output_dir / "images" / split_name / dst_name
-                shutil.copy2(str(src), str(dst_img))
+                img_mode = _link_or_copy(src, dst_img)
+                if img_mode == "symlink":
+                    link_ok += 1
+                else:
+                    copy_fallback += 1
                 logger.debug(
-                    "训练导出复制: split={} image_id={} {} -> {}",
+                    "训练导出{}: split={} image_id={} {} -> {}",
+                    "软链接" if img_mode == "symlink" else "复制",
                     split_name,
                     img.id,
                     src,
@@ -819,7 +1116,9 @@ class TrainingService:
 
                 if is_semantic:
                     dst_mask = output_dir / "masks" / split_name / (Path(dst_name).stem + ".png")
-                    shutil.copy2(str(msrc), str(dst_mask))
+                    mask_mode = _link_or_copy(msrc, dst_mask)
+                    if mask_mode == "copy":
+                        copy_fallback += 1
                     continue
 
                 # Write annotations
@@ -920,6 +1219,17 @@ class TrainingService:
             masks_dir="masks" if is_semantic else None,
         )
 
+        logger.info(
+            "训练导出链接统计: job_id={} symlink={} copy_fallback={}",
+            job.id,
+            link_ok,
+            copy_fallback,
+        )
+        if copy_fallback:
+            logger.warning(
+                "有 {} 个文件软链接失败已回退复制。Docker 同容器内源路径与 EXPORT_DIR 应均可访问。",
+                copy_fallback,
+            )
         if missing_src_count:
             logger.error(
                 "训练导出共有 {} 张图片在服务器上找不到源文件。",
@@ -1066,14 +1376,7 @@ def _run_training_sync(job_id: str, main_loop, allocated_device: Optional[str] =
                         job = result.scalar_one_or_none()
                         if job:
                             job.status = JobStatus.FAILED
-                            # 处理CUDA OOM错误信息
-                            error_message = str(e)
-                            if "CUDA out of memory" in error_message or "OutOfMemoryError" in error_message:
-                                error_message = (
-                                    "GPU 显存不足 (OOM)。建议：1) 图片尺寸改为 640×640 或 1280×1280；"
-                                    "2) batch_size 降至 2-4；3) 等待其他训练任务释放显存。"
-                                )
-                            job.error_message = error_message
+                            job.error_message = _format_training_error_message(e, job_id)
                             # Clear time estimation fields
                             job.avg_epoch_time = None
                             job.estimated_remaining_time = None
@@ -1116,10 +1419,6 @@ def _run_training_sync(job_id: str, main_loop, allocated_device: Optional[str] =
 
 async def _execute_training(db: AsyncSession, job_id: str, main_loop):
     """Execute YOLO training"""
-    # 无公网 DNS 时 Ultralytics 会访问 api.github.com 拉版本/资源导致训练失败；需要联网检查时设 YOLO_OFFLINE=false
-    os.environ.setdefault("YOLO_OFFLINE", "true")
-    from ultralytics import YOLO
-
     job = await TrainingService.get_job(db, job_id)
     if not job:
         raise ValueError(f"Job {job_id} not found")
@@ -1127,6 +1426,18 @@ async def _execute_training(db: AsyncSession, job_id: str, main_loop):
     # Check if cancelled
     if job.status == JobStatus.CANCELLED:
         return
+
+    try:
+        await _execute_training_body(db, job_id, main_loop, job)
+    finally:
+        _cleanup_training_export_dir(job_id)
+
+
+async def _execute_training_body(db: AsyncSession, job_id: str, main_loop, job: TrainingJob):
+    """训练主流程（数据集导出目录在 _execute_training 的 finally 中统一清理）。"""
+    # 无公网 DNS 时 Ultralytics 会访问 api.github.com 拉版本/资源导致训练失败；需要联网检查时设 YOLO_OFFLINE=false
+    os.environ.setdefault("YOLO_OFFLINE", "true")
+    from ultralytics import YOLO
 
     # Prepare dataset
     yaml_path, data_stats = await TrainingService.prepare_yolo_dataset(db, job)
@@ -1161,7 +1472,8 @@ async def _execute_training(db: AsyncSession, job_id: str, main_loop):
         except ImportError:
             device = "cpu"
 
-    # Output directory
+    device = _normalize_device_for_cuda_visible(str(device))
+    logger.info(f"Resolved training device: {device} (CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')})")
     output_dir = settings.MODEL_DIR / job_id
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1253,15 +1565,28 @@ async def _execute_training(db: AsyncSession, job_id: str, main_loop):
             "timestamp": current_time.isoformat(),
         }
 
-        # 训练损失
-        if hasattr(trainer, 'loss_items') and trainer.loss_items is not None:
-            if len(trainer.loss_items) >= 3:
-                metrics["train/box_loss"] = float(trainer.loss_items[0])
-                metrics["train/cls_loss"] = float(trainer.loss_items[1])
-                metrics["train/dfl_loss"] = float(trainer.loss_items[2])
-            elif len(trainer.loss_items) >= 2:
-                metrics["train/box_loss"] = float(trainer.loss_items[0])
-                metrics["train/cls_loss"] = float(trainer.loss_items[1])
+        # 新版 Ultralytics 的 loss_items 是 dict；旧版是 tensor/list。按 [0] 取值会 KeyError(0) 中断训练
+        items = getattr(trainer, "loss_items", None)
+        if isinstance(items, dict):
+            alias = (("train/box_loss", ("box_loss", "box")), ("train/cls_loss", ("cls_loss", "cls")), ("train/dfl_loss", ("dfl_loss", "dfl")))
+            for dest, keys in alias:
+                for key in keys:
+                    if key in items:
+                        metrics[dest] = float(items[key])
+                        break
+        elif items is not None:
+            if hasattr(items, "detach"):
+                seq = items.detach().cpu().flatten().tolist()
+            else:
+                try:
+                    seq = list(items)
+                except TypeError:
+                    seq = []
+            if len(seq) >= 2:
+                metrics["train/box_loss"] = float(seq[0])
+                metrics["train/cls_loss"] = float(seq[1])
+            if len(seq) >= 3:
+                metrics["train/dfl_loss"] = float(seq[2])
 
         metrics_history.append(sanitize_metrics_for_pg_json(metrics))
 
@@ -1370,6 +1695,11 @@ async def _execute_training(db: AsyncSession, job_id: str, main_loop):
     if shm_size_gb < 2:
         final_workers = min(final_workers, 2)
         logger.warning(f"Shared memory is small ({shm_size_gb}GB), limiting workers to {final_workers}")
+
+    # PyInstaller 子进程会再次启动 exe，Windows 上 workers>0 常把 model.train() 卡死
+    if getattr(sys, "frozen", False) or os.environ.get("TRAIN_WORKERS") == "0":
+        final_workers = 0
+        logger.info("Frozen/TRAIN_WORKERS=0: DataLoader workers=0")
 
     logger.info(f"Using {final_workers} data loading workers (CPU cores: {cpu_count}, batch size: {job.batch_size})")
 
@@ -1512,7 +1842,7 @@ async def _execute_training(db: AsyncSession, job_id: str, main_loop):
             'dropout', 'weight_decay', 'lrf', 'warmup_epochs',
             'box', 'cls', 'dfl',
             'close_mosaic', 'single_cls', 'nbs',
-            'save', 'val',
+            'save', 'val', 'val_batch',  # 当前 Ultralytics 版本不支持 val_batch
         }
         for key, value in job.extra_params.items():
             if key not in skip_keys:
@@ -1541,12 +1871,16 @@ async def _execute_training(db: AsyncSession, job_id: str, main_loop):
     # 增大 NMS max_time_img 默认值，避免 "NMS time limit exceeded" 导致验证 mAP 异常低下
     _patch_nms_max_time_img(2.0)
 
+    train_log_path = output_dir / "train" / "training.log"
+
     try:
-        logger.info("Calling model.train() ...")
-        results = model.train(**train_args)
+        logger.info("Calling model.train() ... (YOLO 日志同时写入 {})", train_log_path)
+        with _capture_training_output(train_log_path):
+            results = model.train(**train_args)
         logger.info("model.train() completed successfully")
     except Exception as train_error:
         logger.error(f"Training failed: {train_error}")
+        logger.error("Formatted training error:\n{}", _format_training_error_message(train_error, job_id))
         try:
             del model
         except Exception:

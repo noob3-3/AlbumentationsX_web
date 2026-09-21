@@ -23,7 +23,7 @@
           <template #header>
             <div style="display: flex; justify-content: space-between; align-items: center">
               <span>部署列表</span>
-              <el-button type="primary" size="small" :icon="Plus" @click="openDeployDialog">部署</el-button>
+              <el-button type="primary" size="small" :icon="Plus" :disabled="!licenseStore.licensed" @click="openDeployDialog">部署</el-button>
             </div>
           </template>
 
@@ -346,7 +346,10 @@ import {Plus, Upload} from '@element-plus/icons-vue'
 import {deploymentApi, trainingApi} from '@/api'
 import {drawDetectionOverlay} from '@/utils/drawDetectionsCanvas'
 import {useProjectStore} from '@/stores/project'
+import {useLicenseStore} from '@/stores/license'
 import {storeToRefs} from 'pinia'
+
+const licenseStore = useLicenseStore()
 
 const COLORS = [
   '#FF6B6B', '#4ECDC4', '#45B7D1', '#96E6A1', '#DDA0DD',
@@ -531,6 +534,10 @@ async function loadData() {
 // 不再需要手动保存到 localStorage，由后端管理
 
 async function openDeployDialog() {
+  if (!licenseStore.licensed) {
+    licenseStore.openDialog()
+    return
+  }
   showDeployDialog.value = true
   // 刷新模型列表，确保显示最新的模型
   await loadModels()

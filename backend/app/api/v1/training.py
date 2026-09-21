@@ -5,6 +5,7 @@ import asyncio
 import shutil
 from app.core.config import settings
 from app.core.database import get_db
+from app.core.license_guard import require_license
 from app.models import JobStatus, Model, ModelValidation, Dataset, Image, Annotation, TrainingJob
 from app.models.models import gen_uuid
 from app.schemas.schemas import TrainingJobCreate, TrainingJobResponse, SuccessResponse, ModelResponse
@@ -26,6 +27,7 @@ async def create_training_job(
     data: TrainingJobCreate,
     background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
+    _license=Depends(require_license),
 ):
     # Validate dataset has annotations before creating training job
     dataset_result = await db.execute(
@@ -249,6 +251,7 @@ async def export_job_weights_onnx(
         half: bool = Query(False, description="FP16 导出"),
         imgsz: Optional[int] = Query(None, ge=32, le=8192, description="导出输入边长；不传则沿用模型默认"),
         db: AsyncSession = Depends(get_db),
+        _license=Depends(require_license),
 ):
     """将当前训练任务 run 目录下的 best.pt 在 CPU 上转为 ONNX 并下载。"""
     import re
@@ -487,6 +490,7 @@ async def export_registered_model_onnx(
         half: bool = Query(False, description="FP16 导出"),
         imgsz: Optional[int] = Query(None, ge=32, le=8192, description="导出输入边长；不传为模型默认"),
         db: AsyncSession = Depends(get_db),
+        _license=Depends(require_license),
 ):
     """将已注册模型的 .pt 在 CPU 上导出为 ONNX 并下载。"""
     import re

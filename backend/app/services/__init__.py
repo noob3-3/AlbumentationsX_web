@@ -4,11 +4,6 @@ from app.services.augmentation_service import AugmentationService, build_pipelin
 from app.services.collection_service import collect_from_urls, fetch_image_from_url
 from app.services.dataset_service import DatasetService
 from app.services.deployment_service import DeploymentService
-from app.services.training_service import (
-    TrainingService,
-    AVAILABLE_MODELS,
-    infer_ultralytics_task_from_model_name,
-)
 
 __all__ = [
     "DatasetService",
@@ -24,3 +19,10 @@ __all__ = [
     "AnnotationService",
     "DeploymentService",
 ]
+
+
+def __getattr__(name):
+    if name in ("TrainingService", "AVAILABLE_MODELS", "infer_ultralytics_task_from_model_name"):
+        from app.services import training_service as _ts
+        return getattr(_ts, name)
+    raise AttributeError(name)

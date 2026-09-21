@@ -19,8 +19,8 @@
           <el-button :icon="Upload" :loading="exportLoading" @click="openExportDialog">
             导出数据集
           </el-button>
-          <el-button type="primary" :icon="MagicStick" @click="showAugDialog = true">数据增强</el-button>
-          <el-button type="success" :icon="Cpu" @click="showTrainDialog = true">开始训练</el-button>
+          <el-button type="primary" :icon="MagicStick" :disabled="!licenseStore.licensed" @click="showAugDialog = true">数据增强</el-button>
+          <el-button type="success" :icon="Cpu" :disabled="!licenseStore.licensed" @click="showTrainDialog = true">开始训练</el-button>
         </el-space>
       </template>
     </el-page-header>
@@ -74,10 +74,16 @@
             <el-icon style="margin-right: 4px"><Edit /></el-icon>
             开始标注
           </el-button>
-          <el-button @click="activeTab = 'augmentation'" style="width: 100%">
+          <el-button @click="activeTab = 'augmentation'" style="width: 100%; margin-bottom: 8px">
             <el-icon style="margin-right: 4px"><Operation /></el-icon>
             管理增强数据
           </el-button>
+          <el-button :loading="compressLoading" @click="compressToPng" style="width: 100%">
+            压缩原图为 PNG
+          </el-button>
+          <div class="label-task-hint" style="margin-top:8px">
+            将 BMP/TIFF 转为 PNG，仅当体积更小才替换，可减少硬盘占用
+          </div>
         </el-card>
       </el-col>
 
@@ -132,6 +138,9 @@
                   >
                     <el-image
                       :src="imageUrl(img.id, true)"
+                      :preview-src-list="[imageUrl(img.id)]"
+                      preview-teleported
+                      hide-on-click-modal
                       fit="cover"
                       loading="lazy"
                       class="image-thumb"
@@ -175,7 +184,7 @@
       </el-form>
       <template #footer>
         <el-button @click="showAugDialog = false">取消</el-button>
-        <el-button type="primary" :loading="augLoading" @click="startAugmentation">开始增强</el-button>
+        <el-button type="primary" :loading="augLoading" :disabled="!licenseStore.licensed" @click="startAugmentation">开始增强</el-button>
       </template>
     </el-dialog>
 
@@ -225,7 +234,7 @@
       </el-form>
       <template #footer>
         <el-button @click="showTrainDialog = false">取消</el-button>
-        <el-button type="primary" :loading="trainLoading" @click="startTraining">开始训练</el-button>
+        <el-button type="primary" :loading="trainLoading" :disabled="!licenseStore.licensed" @click="startTraining">开始训练</el-button>
       </template>
     </el-dialog>
   </div>
@@ -235,9 +244,10 @@
 import {computed, onMounted, ref, watch} from 'vue'
 import {useRoute, useRouter} from 'vue-router'
 import {Cpu, Delete, Download, Edit, MagicStick, Operation, Picture, Upload} from '@element-plus/icons-vue'
-import {ElMessage} from 'element-plus'
+import {ElMessage, ElMessageBox} from 'element-plus'
 import {augmentationApi, datasetApi, trainingApi} from '@/api'
 import {useDatasetStore} from '@/stores/dataset'
+import {useLicenseStore} from '@/stores/license'
 import {storeToRefs} from 'pinia'
 import AnnotationView from '@/components/annotation/AnnotationView.vue'
 import AugmentationManager from '@/components/augmentation/AugmentationManager.vue'
@@ -246,6 +256,7 @@ const route = useRoute()
 const router = useRouter()
 const id = route.params.id
 const store = useDatasetStore()
+const licenseStore = useLicenseStore()
 const { currentDataset: dataset, images, imageTotal, loading } = storeToRefs(store)
 
 const activeTab = ref('annotation')
@@ -258,6 +269,7 @@ const augLoading = ref(false)
 const showTrainDialog = ref(false)
 const trainLoading = ref(false)
 const exportLoading = ref(false)
+const compressLoading = ref(false)
 const showExportDialog = ref(false)
 const exportForm = ref({
   scope: 'all',
@@ -414,7 +426,33 @@ function onImageMoved() {
   loadOtherDatasets()
 }
 
+async function compressToPng() {
+  try {
+    await ElMessageBox.confirm(
+      '将把 BMP/TIFF 等未压缩原图转为 PNG。仅当新文件更小才替换，JPEG 不会转换。此操作会改写磁盘上的原图文件。',
+      '压缩原图为 PNG',
+      { type: 'warning', confirmButtonText: '开始压缩', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  compressLoading.value = true
+  try {
+    const res = await datasetApi.compressPng(id)
+    ElMessage.success(res.message || '压缩完成')
+    await Promise.all([store.fetchDataset(id), loadImages()])
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.detail || e.message || '压缩失败')
+  } finally {
+    compressLoading.value = false
+  }
+}
+
 async function startAugmentation() {
+  if (!licenseStore.licensed) {
+    licenseStore.openDialog()
+    return
+  }
   augLoading.value = true
   try {
     const job = await augmentationApi.createJob({
@@ -479,6 +517,10 @@ async function confirmExport() {
 }
 
 async function startTraining() {
+  if (!licenseStore.licensed) {
+    licenseStore.openDialog()
+    return
+  }
   trainLoading.value = true
   try {
     const job = await trainingApi.createJob({ ...trainForm.value, dataset_id: id })
@@ -539,6 +581,7 @@ async function startTraining() {
   width: 100%;
   height: 120px;
   display: block;
+  cursor: zoom-in;
 }
 
 .image-error {

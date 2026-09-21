@@ -4,12 +4,17 @@ Provides hardware and system resource information
 """
 import csv
 import io
+import re
 import subprocess
-from fastapi import APIRouter
+from app.core.database import get_db
+from app.models import JobStatus, TrainingJob
+from fastapi import APIRouter, Depends
 from loguru import logger
 import shutil
 import platform
 from typing import Dict, Any, List, Optional
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 router = APIRouter(prefix="/system", tags=["system"])
 
@@ -31,6 +36,28 @@ async def get_system_info() -> Dict[str, Any]:
     }
 
     return info
+
+
+@router.post("/cleanup-training-exports", summary="清理训练导出的临时目录")
+async def cleanup_training_exports(db: AsyncSession = Depends(get_db)) -> Dict[str, Any]:
+    """删除 data/exports/train_* 遗留目录。正在排队/训练中的任务目录会保留。"""
+    from app.services.training_service import cleanup_stale_training_exports
+
+    running = await db.execute(
+        select(TrainingJob.id).where(
+            TrainingJob.status.in_([JobStatus.PENDING, JobStatus.RUNNING])
+        )
+    )
+    keep = list(running.scalars().all())
+    stats = cleanup_stale_training_exports(keep)
+    freed_mb = round(stats["freed_bytes"] / (1024 * 1024), 2)
+    return {
+        "success": True,
+        "message": f"已删除 {stats['removed_count']} 个训练临时目录，释放约 {freed_mb} MB",
+        "kept_job_ids": keep,
+        "freed_mb": freed_mb,
+        **stats,
+    }
 
 
 def _get_gpu_info_from_nvidia_smi() -> Optional[Dict[str, Any]]:
@@ -85,6 +112,24 @@ def _get_gpu_info_from_nvidia_smi() -> Optional[Dict[str, Any]]:
         return None
 
 
+def _get_driver_cuda_version() -> Optional[str]:
+    """从 nvidia-smi 表头读取驱动支持的 CUDA 版本，不依赖 PyTorch。"""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0 or not result.stdout:
+            return None
+        match = re.search(r"CUDA Version:\s*([\d.]+)", result.stdout)
+        return match.group(1) if match else None
+    except Exception as e:
+        logger.debug(f"nvidia-smi CUDA version failed: {e}")
+        return None
+
+
 async def _get_gpu_info() -> Dict[str, Any]:
     """获取GPU信息。优先用 nvidia-smi 显示系统级真实使用（含 DDP 训练子进程）"""
     gpu_info = {
@@ -99,12 +144,14 @@ async def _get_gpu_info() -> Dict[str, Any]:
         gpu_info["available"] = True
         gpu_info["count"] = nvidia_result["count"]
         gpu_info["devices"] = nvidia_result["devices"]
+        driver_cuda = _get_driver_cuda_version()
+        gpu_info["driver_cuda_version"] = driver_cuda
         try:
             import torch
-            gpu_info["cuda_version"] = torch.version.cuda
+            gpu_info["cuda_version"] = torch.version.cuda or driver_cuda or "unknown"
             gpu_info["cudnn_version"] = torch.backends.cudnn.version()
         except Exception:
-            gpu_info["cuda_version"] = "unknown"
+            gpu_info["cuda_version"] = driver_cuda or "unknown"
             gpu_info["cudnn_version"] = "unknown"
         logger.debug(f"GPU info from nvidia-smi: {gpu_info['count']} GPU(s)")
         return gpu_info

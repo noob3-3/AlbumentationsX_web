@@ -1,6 +1,8 @@
 """
 Project service for managing projects
 """
+from __future__ import annotations
+
 from typing import Optional, List
 from sqlalchemy import select, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession

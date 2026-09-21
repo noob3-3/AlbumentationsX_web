@@ -41,7 +41,7 @@
     </el-form>
     <template #footer>
       <el-button @click="emit('update:modelValue', false)">取消</el-button>
-      <el-button type="primary" :loading="loading" @click="submit">导出并下载</el-button>
+      <el-button type="primary" :loading="loading" :disabled="!licenseStore.licensed" @click="submit">导出并下载</el-button>
     </template>
   </el-dialog>
 </template>
@@ -50,6 +50,9 @@
 import { ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { buildTrainingJobOnnxUrl, buildTrainingModelOnnxUrl, downloadOnnxExport } from '@/api'
+import { useLicenseStore } from '@/stores/license'
+
+const licenseStore = useLicenseStore()
 
 const props = defineProps({
   modelValue: { type: Boolean, default: false },
@@ -104,6 +107,10 @@ function buildOpts() {
 }
 
 async function submit() {
+  if (!licenseStore.licensed) {
+    licenseStore.openDialog()
+    return
+  }
   if (props.kind === 'job' && !props.jobId) {
     ElMessage.warning('缺少任务 ID')
     return

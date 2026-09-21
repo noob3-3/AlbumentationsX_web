@@ -1,6 +1,8 @@
 """
 SQLAlchemy ORM Models
 """
+from __future__ import annotations
+
 import enum
 import uuid
 from app.core.database import Base
@@ -10,7 +12,7 @@ from sqlalchemy import (
     ForeignKey, JSON, Enum as SAEnum
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-from typing import Optional
+from typing import List, Optional
 
 
 def gen_uuid() -> str:
@@ -79,8 +81,8 @@ class Project(Base):
     )
 
     # Relationships
-    datasets: Mapped[list["Dataset"]] = relationship("Dataset", back_populates="project_rel", cascade="all, delete-orphan")
-    models: Mapped[list["Model"]] = relationship("Model", back_populates="project_rel")
+    datasets: Mapped[List["Dataset"]] = relationship("Dataset", back_populates="project_rel", cascade="all, delete-orphan")
+    models: Mapped[List["Model"]] = relationship("Model", back_populates="project_rel")
 
 
 # ─────────────────────────────────────────────
@@ -110,9 +112,9 @@ class Dataset(Base):
 
     # Relationships
     project_rel: Mapped[Optional["Project"]] = relationship("Project", back_populates="datasets")
-    images: Mapped[list["Image"]] = relationship("Image", back_populates="dataset", cascade="all, delete-orphan")
-    augmentation_jobs: Mapped[list["AugmentationJob"]] = relationship("AugmentationJob", viewonly=True)
-    training_jobs: Mapped[list["TrainingJob"]] = relationship("TrainingJob", viewonly=True)
+    images: Mapped[List["Image"]] = relationship("Image", back_populates="dataset", cascade="all, delete-orphan")
+    augmentation_jobs: Mapped[List["AugmentationJob"]] = relationship("AugmentationJob", viewonly=True)
+    training_jobs: Mapped[List["TrainingJob"]] = relationship("TrainingJob", viewonly=True)
 
 
 # ─────────────────────────────────────────────
@@ -142,7 +144,7 @@ class Image(Base):
 
     # Relationships
     dataset: Mapped["Dataset"] = relationship("Dataset", back_populates="images")
-    annotations: Mapped[list["Annotation"]] = relationship(
+    annotations: Mapped[List["Annotation"]] = relationship(
         "Annotation", back_populates="image", cascade="all, delete-orphan"
     )
 
@@ -258,8 +260,8 @@ class Model(Base):
 
     # Relationships
     project_rel: Mapped[Optional["Project"]] = relationship("Project", back_populates="models")
-    deployments: Mapped[list["Deployment"]] = relationship("Deployment", back_populates="model")
-    validations: Mapped[list["ModelValidation"]] = relationship(
+    deployments: Mapped[List["Deployment"]] = relationship("Deployment", back_populates="model")
+    validations: Mapped[List["ModelValidation"]] = relationship(
         "ModelValidation", back_populates="model", cascade="all, delete-orphan"
     )
 

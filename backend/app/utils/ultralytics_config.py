@@ -237,9 +237,20 @@ def setup_ultralytics_config(
             force_overwrite=False  # 不强制覆盖，保留用户自定义配置
         )
 
+        # 打包机路径会写进 settings.yaml；换目录/换机器后必须改回当前目录
+        current = UltralyticsConfigManager.read_settings(config_path) or {}
+        patched = {
+            "datasets_dir": str(dataset_dir),
+            "weights_dir": str(model_dir),
+            "runs_dir": str(model_dir / "runs"),
+        }
+        if any(str(current.get(k) or "") != v for k, v in patched.items()):
+            current.update(patched)
+            UltralyticsConfigManager.write_settings(current, config_path)
+            logger.info(f"Ultralytics settings paths updated for this install: {patched}")
+
         logger.info(f"✓ Ultralytics configuration initialized: {config_path}")
 
-        # 读取并显示当前配置
         settings = UltralyticsConfigManager.read_settings(config_path)
         if settings:
             logger.debug(f"Ultralytics settings: {settings}")

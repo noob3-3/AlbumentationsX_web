@@ -8,7 +8,6 @@ import zipfile
 from loguru import logger
 from pathlib import Path
 from typing import List, Dict, Optional, Any
-from ultralytics import YOLO
 
 # 过小多为下载中断；PyTorch 2 存盘多为 ZIP，损坏时常报 PytorchStreamReader / central directory
 _MIN_PT_BYTES = 16 * 1024
@@ -419,6 +418,8 @@ class PretrainedModelService:
                 )
 
             # 无配置直链的旧模型名：才交由 Ultralytics 拉取（可能访问 api.github.com）
+            from ultralytics import YOLO
+
             model = YOLO(model_filename)
 
             # 尝试获取Ultralytics下载的模型路径并复制到持久化目录

@@ -88,7 +88,7 @@
       </el-row>
 
       <!-- Annotation view -->
-      <div v-if="selectedDatasetId && images.length > 0">
+      <div v-if="selectedDatasetId && images.length > 0" class="annotation-workspace">
         <el-alert
             v-if="annotationMode === 'obb'"
             type="info"
@@ -499,6 +499,12 @@ function onClassesManagerSuccess() {
 <style scoped>
 .annotation-page {
   padding: 20px;
+}
+
+.annotation-workspace {
+  min-height: calc(100vh - 260px);
+  display: flex;
+  flex-direction: column;
 }
 
 .card-header {

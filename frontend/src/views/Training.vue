@@ -424,7 +424,7 @@
             </el-collapse>
 
             <el-form-item>
-              <el-button type="primary" :loading="creating" @click="createJob">开始训练</el-button>
+              <el-button type="primary" :loading="creating" :disabled="!licenseStore.licensed" @click="createJob">开始训练</el-button>
             </el-form-item>
           </el-form>
         </el-card>
@@ -520,6 +520,7 @@ import {downloadTrainingJobBestFile, trainingApi} from '@/api'
 import {useTrainingStore} from '@/stores/training'
 import {useDatasetStore} from '@/stores/dataset'
 import {useProjectStore} from '@/stores/project'
+import {useLicenseStore} from '@/stores/license'
 import {storeToRefs} from 'pinia'
 import {useRouter} from 'vue-router'
 
@@ -548,6 +549,7 @@ async function downloadJobBestSnapshot(jobId, jobName) {
 const trainingStore = useTrainingStore()
 const datasetStore = useDatasetStore()
 const projectStore = useProjectStore()
+const licenseStore = useLicenseStore()
 const { jobs } = storeToRefs(trainingStore)
 const { datasets } = storeToRefs(datasetStore)
 const { hasProject, projectId } = storeToRefs(projectStore)
@@ -995,6 +997,10 @@ async function onResumeTrainingChange(value) {
 }
 
 async function createJob() {
+  if (!licenseStore.licensed) {
+    licenseStore.openDialog()
+    return
+  }
   await formRef.value.validate()
   creating.value = true
   try {

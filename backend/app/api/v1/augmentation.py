@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
+from app.core.license_guard import require_license
 from app.schemas.schemas import AugmentationJobCreate, AugmentationJobResponse, SuccessResponse
 from app.services import AugmentationService, DEFAULT_AUGMENTATION_CONFIG
 
@@ -17,6 +18,7 @@ async def create_augmentation_job(
     data: AugmentationJobCreate,
     background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
+    _license=Depends(require_license),
 ):
     job = await AugmentationService.create_job(db, data)
     await db.commit()

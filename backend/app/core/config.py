@@ -2,9 +2,16 @@
 Application configuration settings
 """
 import os
+import sys
 from pathlib import Path
 from pydantic_settings import BaseSettings
 from typing import List
+
+
+def _runtime_root() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent.parent
 
 
 class Settings(BaseSettings):
@@ -21,7 +28,7 @@ class Settings(BaseSettings):
     ALLOWED_ORIGINS: List[str] = ["*"]
 
     # Paths
-    BASE_DIR: Path = Path(__file__).parent.parent.parent
+    BASE_DIR: Path = _runtime_root()
     DATA_DIR: Path = BASE_DIR / "data"
     UPLOAD_DIR: Path = DATA_DIR / "uploads"
     # 数据集图片/标签/缩略图根目录（Docker 可单独挂载 /app/data/static-file）
@@ -82,6 +89,15 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+if not settings.STATIC_DIR and getattr(sys, "frozen", False):
+    _candidates = [settings.BASE_DIR / "static"]
+    _meipass = getattr(sys, "_MEIPASS", None)
+    if _meipass:
+        _candidates.append(Path(_meipass) / "static")
+    for _static in _candidates:
+        if _static.exists():
+            settings.STATIC_DIR = str(_static)
+            break
 settings.create_dirs()
 
 # 设置时区（影响日志时间戳等，Docker 中可通过 TZ 环境变量覆盖）

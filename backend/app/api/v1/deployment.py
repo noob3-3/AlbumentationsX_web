@@ -8,6 +8,7 @@ from sqlalchemy import select
 from loguru import logger
 
 from app.core.database import get_db
+from app.core.license_guard import require_license
 from app.models import Model, ImageSource
 from app.schemas.schemas import (
     DeploymentCreate, DeploymentResponse, InferenceResponse,
@@ -22,6 +23,7 @@ router = APIRouter(prefix="/deployments", tags=["deployment"])
 async def create_deployment(
     data: DeploymentCreate,
     db: AsyncSession = Depends(get_db),
+    _license=Depends(require_license),
 ):
     """部署模型到服务器"""
     try:
@@ -157,6 +159,7 @@ async def stop_deployment(
 async def restart_deployment(
     deployment_id: str,
     db: AsyncSession = Depends(get_db),
+    _license=Depends(require_license),
 ):
     """重启部署"""
     success = await DeploymentService.restart_deployment(db, deployment_id)
@@ -215,6 +218,7 @@ async def predict(
     confidence: Optional[float] = Query(None, ge=0.0, le=1.0),
     iou: Optional[float] = Query(None, ge=0.0, le=1.0),
     db: AsyncSession = Depends(get_db),
+    _license=Depends(require_license),
 ):
     """使用部署的模型进行推理。推理图片与结果会自动保存到项目的「API推理数据」数据集中。"""
     try:

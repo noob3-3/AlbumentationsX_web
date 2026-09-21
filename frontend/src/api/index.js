@@ -55,6 +55,10 @@ export const datasetApi = {
   // 导出数据集（YOLO 格式 ZIP），返回 blob 用于触发下载
   export: (datasetId, params = {}) => http.get(`/datasets/${datasetId}/export`, { params, responseType: 'blob' }),
 
+  // 将 BMP/TIFF 原图压缩为 PNG
+  compressPng: (datasetId, params = {}) =>
+    http.post(`/datasets/${datasetId}/compress-png`, null, { params, timeout: 600000 }),
+
   // 删除类别及其标注
   deleteClass: (datasetId, className) =>
     http.delete(`/datasets/${datasetId}/classes/${encodeURIComponent(className)}`),
@@ -285,4 +289,11 @@ export const validationApi = {
 // System APIs
 export const systemApi = {
   getInfo: () => http.get('/system/info'),
+  cleanupTrainingExports: () => http.post('/system/cleanup-training-exports'),
+}
+
+// License APIs
+export const licenseApi = {
+  get: () => http.get('/license'),
+  activate: (activation_code) => http.post('/license/activate', { activation_code }),
 }

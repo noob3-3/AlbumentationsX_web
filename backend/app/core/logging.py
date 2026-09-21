@@ -24,14 +24,15 @@ def setup_logging():
         colorize=True,
     )
 
-    # File handler
+    # File handler：按日切割，超过 2 个月自动删除
     logger.add(
-        str(log_file),
+        str(settings.LOG_DIR / "app_{time:YYYY-MM-DD}.log"),
         format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
         level="INFO",
-        rotation="10 MB",
-        retention="7 days",
+        rotation="00:00",
+        retention="2 months",
         compression="zip",
+        encoding="utf-8",
     )
 
     return logger

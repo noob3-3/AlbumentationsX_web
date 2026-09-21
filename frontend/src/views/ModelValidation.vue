@@ -146,7 +146,7 @@
             type="primary"
             size="large"
             :loading="validating"
-            :disabled="uploadedFiles.length === 0 || selectedModels.length === 0"
+            :disabled="!licenseStore.licensed || uploadedFiles.length === 0 || selectedModels.length === 0"
             @click="runValidation"
             style="width: 100%; margin-top: 20px"
           >
@@ -403,7 +403,10 @@ import {
   validationTaskLabel,
 } from '@/utils/parseValidationResult'
 import {useProjectStore} from '@/stores/project'
+import {useLicenseStore} from '@/stores/license'
 import {storeToRefs} from 'pinia'
+
+const licenseStore = useLicenseStore()
 
 const COLORS = [
   '#FF6B6B', '#4ECDC4', '#45B7D1', '#96E6A1', '#DDA0DD',
@@ -559,6 +562,10 @@ function removeModel(modelId) {
 }
 
 async function runValidation() {
+  if (!licenseStore.licensed) {
+    licenseStore.openDialog()
+    return
+  }
   if (uploadedFiles.value.length === 0 || selectedModels.value.length === 0) {
     ElMessage.warning('请上传图片并选择至少一个模型')
     return

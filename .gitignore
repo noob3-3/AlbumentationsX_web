@@ -81,3 +81,8 @@ backend/license.dat
 packaging/dist/
 packaging/build/
 packaging/*.pyc
+packaging/*.7z
+packaging/vc_redist.x64.exe
+packaging/vc_runtime_dlls/
+packaging/win7_c10_hotfix/*.dll
+packaging/exe-stdout.txt

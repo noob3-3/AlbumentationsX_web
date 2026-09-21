@@ -52,22 +52,33 @@
                   <el-icon><Monitor /></el-icon>
                   GPU {{ device.id }}: {{ device.name }}
                 </span>
-                <el-tag :type="getMemoryType(device.memory_usage_percent)" size="small">
-                  {{ device.memory_usage_percent }}%
+                <el-tag :type="getMemoryType(gpuUtil(device))" size="small">
+                  算力 {{ gpuUtil(device) }}%
                 </el-tag>
               </div>
 
               <div class="device-memory">
+                <div class="memory-text">算力占用 {{ gpuUtil(device) }}%</div>
                 <div class="memory-bar">
                   <el-progress
-                    :percentage="device.memory_usage_percent"
-                    :color="getMemoryColor(device.memory_usage_percent)"
+                    :percentage="gpuUtil(device)"
+                    :color="getMemoryColor(gpuUtil(device))"
                     :show-text="false"
                   />
                 </div>
                 <div class="memory-text">
-                  {{ device.reserved_memory_gb }} GB / {{ device.total_memory_gb }} GB
+                  显存 {{ device.reserved_memory_gb }} GB / {{ device.total_memory_gb }} GB
                   <span style="color: #909399">(可用: {{ device.free_memory_gb }} GB)</span>
+                </div>
+                <div class="memory-bar">
+                  <el-progress
+                    :percentage="device.memory_usage_percent || 0"
+                    :color="getMemoryColor(device.memory_usage_percent)"
+                    :show-text="false"
+                  />
+                </div>
+                <div v-if="showWddmHint(device)" class="gpu-hint">
+                  Win7 桌面驱动常会预留几乎全部显存，这不代表正在训练。请看上面的「算力占用」。
                 </div>
               </div>
             </div>
@@ -84,6 +95,14 @@
             <div style="display: flex; align-items: center; gap: 8px">
               <el-icon><Files /></el-icon>
               <span>磁盘容量</span>
+              <el-button
+                size="small"
+                style="margin-left: auto"
+                :loading="cleanupLoading"
+                @click="cleanupTrainingExports"
+              >
+                清理训练临时文件
+              </el-button>
             </div>
           </template>
 
@@ -165,7 +184,7 @@
 import { ref, onMounted } from 'vue'
 import { Download, MagicStick, Cpu, FolderOpened, VideoCamera, Monitor, Files, Folder } from '@element-plus/icons-vue'
 import { datasetApi, trainingApi, augmentationApi, systemApi } from '@/api'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 
 const stats = ref([
   { label: '数据集总数', value: 0, icon: 'FolderOpened', color: '#409eff' },
@@ -181,6 +200,7 @@ const systemInfo = ref({
   memory: { available: false }
 })
 const systemInfoLoading = ref(false)
+const cleanupLoading = ref(false)
 
 const statusType = (s) => ({
   pending: 'info', running: 'warning', completed: 'success',
@@ -191,6 +211,14 @@ const statusText = (s) => ({
   pending: '等待中', running: '训练中', completed: '已完成',
   failed: '失败', cancelled: '已取消'
 })[s] || s
+
+const gpuUtil = (device) => {
+  const n = Number(device?.utilization_percent)
+  return Number.isFinite(n) ? n : 0
+}
+
+const showWddmHint = (device) =>
+  gpuUtil(device) < 15 && Number(device?.memory_usage_percent) > 85
 
 // GPU/Disk usage color helpers
 const getMemoryType = (percent) => {
@@ -227,6 +255,28 @@ const loadSystemInfo = async () => {
     ElMessage.warning('无法加载系统信息')
   } finally {
     systemInfoLoading.value = false
+  }
+}
+
+const cleanupTrainingExports = async () => {
+  try {
+    await ElMessageBox.confirm(
+      '将删除 data/exports 下遗留的 train_* 目录（训练复制/链接的临时数据集）。正在训练中的任务不会动。',
+      '清理训练临时文件',
+      { type: 'warning', confirmButtonText: '清理', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  cleanupLoading.value = true
+  try {
+    const res = await systemApi.cleanupTrainingExports()
+    ElMessage.success(res.message || '清理完成')
+    await loadSystemInfo()
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.detail || e.message || '清理失败')
+  } finally {
+    cleanupLoading.value = false
   }
 }
 
@@ -339,6 +389,13 @@ onMounted(async () => {
 .memory-text {
   font-size: 13px;
   color: #606266;
+}
+
+.gpu-hint {
+  margin-top: 6px;
+  font-size: 12px;
+  color: #909399;
+  line-height: 1.4;
 }
 
 /* Disk Partition Styles */

@@ -10,6 +10,7 @@ import shutil
 from pathlib import Path
 
 from app.core.database import get_db
+from app.core.license_guard import require_license
 from app.schemas.schemas import (
     ModelValidationRequest,
     ModelValidationResponse,
@@ -27,6 +28,7 @@ async def validate_models(
     confidence: float = Form(0.5),
     iou: float = Form(0.45),
     db: AsyncSession = Depends(get_db),
+    _license=Depends(require_license),
 ):
     """
     验证多个模型在多张图片上的表现

@@ -70,11 +70,28 @@
           </div>
         </div>
         <div class="header-right">
+          <el-tag
+            :type="licenseStore.statusType"
+            size="small"
+            class="license-tag"
+            @click="licenseStore.openDialog"
+          >
+            {{ licenseStore.message || '未激活' }}
+          </el-tag>
           <el-tag type="success" size="small">v1.0.0</el-tag>
         </div>
       </el-header>
 
       <el-main class="main-content">
+        <el-alert
+          v-if="!licenseStore.licensed"
+          type="error"
+          title="软件未授权"
+          :description="`${licenseStore.message}。未激活时不能使用训练、数据增强、模型验证、模型部署、自动标注和 ONNX 导出。点击右上角授权状态可激活。`"
+          :closable="false"
+          show-icon
+          style="margin-bottom: 16px"
+        />
         <router-view v-slot="{ Component }">
           <transition name="fade" mode="out-in">
             <component :is="Component" />
@@ -82,6 +99,7 @@
         </router-view>
       </el-main>
     </el-container>
+    <LicenseDialog />
   </el-container>
 </template>
 
@@ -89,6 +107,8 @@
 import {computed, onMounted, ref} from 'vue'
 import {useRoute, useRouter} from 'vue-router'
 import {useProjectStore} from '@/stores/project'
+import {useLicenseStore} from '@/stores/license'
+import LicenseDialog from '@/components/license/LicenseDialog.vue'
 import {storeToRefs} from 'pinia'
 import {ElMessage} from 'element-plus'
 
@@ -97,6 +117,7 @@ const router = useRouter()
 const collapsed = ref(false)
 
 const projectStore = useProjectStore()
+const licenseStore = useLicenseStore()
 const { projects, currentProject } = storeToRefs(projectStore)
 
 const currentProjectId = computed({
@@ -108,7 +129,10 @@ const currentProjectId = computed({
 })
 
 onMounted(async () => {
-  await projectStore.fetchProjects()
+  await Promise.all([
+    projectStore.fetchProjects(),
+    licenseStore.fetchLicense().catch(() => {}),
+  ])
   // 如果没有选择项目，提示用户选择
   if (!currentProject.value && projects.value.length > 0) {
     ElMessage.info('请先选择一个项目')
@@ -222,6 +246,16 @@ const currentTitle = computed(
 
 .header-right {
   flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.license-tag {
+  cursor: pointer;
+  max-width: 280px;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .project-selector {

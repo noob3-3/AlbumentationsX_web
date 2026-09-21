@@ -23,7 +23,14 @@
         <el-table-column label="原始图片" width="200">
           <template #default="{ row }">
             <div style="display: flex; align-items: center; gap: 8px">
-              <el-image :src="imageUrl(row.original_image_id, true)" style="width: 40px; height: 40px; border-radius: 4px" />
+              <el-image
+                :src="imageUrl(row.original_image_id, true)"
+                :preview-src-list="[imageUrl(row.original_image_id)]"
+                preview-teleported
+                hide-on-click-modal
+                fit="cover"
+                style="width: 40px; height: 40px; border-radius: 4px; cursor: zoom-in"
+              />
               <span style="font-size: 12px; max-width: 140px; overflow: hidden; text-overflow: ellipsis">
                 {{ row.original_filename }}
               </span>
